@@ -21,7 +21,7 @@ Use date-prefixed filenames for new specs, for example
 There is no package manager or build system. Use the bundled script and skill
 validator for checks:
 
-- `python3 -m py_compile agent-kb/scripts/agent_kb.py` - check Python syntax.
+- `python3 -m py_compile agent-kb/scripts/agent_kb.py agent-kb/scripts/smoke_test.py` - check Python syntax.
 - `python3 agent-kb/scripts/smoke_test.py` - run temporary-directory CLI smoke and edge checks.
 - `python3 agent-kb/scripts/agent_kb.py validate --root .` - validate this repo's KB.
 - `python3 /Users/lsl/.codex/skills/.system/skill-creator/scripts/quick_validate.py agent-kb` - validate skill metadata.
@@ -40,7 +40,7 @@ For specification files, use lowercase, hyphen-separated names with a leading IS
 ## Testing Guidelines
 
 No dedicated test suite is configured. For script changes, run `py_compile`,
-`validate --root .`, and a temporary-directory smoke test for `init`, `note`, and `compile`.
+`validate --root .`, and the temporary-directory smoke test.
 
 Keep future test files close to the code they validate.
 
@@ -59,6 +59,8 @@ Keep changes narrow. Do not turn this repository into a broad knowledge dump.
 ## Project Knowledge Base
 
 Use `.agent-kb/` as the project knowledge base.
+Treat it as an agent-facing index and distilled knowledge layer; do not replace
+human docs with KB entries.
 
 Before non-trivial coding:
 1. Read `.agent-kb/start.md`.
@@ -66,7 +68,7 @@ Before non-trivial coding:
 3. Read only KB documents relevant to the current task.
 
 After coding:
-- Update `.agent-kb/` when the work creates or changes reusable project knowledge.
+- Update `.agent-kb/` only when the work creates or changes reusable project knowledge.
 - Prefer the relevant topic file.
 - Use `.agent-kb/inbox/` when the right location is unclear.
 - Do not write ordinary progress logs or one-off chat summaries into KB.

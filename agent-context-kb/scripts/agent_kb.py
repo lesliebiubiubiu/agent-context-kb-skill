@@ -14,6 +14,8 @@ from pathlib import Path
 RUNTIME_PROTOCOL = """## Project Knowledge Base
 
 Use `.agent-kb/` as the project knowledge base.
+Treat it as an agent-facing index and distilled knowledge layer; do not replace
+human docs with KB entries.
 
 Before non-trivial coding:
 1. Read `.agent-kb/start.md`.
@@ -21,7 +23,7 @@ Before non-trivial coding:
 3. Read only KB documents relevant to the current task.
 
 After coding:
-- Update `.agent-kb/` when the work creates or changes reusable project knowledge.
+- Update `.agent-kb/` only when the work creates or changes reusable project knowledge.
 - Prefer the relevant topic file.
 - Use `.agent-kb/inbox/` when the right location is unclear.
 - Do not write ordinary progress logs or one-off chat summaries into KB.
@@ -30,6 +32,9 @@ After coding:
 START_MD = """# Agent KB Start
 
 This directory is the project knowledge base for coding agents.
+It is an agent-facing index and distilled knowledge layer, not a replacement
+for human docs. When docs already exist, summarize only the durable facts agents
+need and link back to the source.
 
 ## How To Read
 
@@ -40,7 +45,7 @@ This directory is the project knowledge base for coding agents.
 
 ## How To Write
 
-Update this KB when work creates or changes durable project knowledge:
+Update this KB only when work creates or changes durable project knowledge:
 
 - Architecture boundaries or module responsibilities
 - Design decisions and reasons
@@ -87,6 +92,10 @@ TOPIC_DOCS = {
 }
 
 LINK_RE = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
+PLACEHOLDER_TEXTS = (
+    "No durable knowledge recorded yet.",
+    "Add durable project knowledge here.",
+)
 
 
 # Returns the repository root from an argparse namespace.
@@ -115,7 +124,7 @@ def render_topic(title: str, read_when: str) -> str:
 
 ## Summary
 
-No durable knowledge recorded yet.
+No entries yet.
 
 ## Read When
 
@@ -123,7 +132,7 @@ No durable knowledge recorded yet.
 
 ## Current Knowledge
 
-Add durable project knowledge here.
+None yet.
 
 ## Related
 
@@ -292,6 +301,17 @@ def topic_section_warnings(kb: Path) -> list[str]:
     return warnings
 
 
+# Checks whether a topic document still contains starter placeholder text.
+def topic_placeholder_warnings(kb: Path) -> list[str]:
+    warnings = []
+    for path in stable_topic_docs(kb):
+        text = path.read_text(encoding="utf-8")
+        for placeholder in PLACEHOLDER_TEXTS:
+            if placeholder in text:
+                warnings.append(f"{path.relative_to(kb)} still contains placeholder text: {placeholder}")
+    return warnings
+
+
 # Resolves internal Markdown links from a document to KB-relative Markdown paths.
 def linked_docs_from(path: Path, kb: Path) -> list[Path]:
     links = []
@@ -366,6 +386,7 @@ def command_validate(args: argparse.Namespace) -> int:
         if relative not in reachable:
             warnings.append(f"stable topic is not reachable from map/links: {relative}")
     warnings.extend(topic_section_warnings(kb))
+    warnings.extend(topic_placeholder_warnings(kb))
 
     for note in sorted((kb / "inbox").glob("*.md")) if (kb / "inbox").exists() else []:
         text = note.read_text(encoding="utf-8")

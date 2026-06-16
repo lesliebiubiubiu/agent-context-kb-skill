@@ -141,6 +141,26 @@ Unreachable topic.
         )
 
 
+# Checks that validate warns when old starter placeholder text remains in a topic.
+def test_placeholder_warning() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        init_root(root)
+        topic = root / ".agent-kb" / "architecture" / "overview.md"
+        topic.write_text(
+            topic.read_text(encoding="utf-8").replace("No entries yet.", "No durable knowledge recorded yet."),
+            encoding="utf-8",
+        )
+        result = run_cli(root, "validate")
+        require(result.returncode == 0, "placeholder text should warn without failing", result)
+        require(
+            "WARN: architecture/overview.md still contains placeholder text: No durable knowledge recorded yet."
+            in result.stdout,
+            "placeholder warning should be reported",
+            result,
+        )
+
+
 # Runs all smoke tests and prints a compact success line.
 def main() -> int:
     tests = [
@@ -149,6 +169,7 @@ def main() -> int:
         test_path_traversal_target,
         test_relative_broken_link,
         test_unreachable_topic_warning,
+        test_placeholder_warning,
     ]
     for test in tests:
         test()

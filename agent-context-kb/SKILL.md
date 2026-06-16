@@ -9,6 +9,10 @@ Use this skill to manage a repository-local project knowledge base for coding ag
 The runtime knowledge lives in `.agent-kb/`; this skill only handles setup,
 maintenance, validation, and inbox cleanup.
 
+Treat `.agent-kb/` as an agent-facing index and distilled knowledge layer. It
+should summarize durable facts from existing human docs when useful, not replace
+those docs or move their full contents.
+
 ## Quick Start
 
 Run the bundled script from the skill directory:
@@ -27,7 +31,8 @@ Use `--root .` when working in the target repository.
 1. Use `init` to create `.agent-kb/`, starter topic documents, `inbox/`,
    `start.md`, `map.md`, and the short `AGENTS.md` runtime protocol.
 2. Use `validate` after changes to check required files, map routes, Markdown
-   links, inbox shape, and whether stable topic files are reachable.
+   links, inbox shape, placeholder text, and whether stable topic files are
+   reachable.
 3. Use `note` when the task produced durable project knowledge but the right
    stable topic file is not obvious or should be reviewed later.
 4. Use `compile` to merge inbox notes that name an existing `Suggested target`.
@@ -40,7 +45,9 @@ debugging conclusions, workflows, conventions, integration constraints, and
 pitfalls future agents should avoid.
 
 Do not record ordinary progress logs, one-off chat summaries, secrets, local
-credentials, or details that are obvious from reading the code.
+credentials, or details that are obvious from reading the code. When existing
+project docs contain the source material, keep those docs intact and add only a
+short agent-oriented summary or link in `.agent-kb/`.
 
 ## Map Format
 
