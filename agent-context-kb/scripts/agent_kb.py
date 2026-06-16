@@ -19,7 +19,8 @@ human docs with KB entries.
 
 Before non-trivial coding:
 1. Read `.agent-kb/start.md`.
-2. Read `.agent-kb/map.md`.
+2. Read `.agent-kb/routes.yaml` as the source of truth; use `.agent-kb/map.md`
+   only as a readable view if helpful.
 3. Read only KB documents relevant to the current task.
 
 After coding:
@@ -39,7 +40,8 @@ need and link back to the source.
 ## How To Read
 
 1. Read this file first.
-2. Read `map.md` and choose only routes relevant to the current task.
+2. Read `routes.yaml` and choose only routes relevant to the current task.
+   Use `map.md` only as the readable summary if that is faster.
 3. Open candidate topic files and check `Summary` and `Read When`.
 4. Continue into body text and related links only when they are clearly relevant.
 
@@ -66,7 +68,77 @@ write a separate note in `inbox/`.
 - Details that are already obvious from reading the code
 """
 
+DEFAULT_ROUTES = [
+    {
+        "id": "architecture",
+        "task": "Architecture / module boundaries",
+        "read_first": ["architecture/overview.md"],
+        "also_consider": ["architecture/boundaries.md"],
+    },
+    {
+        "id": "decisions",
+        "task": "Design decisions",
+        "read_first": ["decisions/active/project-decisions.md"],
+        "also_consider": ["architecture/overview.md"],
+    },
+    {
+        "id": "debugging",
+        "task": "Debugging / known failures",
+        "read_first": ["debugging/known-failures.md"],
+        "also_consider": ["debugging/test-environment.md"],
+    },
+    {
+        "id": "local-dev",
+        "task": "Local dev / test / deploy",
+        "read_first": ["workflows/local-dev.md"],
+        "also_consider": ["workflows/deploy.md"],
+    },
+    {
+        "id": "code-style",
+        "task": "Coding style / comments",
+        "read_first": ["conventions/code-style.md"],
+        "also_consider": ["conventions/comments.md"],
+    },
+]
+
+ROUTES_YAML = """# Agent KB routes. Keep read_first narrow; use also_consider sparingly.
+routes:
+  - id: architecture
+    task: Architecture / module boundaries
+    read_first:
+      - architecture/overview.md
+    also_consider:
+      - architecture/boundaries.md
+  - id: decisions
+    task: Design decisions
+    read_first:
+      - decisions/active/project-decisions.md
+    also_consider:
+      - architecture/overview.md
+  - id: debugging
+    task: Debugging / known failures
+    read_first:
+      - debugging/known-failures.md
+    also_consider:
+      - debugging/test-environment.md
+  - id: local-dev
+    task: Local dev / test / deploy
+    read_first:
+      - workflows/local-dev.md
+    also_consider:
+      - workflows/deploy.md
+  - id: code-style
+    task: Coding style / comments
+    read_first:
+      - conventions/code-style.md
+    also_consider:
+      - conventions/comments.md
+"""
+
 MAP_MD = """# KB Map
+
+This is a readable view of `routes.yaml`. Keep routing narrow: one `Read First`
+target and no more than two `Also Consider` targets per route.
 
 ## Task Routing
 
@@ -144,6 +216,115 @@ None yet.
 """
 
 
+# Formats a list of route paths for the Markdown routing table.
+def format_route_paths(paths: list[str]) -> str:
+    return ", ".join(paths) if paths else "-"
+
+
+# Renders a Markdown routing table from route dictionaries.
+def render_map(routes: list[dict[str, object]]) -> str:
+    lines = [
+        "# KB Map",
+        "",
+        "This is a readable view of `routes.yaml`. Keep routing narrow: one `Read First`",
+        "target and no more than two `Also Consider` targets per route.",
+        "",
+        "## Task Routing",
+        "",
+        "| Task Pattern | Read First | Also Consider |",
+        "| --- | --- | --- |",
+    ]
+    for route in routes:
+        read_first = [str(path) for path in route.get("read_first", [])]
+        also_consider = [str(path) for path in route.get("also_consider", [])]
+        lines.append(f"| {route.get('task', '')} | {format_route_paths(read_first)} | {format_route_paths(also_consider)} |")
+    return "\n".join(lines) + "\n"
+
+
+# Parses the supported routes.yaml subset into route dictionaries.
+def parse_routes_yaml(routes_path: Path) -> tuple[list[dict[str, object]], list[str]]:
+    if not routes_path.exists():
+        return [], ["missing .agent-kb/routes.yaml"]
+
+    routes: list[dict[str, object]] = []
+    errors = []
+    current: dict[str, object] | None = None
+    current_list: str | None = None
+    saw_routes = False
+
+    for line_number, line in enumerate(routes_path.read_text(encoding="utf-8").splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped == "routes:":
+            saw_routes = True
+            continue
+        if not saw_routes:
+            errors.append(f"routes.yaml line {line_number}: expected routes:")
+            continue
+        if line.startswith("  - "):
+            if current is not None:
+                routes.append(current)
+            current = {"read_first": [], "also_consider": []}
+            current_list = None
+            key_value = line[4:].strip()
+            if not key_value:
+                continue
+            if ":" not in key_value:
+                errors.append(f"routes.yaml line {line_number}: invalid route entry")
+                continue
+            key, value = [part.strip() for part in key_value.split(":", 1)]
+            current[key] = value
+            continue
+        if current is None:
+            errors.append(f"routes.yaml line {line_number}: route field before route entry")
+            continue
+        if line.startswith("    ") and not line.startswith("      - "):
+            field = line[4:].strip()
+            if ":" not in field:
+                errors.append(f"routes.yaml line {line_number}: invalid field")
+                continue
+            key, value = [part.strip() for part in field.split(":", 1)]
+            if key in {"read_first", "also_consider"}:
+                current[key] = []
+                current_list = key
+            else:
+                current[key] = value
+                current_list = None
+            continue
+        if line.startswith("      - "):
+            if current_list not in {"read_first", "also_consider"}:
+                errors.append(f"routes.yaml line {line_number}: list item without list field")
+                continue
+            value = line[8:].strip()
+            if not value:
+                errors.append(f"routes.yaml line {line_number}: empty path")
+                continue
+            current[current_list].append(value)  # type: ignore[index, union-attr]
+            continue
+        errors.append(f"routes.yaml line {line_number}: unsupported YAML shape")
+
+    if current is not None:
+        routes.append(current)
+    if not saw_routes:
+        errors.append("routes.yaml is missing routes:")
+    for index, route in enumerate(routes, 1):
+        for key in ["id", "task", "read_first", "also_consider"]:
+            if key not in route:
+                errors.append(f"routes.yaml route {index} missing {key}")
+    return routes, errors
+
+
+# Converts route dictionaries into map-compatible routing rows.
+def rows_from_routes(routes: list[dict[str, object]]) -> list[tuple[str, str, str]]:
+    rows = []
+    for route in routes:
+        read_first = [str(path) for path in route.get("read_first", [])]
+        also_consider = [str(path) for path in route.get("also_consider", [])]
+        rows.append((str(route.get("task", "")), format_route_paths(read_first), format_route_paths(also_consider)))
+    return rows
+
+
 # Adds or replaces the Project Knowledge Base section in AGENTS.md.
 def upsert_agents_protocol(root: Path) -> str:
     agents_path = root / "AGENTS.md"
@@ -182,6 +363,7 @@ def command_init(args: argparse.Namespace) -> int:
 
     for relative, content in {
         "start.md": START_MD,
+        "routes.yaml": ROUTES_YAML,
         "map.md": MAP_MD,
     }.items():
         if write_if_missing(kb / relative, content):
@@ -201,7 +383,59 @@ def command_init(args: argparse.Namespace) -> int:
     return 0
 
 
-# Extracts the Task Routing rows from `.agent-kb/map.md`.
+# Updates a scaffold file when missing or when explicit overwrite is allowed.
+def upgrade_scaffold_file(path: Path, content: str, write_existing: bool) -> str:
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return "created"
+    if path.read_text(encoding="utf-8") == content:
+        return "current"
+    if write_existing:
+        path.write_text(content, encoding="utf-8")
+        return "updated"
+    return "needs review"
+
+
+# Upgrades generated protocol files while leaving project-specific KB content intact.
+def command_upgrade(args: argparse.Namespace) -> int:
+    root = repo_root(args)
+    kb = kb_dir(root)
+    if not kb.exists():
+        print("ERROR: missing .agent-kb/; run init first")
+        return 1
+
+    if not (kb / "inbox").exists():
+        (kb / "inbox").mkdir(parents=True)
+
+    protocol_action = upsert_agents_protocol(root)
+    start_action = upgrade_scaffold_file(kb / "start.md", START_MD, args.write_start)
+    routes_action = upgrade_scaffold_file(kb / "routes.yaml", ROUTES_YAML, args.write_routes)
+    routes, route_errors = parse_routes_yaml(kb / "routes.yaml")
+    map_content = render_map(routes) if not route_errors else MAP_MD
+    map_action = upgrade_scaffold_file(kb / "map.md", map_content, args.write_map)
+    custom_routes_preserved = routes_action == "needs review" and args.write_map and not args.write_routes and not route_errors
+
+    print(f"Upgraded KB at {kb}")
+    print(f"AGENTS.md protocol {protocol_action}.")
+    print(f".agent-kb/start.md {start_action}.")
+    if custom_routes_preserved:
+        print(".agent-kb/routes.yaml custom routes preserved.")
+    else:
+        print(f".agent-kb/routes.yaml {routes_action}.")
+    print(f".agent-kb/map.md {map_action}.")
+    if start_action == "needs review":
+        print("Review .agent-kb/start.md manually or rerun with --write-start to replace it.")
+    if custom_routes_preserved:
+        print("custom routes preserved; map generated from routes.yaml")
+    elif routes_action == "needs review":
+        print("Review .agent-kb/routes.yaml manually; use --write-routes only if you want the default routes.")
+    if map_action == "needs review":
+        print("Review .agent-kb/map.md manually; use --write-map only if you want the default routing table.")
+    return 0
+
+
+# Extracts the Task Routing rows from `.agent-kb/map.md` for legacy compatibility.
 def parse_map_rows(map_path: Path) -> tuple[list[tuple[str, str, str]], list[str]]:
     if not map_path.exists():
         return [], ["missing .agent-kb/map.md"]
@@ -234,6 +468,20 @@ def parse_map_rows(map_path: Path) -> tuple[list[tuple[str, str, str]], list[str
     if not header_seen:
         errors.append("map.md is missing the required Task Routing header")
     return rows, errors
+
+
+# Checks route shape rules that keep routing narrow and cheap to read.
+def route_quality_warnings(routes: list[dict[str, object]]) -> list[str]:
+    warnings = []
+    for route in routes:
+        route_id = str(route.get("id", "unknown"))
+        read_first = route.get("read_first", [])
+        also_consider = route.get("also_consider", [])
+        if isinstance(read_first, list) and len(read_first) > 1:
+            warnings.append(f"route {route_id} has more than one read_first path")
+        if isinstance(also_consider, list) and len(also_consider) > 2:
+            warnings.append(f"route {route_id} has more than two also_consider paths")
+    return warnings
 
 
 # Splits a map cell into candidate KB-relative paths.
@@ -356,21 +604,26 @@ def command_validate(args: argparse.Namespace) -> int:
     if not kb.exists():
         print("ERROR: missing .agent-kb/")
         return 1
-    for relative in ["start.md", "map.md"]:
+    for relative in ["start.md", "routes.yaml", "map.md"]:
         if not (kb / relative).exists():
             errors.append(f"missing .agent-kb/{relative}")
     if not (kb / "inbox").is_dir():
         errors.append("missing .agent-kb/inbox/")
 
-    rows, map_errors = parse_map_rows(kb / "map.md")
-    errors.extend(map_errors)
+    routes, route_errors = parse_routes_yaml(kb / "routes.yaml")
+    errors.extend(route_errors)
+    rows = rows_from_routes(routes)
+    if routes and (kb / "map.md").exists() and (kb / "map.md").read_text(encoding="utf-8") != render_map(routes):
+        warnings.append("map.md differs from routes.yaml; update the readable view or rerun upgrade --write-map")
+    warnings.extend(route_quality_warnings(routes))
+
     for _, read_first, also_consider in rows:
         for raw in split_path_cell(read_first) + split_path_cell(also_consider):
             normalized = normalize_kb_path(raw)
             if normalized is None:
-                errors.append(f"invalid map path: {raw}")
+                errors.append(f"invalid route path: {raw}")
             elif not (kb / normalized).exists():
-                errors.append(f"map path does not exist: {raw}")
+                errors.append(f"route path does not exist: {raw}")
 
     for path in kb.rglob("*.md"):
         for raw in markdown_links(path.read_text(encoding="utf-8")):
@@ -384,7 +637,7 @@ def command_validate(args: argparse.Namespace) -> int:
     for path in stable_topic_docs(kb):
         relative = path.relative_to(kb)
         if relative not in reachable:
-            warnings.append(f"stable topic is not reachable from map/links: {relative}")
+            warnings.append(f"stable topic is not reachable from routes/map/links: {relative}")
     warnings.extend(topic_section_warnings(kb))
     warnings.extend(topic_placeholder_warnings(kb))
 
@@ -519,6 +772,13 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser = subparsers.add_parser("init", help="Initialize .agent-kb and AGENTS.md protocol.")
     init_parser.add_argument("--root", default=".", help="Repository root to manage.")
     init_parser.set_defaults(func=command_init)
+
+    upgrade_parser = subparsers.add_parser("upgrade", help="Upgrade generated KB protocol files conservatively.")
+    upgrade_parser.add_argument("--root", default=".", help="Repository root to manage.")
+    upgrade_parser.add_argument("--write-start", action="store_true", help="Replace .agent-kb/start.md with the current template.")
+    upgrade_parser.add_argument("--write-routes", action="store_true", help="Replace .agent-kb/routes.yaml with the default routes.")
+    upgrade_parser.add_argument("--write-map", action="store_true", help="Replace .agent-kb/map.md with the default routing table.")
+    upgrade_parser.set_defaults(func=command_upgrade)
 
     validate_parser = subparsers.add_parser("validate", help="Validate the .agent-kb scaffold.")
     validate_parser.add_argument("--root", default=".", help="Repository root to manage.")

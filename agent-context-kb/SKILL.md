@@ -1,6 +1,6 @@
 ---
 name: agent-kb
-description: Initialize, maintain, validate, and compile a lightweight `.agent-kb/` project knowledge base for coding agents. Use when Codex needs to create the KB scaffold, add the AGENTS.md runtime protocol, record durable project knowledge, check KB links/routes, or merge inbox notes into stable topic documents.
+description: Initialize, upgrade, maintain, validate, and compile a lightweight `.agent-kb/` project knowledge base for coding agents. Use when Codex needs to create the KB scaffold, refresh the AGENTS.md runtime protocol, record durable project knowledge, check KB links/routes, or merge inbox notes into stable topic documents.
 ---
 
 # Agent KB
@@ -19,6 +19,7 @@ Run the bundled script from the skill directory:
 
 ```bash
 python3 scripts/agent_kb.py init --root /path/to/repo
+python3 scripts/agent_kb.py upgrade --root /path/to/repo
 python3 scripts/agent_kb.py validate --root /path/to/repo
 python3 scripts/agent_kb.py note --root /path/to/repo --title "Auth session note" --target decisions/active/auth-storage.md --body "Durable fact."
 python3 scripts/agent_kb.py compile --root /path/to/repo
@@ -29,13 +30,18 @@ Use `--root .` when working in the target repository.
 ## Workflow
 
 1. Use `init` to create `.agent-kb/`, starter topic documents, `inbox/`,
-   `start.md`, `map.md`, and the short `AGENTS.md` runtime protocol.
-2. Use `validate` after changes to check required files, map routes, Markdown
+   `start.md`, `routes.yaml`, `map.md`, and the short `AGENTS.md` runtime
+   protocol.
+2. Use `upgrade` to refresh generated protocol text conservatively. It updates
+   `AGENTS.md`, creates missing scaffold files, and leaves existing `start.md`,
+   `routes.yaml`, or `map.md` for manual review unless explicit write flags are
+   passed.
+3. Use `validate` after changes to check required files, map routes, Markdown
    links, inbox shape, placeholder text, and whether stable topic files are
    reachable.
-3. Use `note` when the task produced durable project knowledge but the right
+4. Use `note` when the task produced durable project knowledge but the right
    stable topic file is not obvious or should be reviewed later.
-4. Use `compile` to merge inbox notes that name an existing `Suggested target`.
+5. Use `compile` to merge inbox notes that name an existing `Suggested target`.
    Notes with `unsure`, missing targets, or invalid targets remain in `inbox/`.
 
 ## Knowledge Rules
@@ -49,15 +55,23 @@ credentials, or details that are obvious from reading the code. When existing
 project docs contain the source material, keep those docs intact and add only a
 short agent-oriented summary or link in `.agent-kb/`.
 
-## Map Format
+## Route Format
 
-`.agent-kb/map.md` must keep this table under `## Task Routing`:
+`.agent-kb/routes.yaml` is the canonical route source. The CLI supports a small
+YAML subset directly, so projects do not need PyYAML or any external parser.
 
-```md
-| Task Pattern | Read First | Also Consider |
-| --- | --- | --- |
-| Local dev / test / deploy | workflows/local-dev.md | workflows/deploy.md |
+```yaml
+routes:
+  - id: local-dev
+    task: Local dev / test / deploy
+    read_first:
+      - workflows/local-dev.md
+    also_consider:
+      - workflows/deploy.md
 ```
 
-Paths are relative to `.agent-kb/`. Keep each stable topic document reachable
-from `map.md` or from another reachable document's Markdown links.
+Paths are relative to `.agent-kb/`. Keep `read_first` to one file and
+`also_consider` to at most two files. `.agent-kb/map.md` is a readable Markdown
+view of the routes; regenerate or update it when routes change. Keep each stable
+topic document reachable from `routes.yaml` or from another reachable document's
+Markdown links.

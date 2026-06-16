@@ -9,7 +9,8 @@ Current layout:
 
 - `agent-kb/` - the Codex skill, including `SKILL.md`, UI metadata, and scripts.
 - `agent-kb/scripts/agent_kb.py` - the CLI for KB init, validation, notes, and compile.
-- `.agent-kb/` - this repository's own project knowledge base scaffold.
+- `.agent-kb/` - this repository's own project knowledge base scaffold, with
+  route data in `.agent-kb/routes.yaml` and a readable view in `.agent-kb/map.md`.
 - `docs/superpowers/specs/` - dated design specifications and planning documents.
 - `AGENTS.md` - contributor and agent guidance for this repository.
 
@@ -22,7 +23,7 @@ There is no package manager or build system. Use the bundled script and skill
 validator for checks:
 
 - `python3 -m py_compile agent-kb/scripts/agent_kb.py agent-kb/scripts/smoke_test.py` - check Python syntax.
-- `python3 agent-kb/scripts/smoke_test.py` - run temporary-directory CLI smoke and edge checks.
+- `python3 agent-kb/scripts/smoke_test.py` - run temporary-directory CLI smoke, upgrade, and edge checks.
 - `python3 agent-kb/scripts/agent_kb.py validate --root .` - validate this repo's KB.
 - `python3 /Users/lsl/.codex/skills/.system/skill-creator/scripts/quick_validate.py agent-kb` - validate skill metadata.
 - `git status --short` - review tracked and untracked changes.
@@ -64,7 +65,8 @@ human docs with KB entries.
 
 Before non-trivial coding:
 1. Read `.agent-kb/start.md`.
-2. Read `.agent-kb/map.md`.
+2. Read `.agent-kb/routes.yaml` as the source of truth; use `.agent-kb/map.md`
+   only as a readable view if helpful.
 3. Read only KB documents relevant to the current task.
 
 After coding:

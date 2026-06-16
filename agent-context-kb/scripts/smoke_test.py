@@ -109,7 +109,7 @@ def test_relative_broken_link() -> None:
         require("broken link in architecture/overview.md: nested/../missing.md" in result.stdout, "broken link should be reported", result)
 
 
-# Checks that validate warns when a stable topic is not reachable from map routes or links.
+# Checks that validate warns when a stable topic is not reachable from routes, map, or links.
 def test_unreachable_topic_warning() -> None:
     with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
         root = Path(tmp)
@@ -135,7 +135,7 @@ Unreachable topic.
         result = run_cli(root, "validate")
         require(result.returncode == 0, "unreachable topics should warn without failing", result)
         require(
-            "WARN: stable topic is not reachable from map/links: architecture/orphan.md" in result.stdout,
+            "WARN: stable topic is not reachable from routes/map/links: architecture/orphan.md" in result.stdout,
             "unreachable topic warning should be reported",
             result,
         )
@@ -161,6 +161,78 @@ def test_placeholder_warning() -> None:
         )
 
 
+# Checks that validate uses routes.yaml as the canonical route source.
+def test_validate_uses_routes_yaml() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        init_root(root)
+        routes = root / ".agent-kb" / "routes.yaml"
+        routes.write_text(
+            routes.read_text(encoding="utf-8").replace("architecture/overview.md", "architecture/missing.md", 1),
+            encoding="utf-8",
+        )
+        result = run_cli(root, "validate")
+        require(result.returncode == 1, "validate should fail on missing routes.yaml paths", result)
+        require("ERROR: route path does not exist: architecture/missing.md" in result.stdout, "routes.yaml path should be checked", result)
+
+
+# Checks that upgrade reports customized scaffold files without replacing them by default.
+def test_upgrade_preserves_custom_scaffold_by_default() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        init_root(root)
+        start = root / ".agent-kb" / "start.md"
+        route_map = root / ".agent-kb" / "map.md"
+        start.write_text("# Custom Start\n", encoding="utf-8")
+        route_map.write_text("# Custom Map\n", encoding="utf-8")
+        result = run_cli(root, "upgrade")
+        require(result.returncode == 0, "upgrade should succeed on an existing KB", result)
+        require(".agent-kb/start.md needs review." in result.stdout, "custom start should need review", result)
+        require(".agent-kb/map.md needs review." in result.stdout, "custom map should need review", result)
+        require(start.read_text(encoding="utf-8") == "# Custom Start\n", "upgrade should preserve custom start by default")
+        require(route_map.read_text(encoding="utf-8") == "# Custom Map\n", "upgrade should preserve custom map by default")
+
+
+# Checks that upgrade can explicitly replace start.md with the current protocol template.
+def test_upgrade_can_write_start_template() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        init_root(root)
+        start = root / ".agent-kb" / "start.md"
+        start.write_text("# Custom Start\n", encoding="utf-8")
+        result = run_cli(root, "upgrade", "--write-start")
+        require(result.returncode == 0, "upgrade --write-start should succeed", result)
+        require(".agent-kb/start.md updated." in result.stdout, "write-start should report update", result)
+        require("This directory is the project knowledge base" in start.read_text(encoding="utf-8"), "write-start should restore template")
+
+
+# Checks that upgrade renders map.md from the current routes.yaml file.
+def test_upgrade_writes_map_from_routes() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        init_root(root)
+        routes = root / ".agent-kb" / "routes.yaml"
+        route_map = root / ".agent-kb" / "map.md"
+        routes.write_text(
+            """routes:
+  - id: docs
+    task: Documentation
+    read_first:
+      - workflows/local-dev.md
+    also_consider:
+      - conventions/comments.md
+""",
+            encoding="utf-8",
+        )
+        route_map.write_text("# stale map\n", encoding="utf-8")
+        result = run_cli(root, "upgrade", "--write-map")
+        require(result.returncode == 0, "upgrade --write-map should succeed", result)
+        require(".agent-kb/routes.yaml custom routes preserved." in result.stdout, "custom routes should be reported as preserved", result)
+        require("custom routes preserved; map generated from routes.yaml" in result.stdout, "write-map should explain route preservation", result)
+        text = route_map.read_text(encoding="utf-8")
+        require("| Documentation | workflows/local-dev.md | conventions/comments.md |" in text, "write-map should render current routes")
+
+
 # Runs all smoke tests and prints a compact success line.
 def main() -> int:
     tests = [
@@ -170,6 +242,10 @@ def main() -> int:
         test_relative_broken_link,
         test_unreachable_topic_warning,
         test_placeholder_warning,
+        test_validate_uses_routes_yaml,
+        test_upgrade_preserves_custom_scaffold_by_default,
+        test_upgrade_can_write_start_template,
+        test_upgrade_writes_map_from_routes,
     ]
     for test in tests:
         test()
