@@ -22,6 +22,7 @@ There is no package manager or build system. Use the bundled script and skill
 validator for checks:
 
 - `python3 -m py_compile agent-kb/scripts/agent_kb.py` - check Python syntax.
+- `python3 agent-kb/scripts/smoke_test.py` - run temporary-directory CLI smoke and edge checks.
 - `python3 agent-kb/scripts/agent_kb.py validate --root .` - validate this repo's KB.
 - `python3 /Users/lsl/.codex/skills/.system/skill-creator/scripts/quick_validate.py agent-kb` - validate skill metadata.
 - `git status --short` - review tracked and untracked changes.
@@ -45,8 +46,8 @@ Keep future test files close to the code they validate.
 
 ## Commit & Pull Request Guidelines
 
-This repository has no established history yet. Prefer concise imperative commit
-messages such as `Implement agent KB skill`.
+Use concise type-prefixed commit messages such as `fix: repair KB validation`
+or `test: add KB smoke checks`.
 
 Pull requests should include a summary, affected paths, and manual verification.
 
