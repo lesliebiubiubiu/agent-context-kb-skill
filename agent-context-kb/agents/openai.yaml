@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent KB"
+  short_description: "Project memory for coding agents"
+  default_prompt: "Use $agent-kb to initialize and validate a project knowledge base."
