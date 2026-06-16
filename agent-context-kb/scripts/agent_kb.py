@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import datetime as dt
 import re
 import sys
@@ -255,6 +256,17 @@ def markdown_links(text: str) -> list[str]:
     return links
 
 
+# Resolves a document-relative Markdown link to a KB-relative path when it stays inside the KB.
+def resolve_internal_link(source: Path, kb: Path, raw: str) -> Path | None:
+    if Path(raw).is_absolute():
+        return None
+    candidate = (source.parent / raw).resolve()
+    try:
+        return candidate.relative_to(kb.resolve())
+    except ValueError:
+        return None
+
+
 # Lists stable topic documents while excluding routing and inbox files.
 def stable_topic_docs(kb: Path) -> list[Path]:
     docs = []
@@ -285,20 +297,18 @@ def linked_docs_from(path: Path, kb: Path) -> list[Path]:
     links = []
     text = path.read_text(encoding="utf-8")
     for raw in markdown_links(text):
-        candidate = (path.parent / raw).resolve()
-        try:
-            relative = candidate.relative_to(kb.resolve())
-        except ValueError:
+        relative = resolve_internal_link(path, kb, raw)
+        if relative is None:
             continue
-        if candidate.suffix == ".md":
+        if relative.suffix == ".md":
             links.append(relative)
     return links
 
 
 # Computes topic documents reachable from map routes and reachable Markdown links.
 def reachable_docs(kb: Path, rows: list[tuple[str, str, str]]) -> set[Path]:
-    reachable = set()
-    queue = []
+    reachable: set[Path] = set()
+    queue: deque[Path] = deque()
     for _, read_first, also_consider in rows:
         for raw in split_path_cell(read_first) + split_path_cell(also_consider):
             normalized = normalize_kb_path(raw)
@@ -306,7 +316,7 @@ def reachable_docs(kb: Path, rows: list[tuple[str, str, str]]) -> set[Path]:
                 queue.append(normalized)
 
     while queue:
-        relative = queue.pop(0)
+        relative = queue.popleft()
         if relative in reachable:
             continue
         reachable.add(relative)
@@ -344,10 +354,10 @@ def command_validate(args: argparse.Namespace) -> int:
 
     for path in kb.rglob("*.md"):
         for raw in markdown_links(path.read_text(encoding="utf-8")):
-            if normalize_kb_path(raw) is None and not raw.startswith("."):
+            relative = resolve_internal_link(path, kb, raw)
+            if relative is None:
                 continue
-            target = (path.parent / raw.split("#", 1)[0]).resolve()
-            if not target.exists():
+            if not (kb / relative).exists():
                 errors.append(f"broken link in {path.relative_to(kb)}: {raw}")
 
     reachable = reachable_docs(kb, rows)
@@ -431,7 +441,7 @@ def insert_under_heading(text: str, heading: str, addition: str) -> tuple[str, b
     if not match:
         return text.rstrip() + f"\n\n## {heading}\n\n{addition.rstrip()}\n", False
     existing = match.group(2).rstrip()
-    replacement = f"{match.group(1)}{existing}\n\n{addition.rstrip()}\n"
+    replacement = f"{match.group(1)}{existing}\n\n{addition.rstrip()}\n\n"
     return text[: match.start()] + replacement + text[match.end() :], True
 
 
