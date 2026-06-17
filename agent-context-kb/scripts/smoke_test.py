@@ -176,6 +176,31 @@ def test_validate_uses_routes_yaml() -> None:
         require("ERROR: route path does not exist: architecture/missing.md" in result.stdout, "routes.yaml path should be checked", result)
 
 
+# Checks that init creates the lightweight current plan and routes to it.
+def test_init_creates_current_plan_route() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        init_root(root)
+        plan = root / ".agent-kb" / "plans" / "current.md"
+        routes = (root / ".agent-kb" / "routes.yaml").read_text(encoding="utf-8")
+        require(plan.exists(), "init should create plans/current.md")
+        require("## Current Focus" in plan.read_text(encoding="utf-8"), "current plan should use plan sections")
+        require("plans/current.md" in routes, "routes.yaml should include the current plan route")
+
+
+# Checks that upgrade creates the current plan when older KBs do not have it.
+def test_upgrade_creates_missing_current_plan() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        init_root(root)
+        plan = root / ".agent-kb" / "plans" / "current.md"
+        plan.unlink()
+        result = run_cli(root, "upgrade")
+        require(result.returncode == 0, "upgrade should succeed when current plan is missing", result)
+        require(".agent-kb/plans/current.md created." in result.stdout, "upgrade should report current plan creation", result)
+        require(plan.exists(), "upgrade should recreate missing current plan")
+
+
 # Checks that upgrade reports customized scaffold files without replacing them by default.
 def test_upgrade_preserves_custom_scaffold_by_default() -> None:
     with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
@@ -243,6 +268,8 @@ def main() -> int:
         test_unreachable_topic_warning,
         test_placeholder_warning,
         test_validate_uses_routes_yaml,
+        test_init_creates_current_plan_route,
+        test_upgrade_creates_missing_current_plan,
         test_upgrade_preserves_custom_scaffold_by_default,
         test_upgrade_can_write_start_template,
         test_upgrade_writes_map_from_routes,

@@ -30,12 +30,12 @@ Use `--root .` when working in the target repository.
 ## Workflow
 
 1. Use `init` to create `.agent-kb/`, starter topic documents, `inbox/`,
-   `start.md`, `routes.yaml`, `map.md`, and the short `AGENTS.md` runtime
-   protocol.
+   `plans/current.md`, `start.md`, `routes.yaml`, `map.md`, and the short
+   `AGENTS.md` runtime protocol.
 2. Use `upgrade` to refresh generated protocol text conservatively. It updates
    `AGENTS.md`, creates missing scaffold files, and leaves existing `start.md`,
-   `routes.yaml`, or `map.md` for manual review unless explicit write flags are
-   passed.
+   `routes.yaml`, `map.md`, or `plans/current.md` for manual review unless
+   explicit write flags are passed.
 3. Use `validate` after changes to check required files, map routes, Markdown
    links, inbox shape, placeholder text, and whether stable topic files are
    reachable.
@@ -55,6 +55,15 @@ credentials, or details that are obvious from reading the code. When existing
 project docs contain the source material, keep those docs intact and add only a
 short agent-oriented summary or link in `.agent-kb/`.
 
+## Lightweight Plans
+
+Use `.agent-kb/plans/current.md` for durable continuity: current focus, major
+done milestones, next moves, and open questions that affect future work. Keep it
+short. Do not use it as an issue tracker, commit log, or ordinary progress log.
+
+Create module-specific plan files only when a module has its own durable
+multi-step direction that will be reused across future tasks.
+
 ## Route Format
 
 `.agent-kb/routes.yaml` is the canonical route source. The CLI supports a small
@@ -62,6 +71,12 @@ YAML subset directly, so projects do not need PyYAML or any external parser.
 
 ```yaml
 routes:
+  - id: planning
+    task: Planning / current focus
+    read_first:
+      - plans/current.md
+    also_consider:
+      - decisions/active/project-decisions.md
   - id: local-dev
     task: Local dev / test / deploy
     read_first:

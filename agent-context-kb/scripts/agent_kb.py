@@ -94,6 +94,12 @@ DEFAULT_ROUTES = [
         "also_consider": ["workflows/deploy.md"],
     },
     {
+        "id": "planning",
+        "task": "Planning / current focus",
+        "read_first": ["plans/current.md"],
+        "also_consider": ["decisions/active/project-decisions.md"],
+    },
+    {
         "id": "code-style",
         "task": "Coding style / comments",
         "read_first": ["conventions/code-style.md"],
@@ -127,6 +133,12 @@ routes:
       - workflows/local-dev.md
     also_consider:
       - workflows/deploy.md
+  - id: planning
+    task: Planning / current focus
+    read_first:
+      - plans/current.md
+    also_consider:
+      - decisions/active/project-decisions.md
   - id: code-style
     task: Coding style / comments
     read_first:
@@ -148,6 +160,7 @@ target and no more than two `Also Consider` targets per route.
 | Design decisions | decisions/active/project-decisions.md | architecture/overview.md |
 | Debugging / known failures | debugging/known-failures.md | debugging/test-environment.md |
 | Local dev / test / deploy | workflows/local-dev.md | workflows/deploy.md |
+| Planning / current focus | plans/current.md | decisions/active/project-decisions.md |
 | Coding style / comments | conventions/code-style.md | conventions/comments.md |
 """
 
@@ -162,6 +175,41 @@ TOPIC_DOCS = {
     "conventions/code-style.md": ("Code Style", "Changing code patterns, naming, or formatting conventions"),
     "conventions/comments.md": ("Comments", "Adding or changing project comment conventions"),
 }
+
+PLAN_CURRENT_MD = """# Current Plan
+
+## Summary
+
+No active plan recorded yet.
+
+## Read When
+
+- Continuing prior work or deciding the next project step
+
+## Current Focus
+
+None yet.
+
+## Done
+
+None yet.
+
+## Next
+
+None yet.
+
+## Open Questions
+
+None yet.
+
+## Related
+
+None yet.
+
+## Change Log
+
+- {today} - Created initial lightweight plan.
+"""
 
 LINK_RE = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
 PLACEHOLDER_TEXTS = (
@@ -214,6 +262,11 @@ None yet.
 
 - {today} - Created initial KB topic.
 """
+
+
+# Builds the lightweight current plan document with today's creation date.
+def render_current_plan() -> str:
+    return PLAN_CURRENT_MD.format(today=dt.date.today().isoformat())
 
 
 # Formats a list of route paths for the Markdown routing table.
@@ -358,6 +411,7 @@ def command_init(args: argparse.Namespace) -> int:
         kb / "debugging",
         kb / "workflows",
         kb / "conventions",
+        kb / "plans",
     ]:
         directory.mkdir(parents=True, exist_ok=True)
 
@@ -365,6 +419,7 @@ def command_init(args: argparse.Namespace) -> int:
         "start.md": START_MD,
         "routes.yaml": ROUTES_YAML,
         "map.md": MAP_MD,
+        "plans/current.md": render_current_plan(),
     }.items():
         if write_if_missing(kb / relative, content):
             created.append(str(Path(".agent-kb") / relative))
@@ -411,6 +466,7 @@ def command_upgrade(args: argparse.Namespace) -> int:
     protocol_action = upsert_agents_protocol(root)
     start_action = upgrade_scaffold_file(kb / "start.md", START_MD, args.write_start)
     routes_action = upgrade_scaffold_file(kb / "routes.yaml", ROUTES_YAML, args.write_routes)
+    plan_action = upgrade_scaffold_file(kb / "plans" / "current.md", render_current_plan(), args.write_plan)
     routes, route_errors = parse_routes_yaml(kb / "routes.yaml")
     map_content = render_map(routes) if not route_errors else MAP_MD
     map_action = upgrade_scaffold_file(kb / "map.md", map_content, args.write_map)
@@ -423,6 +479,7 @@ def command_upgrade(args: argparse.Namespace) -> int:
         print(".agent-kb/routes.yaml custom routes preserved.")
     else:
         print(f".agent-kb/routes.yaml {routes_action}.")
+    print(f".agent-kb/plans/current.md {plan_action}.")
     print(f".agent-kb/map.md {map_action}.")
     if start_action == "needs review":
         print("Review .agent-kb/start.md manually or rerun with --write-start to replace it.")
@@ -430,6 +487,8 @@ def command_upgrade(args: argparse.Namespace) -> int:
         print("custom routes preserved; map generated from routes.yaml")
     elif routes_action == "needs review":
         print("Review .agent-kb/routes.yaml manually; use --write-routes only if you want the default routes.")
+    if plan_action == "needs review":
+        print("Review .agent-kb/plans/current.md manually; use --write-plan only if you want the default empty plan.")
     if map_action == "needs review":
         print("Review .agent-kb/map.md manually; use --write-map only if you want the default routing table.")
     return 0
@@ -537,15 +596,19 @@ def stable_topic_docs(kb: Path) -> list[Path]:
     return sorted(docs)
 
 
-# Checks whether a topic document has the sections agents need for skimming.
+# Checks whether a stable document has the sections agents need for skimming.
 def topic_section_warnings(kb: Path) -> list[str]:
     warnings = []
-    required = ["## Summary", "## Read When", "## Current Knowledge"]
     for path in stable_topic_docs(kb):
+        relative = path.relative_to(kb)
+        if relative.parts[0] == "plans":
+            required = ["## Summary", "## Read When", "## Current Focus", "## Next"]
+        else:
+            required = ["## Summary", "## Read When", "## Current Knowledge"]
         text = path.read_text(encoding="utf-8")
         for section in required:
             if section not in text:
-                warnings.append(f"{path.relative_to(kb)} missing {section}")
+                warnings.append(f"{relative} missing {section}")
     return warnings
 
 
@@ -778,6 +841,7 @@ def build_parser() -> argparse.ArgumentParser:
     upgrade_parser.add_argument("--write-start", action="store_true", help="Replace .agent-kb/start.md with the current template.")
     upgrade_parser.add_argument("--write-routes", action="store_true", help="Replace .agent-kb/routes.yaml with the default routes.")
     upgrade_parser.add_argument("--write-map", action="store_true", help="Replace .agent-kb/map.md with the default routing table.")
+    upgrade_parser.add_argument("--write-plan", action="store_true", help="Replace .agent-kb/plans/current.md with the default empty plan.")
     upgrade_parser.set_defaults(func=command_upgrade)
 
     validate_parser = subparsers.add_parser("validate", help="Validate the .agent-kb scaffold.")

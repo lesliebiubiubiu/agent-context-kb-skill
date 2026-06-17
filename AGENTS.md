@@ -11,6 +11,8 @@ Current layout:
 - `agent-kb/scripts/agent_kb.py` - the CLI for KB init, validation, notes, and compile.
 - `.agent-kb/` - this repository's own project knowledge base scaffold, with
   route data in `.agent-kb/routes.yaml` and a readable view in `.agent-kb/map.md`.
+- `.agent-kb/plans/current.md` - lightweight durable focus and next-step plan
+  for agent continuity.
 - `docs/superpowers/specs/` - dated design specifications and planning documents.
 - `AGENTS.md` - contributor and agent guidance for this repository.
 
