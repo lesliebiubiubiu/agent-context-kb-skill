@@ -216,6 +216,13 @@ PLACEHOLDER_TEXTS = (
     "No durable knowledge recorded yet.",
     "Add durable project knowledge here.",
 )
+TRIM_PLACEHOLDER_TEXTS = PLACEHOLDER_TEXTS + (
+    "No entries yet.",
+    "None yet.",
+)
+TRIM_MAX_FILE_LINES = 120
+TRIM_MAX_TOTAL_CHARS = 20000
+TRIM_MAX_INBOX_NOTES = 5
 
 
 # Returns the repository root from an argparse namespace.
@@ -291,6 +298,19 @@ def render_map(routes: list[dict[str, object]]) -> str:
         read_first = [str(path) for path in route.get("read_first", [])]
         also_consider = [str(path) for path in route.get("also_consider", [])]
         lines.append(f"| {route.get('task', '')} | {format_route_paths(read_first)} | {format_route_paths(also_consider)} |")
+    return "\n".join(lines) + "\n"
+
+
+# Renders route dictionaries into the supported routes.yaml subset.
+def render_routes_yaml(routes: list[dict[str, object]]) -> str:
+    lines = ["# Agent KB routes. Keep read_first narrow; use also_consider sparingly.", "routes:"]
+    for route in routes:
+        lines.append(f"  - id: {route.get('id', '')}")
+        lines.append(f"    task: {route.get('task', '')}")
+        for key in ["read_first", "also_consider"]:
+            lines.append(f"    {key}:")
+            for path in [str(path) for path in route.get(key, [])]:
+                lines.append(f"      - {path}")
     return "\n".join(lines) + "\n"
 
 
@@ -623,50 +643,135 @@ def topic_placeholder_warnings(kb: Path) -> list[str]:
     return warnings
 
 
-# Resolves internal Markdown links from a document to KB-relative Markdown paths.
-def linked_docs_from(path: Path, kb: Path) -> list[Path]:
-    links = []
+# Extracts the body of a second-level Markdown section by heading text.
+def markdown_section_body(text: str, heading: str) -> str:
+    pattern = re.compile(rf"^## {re.escape(heading)}\s*\n(.*?)(?=^## |\Z)", re.M | re.S)
+    match = pattern.search(text)
+    return match.group(1).strip() if match else ""
+
+
+# Checks whether a document contains a named second-level Markdown section.
+def has_markdown_section(text: str, heading: str) -> bool:
+    return bool(re.search(rf"^## {re.escape(heading)}\s*$", text, re.M))
+
+
+# Checks whether a section body contains only starter placeholder text.
+def is_placeholder_body(body: str) -> bool:
+    normalized = body.strip()
+    if not normalized:
+        return True
+    normalized_lines = [line.strip("- ").strip() for line in normalized.splitlines() if line.strip()]
+    return bool(normalized_lines) and all(line in TRIM_PLACEHOLDER_TEXTS for line in normalized_lines)
+
+
+# Checks whether a changelog only records initial scaffold creation.
+def is_initial_changelog_only(body: str) -> bool:
+    lines = [line.strip() for line in body.splitlines() if line.strip()]
+    return len(lines) == 1 and "Created initial KB topic." in lines[0]
+
+
+# Checks whether a stable topic is an empty scaffold that can be safely deleted.
+def is_empty_scaffold_topic(path: Path, kb: Path) -> bool:
+    relative = path.relative_to(kb)
+    if relative in {Path("start.md"), Path("map.md"), Path("plans/current.md")}:
+        return False
+    if relative.parts[0] in {"inbox", "plans"}:
+        return False
     text = path.read_text(encoding="utf-8")
-    for raw in markdown_links(text):
-        relative = resolve_internal_link(path, kb, raw)
-        if relative is None:
+    for heading in ["Summary", "Current Knowledge", "Related", "Change Log"]:
+        if not has_markdown_section(text, heading):
+            return False
+    return (
+        is_placeholder_body(markdown_section_body(text, "Summary"))
+        and is_placeholder_body(markdown_section_body(text, "Current Knowledge"))
+        and is_placeholder_body(markdown_section_body(text, "Related"))
+        and is_initial_changelog_only(markdown_section_body(text, "Change Log"))
+        and not markdown_links(text)
+    )
+
+
+# Maps internal Markdown link targets to the KB documents that reference them.
+def incoming_link_sources(kb: Path) -> dict[Path, list[Path]]:
+    incoming: dict[Path, list[Path]] = {}
+    for source in kb.rglob("*.md"):
+        source_relative = source.relative_to(kb)
+        for raw in markdown_links(source.read_text(encoding="utf-8")):
+            target = resolve_internal_link(source, kb, raw)
+            if target is not None:
+                incoming.setdefault(target, []).append(source_relative)
+    return incoming
+
+
+# Finds empty scaffold topic files that trim can remove without breaking links.
+def empty_scaffold_topics(kb: Path) -> list[Path]:
+    candidates = [path for path in stable_topic_docs(kb) if is_empty_scaffold_topic(path, kb)]
+    candidate_relatives = {path.relative_to(kb) for path in candidates}
+    incoming = incoming_link_sources(kb)
+    safe = []
+    for path in candidates:
+        relative = path.relative_to(kb)
+        linked_from_kept_docs = [source for source in incoming.get(relative, []) if source not in candidate_relatives]
+        if not linked_from_kept_docs:
+            safe.append(path)
+    return safe
+
+
+# Builds the short agent prompt used when trim sees useful cleanup or compacting work.
+def trim_compact_prompt() -> str:
+    return (
+        "Compact `.agent-kb/` without changing schema. Delete empty scaffold nodes, "
+        "prune routes to remaining useful entries, keep durable knowledge reachable, "
+        "regenerate map.md, and validate."
+    )
+
+
+# Checks whether KB size suggests agent-assisted semantic compacting could help.
+def trim_compact_recommended(kb: Path) -> tuple[bool, list[str]]:
+    reasons = []
+    docs = stable_topic_docs(kb)
+    total_chars = sum(len(path.read_text(encoding="utf-8")) for path in docs)
+    if total_chars > TRIM_MAX_TOTAL_CHARS:
+        reasons.append(f"stable KB docs exceed {TRIM_MAX_TOTAL_CHARS} characters")
+    for path in docs:
+        line_count = len(path.read_text(encoding="utf-8").splitlines())
+        if line_count > TRIM_MAX_FILE_LINES:
+            reasons.append(f"{path.relative_to(kb)} exceeds {TRIM_MAX_FILE_LINES} lines")
+    inbox_count = len(list((kb / "inbox").glob("*.md"))) if (kb / "inbox").exists() else 0
+    if inbox_count > TRIM_MAX_INBOX_NOTES:
+        reasons.append(f"inbox has more than {TRIM_MAX_INBOX_NOTES} notes")
+    return bool(reasons), reasons
+
+
+# Removes deleted topic paths from routes and promotes remaining entries when needed.
+def prune_routes(routes: list[dict[str, object]], deleted: set[Path]) -> tuple[list[dict[str, object]], bool]:
+    changed = False
+    pruned = []
+    deleted_strings = {str(path) for path in deleted}
+    for route in routes:
+        read_first = [str(path) for path in route.get("read_first", []) if str(path) not in deleted_strings]
+        also_consider = [str(path) for path in route.get("also_consider", []) if str(path) not in deleted_strings]
+        if read_first != route.get("read_first", []) or also_consider != route.get("also_consider", []):
+            changed = True
+        if not read_first and also_consider:
+            read_first = [also_consider.pop(0)]
+            changed = True
+        if not read_first and not also_consider:
+            changed = True
             continue
-        if relative.suffix == ".md":
-            links.append(relative)
-    return links
+        updated = dict(route)
+        updated["read_first"] = read_first
+        updated["also_consider"] = also_consider
+        pruned.append(updated)
+    return pruned, changed
 
 
-# Computes topic documents reachable from map routes and reachable Markdown links.
-def reachable_docs(kb: Path, rows: list[tuple[str, str, str]]) -> set[Path]:
-    reachable: set[Path] = set()
-    queue: deque[Path] = deque()
-    for _, read_first, also_consider in rows:
-        for raw in split_path_cell(read_first) + split_path_cell(also_consider):
-            normalized = normalize_kb_path(raw)
-            if normalized and (kb / normalized).exists():
-                queue.append(normalized)
-
-    while queue:
-        relative = queue.popleft()
-        if relative in reachable:
-            continue
-        reachable.add(relative)
-        path = kb / relative
-        if path.exists() and path.suffix == ".md":
-            queue.extend(linked_docs_from(path, kb))
-    return reachable
-
-
-# Validates the KB scaffold, routes, links, inbox notes, and topic reachability.
-def command_validate(args: argparse.Namespace) -> int:
-    root = repo_root(args)
-    kb = kb_dir(root)
+# Runs KB validation without printing so maintenance commands can summarize it.
+def validate_kb(kb: Path) -> tuple[list[str], list[str]]:
     errors = []
     warnings = []
 
     if not kb.exists():
-        print("ERROR: missing .agent-kb/")
-        return 1
+        return ["missing .agent-kb/"], warnings
     for relative in ["start.md", "routes.yaml", "map.md"]:
         if not (kb / relative).exists():
             errors.append(f"missing .agent-kb/{relative}")
@@ -708,6 +813,48 @@ def command_validate(args: argparse.Namespace) -> int:
         text = note.read_text(encoding="utf-8")
         if "Suggested target:" not in text or "## Note" not in text:
             warnings.append(f"inbox note does not match template: {note.relative_to(kb)}")
+    return errors, warnings
+
+
+# Resolves internal Markdown links from a document to KB-relative Markdown paths.
+def linked_docs_from(path: Path, kb: Path) -> list[Path]:
+    links = []
+    text = path.read_text(encoding="utf-8")
+    for raw in markdown_links(text):
+        relative = resolve_internal_link(path, kb, raw)
+        if relative is None:
+            continue
+        if relative.suffix == ".md":
+            links.append(relative)
+    return links
+
+
+# Computes topic documents reachable from map routes and reachable Markdown links.
+def reachable_docs(kb: Path, rows: list[tuple[str, str, str]]) -> set[Path]:
+    reachable: set[Path] = set()
+    queue: deque[Path] = deque()
+    for _, read_first, also_consider in rows:
+        for raw in split_path_cell(read_first) + split_path_cell(also_consider):
+            normalized = normalize_kb_path(raw)
+            if normalized and (kb / normalized).exists():
+                queue.append(normalized)
+
+    while queue:
+        relative = queue.popleft()
+        if relative in reachable:
+            continue
+        reachable.add(relative)
+        path = kb / relative
+        if path.exists() and path.suffix == ".md":
+            queue.extend(linked_docs_from(path, kb))
+    return reachable
+
+
+# Validates the KB scaffold, routes, links, inbox notes, and topic reachability.
+def command_validate(args: argparse.Namespace) -> int:
+    root = repo_root(args)
+    kb = kb_dir(root)
+    errors, warnings = validate_kb(kb)
 
     for warning in warnings:
         print(f"WARN: {warning}")
@@ -717,6 +864,73 @@ def command_validate(args: argparse.Namespace) -> int:
         return 1
     print(f"OK: validated {kb}")
     return 0
+
+
+# Diagnoses or applies safe deterministic KB trimming.
+def command_trim(args: argparse.Namespace) -> int:
+    root = repo_root(args)
+    kb = kb_dir(root)
+    if not kb.exists():
+        print("ERROR: missing .agent-kb/")
+        return 1
+
+    routes, route_errors = parse_routes_yaml(kb / "routes.yaml")
+    if route_errors:
+        for error in route_errors:
+            print(f"ERROR: {error}")
+        return 1
+
+    candidates = empty_scaffold_topics(kb)
+    compact_recommended, compact_reasons = trim_compact_recommended(kb)
+
+    if not args.write:
+        if not candidates and not compact_recommended:
+            print("Trim diagnosis: KB is already lean.")
+            print("No write step recommended.")
+            return 0
+        diagnosis = "cleanup recommended" if candidates else "compact recommended"
+        print(f"Trim diagnosis: {diagnosis}.")
+        if candidates:
+            print()
+            print("Next:")
+            print(f"  python3 agent-kb/scripts/agent_kb.py trim --root {args.root} --write")
+        print()
+        print("Agent compact prompt:")
+        print(f"  {trim_compact_prompt()}")
+        if args.verbose:
+            print()
+            print("Details:")
+            for path in candidates:
+                print(f"- delete empty scaffold topic: {path.relative_to(kb)}")
+            for reason in compact_reasons:
+                print(f"- compact signal: {reason}")
+        return 0
+
+    deleted = set()
+    for path in candidates:
+        path.unlink()
+        deleted.add(path.relative_to(kb))
+
+    pruned_routes, routes_changed = prune_routes(routes, deleted)
+    if deleted or routes_changed:
+        (kb / "routes.yaml").write_text(render_routes_yaml(pruned_routes), encoding="utf-8")
+        (kb / "map.md").write_text(render_map(pruned_routes), encoding="utf-8")
+
+    errors, _ = validate_kb(kb)
+    print("Trim complete.")
+    print(f"- Deleted {len(deleted)} empty topic nodes.")
+    print(f"- Updated routes.yaml: {'yes' if deleted or routes_changed else 'no'}.")
+    print(f"- Regenerated map.md: {'yes' if deleted or routes_changed else 'no'}.")
+    print(f"- Validate: {'OK' if not errors else 'FAILED'}.")
+    if args.verbose and deleted:
+        print("Deleted nodes:")
+        for path in sorted(deleted):
+            print(f"- {path}")
+    if compact_recommended:
+        print("Agent compact still recommended for non-empty topics.")
+    for error in errors:
+        print(f"ERROR: {error}")
+    return 1 if errors else 0
 
 
 # Converts a note title into a short filesystem-safe slug.
@@ -858,6 +1072,12 @@ def build_parser() -> argparse.ArgumentParser:
     compile_parser = subparsers.add_parser("compile", help="Merge inbox notes with valid targets.")
     compile_parser.add_argument("--root", default=".", help="Repository root to manage.")
     compile_parser.set_defaults(func=command_compile)
+
+    trim_parser = subparsers.add_parser("trim", help="Diagnose or apply safe KB trimming.")
+    trim_parser.add_argument("--root", default=".", help="Repository root to manage.")
+    trim_parser.add_argument("--write", action="store_true", help="Apply deterministic cleanup and validate.")
+    trim_parser.add_argument("--verbose", action="store_true", help="Print detailed trim candidates.")
+    trim_parser.set_defaults(func=command_trim)
     return parser
 
 

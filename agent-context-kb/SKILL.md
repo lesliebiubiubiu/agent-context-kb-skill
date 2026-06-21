@@ -23,6 +23,8 @@ python3 scripts/agent_kb.py upgrade --root /path/to/repo
 python3 scripts/agent_kb.py validate --root /path/to/repo
 python3 scripts/agent_kb.py note --root /path/to/repo --title "Auth session note" --target decisions/active/auth-storage.md --body "Durable fact."
 python3 scripts/agent_kb.py compile --root /path/to/repo
+python3 scripts/agent_kb.py trim --root /path/to/repo
+python3 scripts/agent_kb.py trim --root /path/to/repo --write
 ```
 
 Use `--root .` when working in the target repository.
@@ -43,6 +45,9 @@ Use `--root .` when working in the target repository.
    stable topic file is not obvious or should be reviewed later.
 5. Use `compile` to merge inbox notes that name an existing `Suggested target`.
    Notes with `unsure`, missing targets, or invalid targets remain in `inbox/`.
+6. Use `trim` to diagnose KB bloat and get a compact prompt. Use `trim --write`
+   only for deterministic cleanup: deleting empty scaffold topics, pruning
+   route references, regenerating `map.md`, and validating the result.
 
 ## Knowledge Rules
 

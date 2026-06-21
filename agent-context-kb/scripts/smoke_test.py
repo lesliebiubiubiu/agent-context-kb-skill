@@ -258,6 +258,100 @@ def test_upgrade_writes_map_from_routes() -> None:
         require("| Documentation | workflows/local-dev.md | conventions/comments.md |" in text, "write-map should render current routes")
 
 
+# Checks that trim diagnosis stays short while pointing to the write step.
+def test_trim_diagnoses_empty_scaffold() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        init_root(root)
+        result = run_cli(root, "trim")
+        require(result.returncode == 0, "trim diagnosis should succeed", result)
+        require("Trim diagnosis: cleanup recommended." in result.stdout, "trim should recommend cleanup", result)
+        require("trim --root" in result.stdout and "--write" in result.stdout, "trim should show the write command", result)
+        require("Agent compact prompt:" in result.stdout, "trim should print the compact prompt", result)
+
+
+# Checks that trim --write deletes empty topics and prunes routes and map output.
+def test_trim_write_deletes_empty_scaffold_topics() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        init_root(root)
+        result = run_cli(root, "trim", "--write")
+        require(result.returncode == 0, "trim --write should succeed", result)
+        require("Trim complete." in result.stdout, "trim --write should summarize completion", result)
+        require("- Validate: OK." in result.stdout, "trim --write should validate", result)
+        require(not (root / ".agent-kb" / "architecture" / "overview.md").exists(), "empty topic should be deleted")
+        require((root / ".agent-kb" / "plans" / "current.md").exists(), "current plan should never be deleted")
+        routes = (root / ".agent-kb" / "routes.yaml").read_text(encoding="utf-8")
+        route_map = (root / ".agent-kb" / "map.md").read_text(encoding="utf-8")
+        require("architecture/overview.md" not in routes, "deleted topic should be pruned from routes")
+        require("Architecture / module boundaries" not in route_map, "empty route should be pruned from map")
+
+
+# Checks that trim promotes a remaining also_consider entry when read_first is deleted.
+def test_trim_write_promotes_remaining_route_entry() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        init_root(root)
+        test_env = root / ".agent-kb" / "debugging" / "test-environment.md"
+        test_env.write_text(
+            test_env.read_text(encoding="utf-8").replace("No entries yet.", "Test environment notes."),
+            encoding="utf-8",
+        )
+        result = run_cli(root, "trim", "--write")
+        require(result.returncode == 0, "trim --write should succeed when promoting entries", result)
+        require(not (root / ".agent-kb" / "debugging" / "known-failures.md").exists(), "empty read_first should be deleted")
+        require(test_env.exists(), "non-empty also_consider should remain")
+        routes = (root / ".agent-kb" / "routes.yaml").read_text(encoding="utf-8")
+        require("task: Debugging / known failures" in routes, "route with promoted entry should remain")
+        require("read_first:\n      - debugging/test-environment.md" in routes, "remaining entry should be promoted")
+
+
+# Checks that trim keeps non-empty topics even when they still resemble scaffold files.
+def test_trim_write_keeps_non_empty_topic() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        init_root(root)
+        topic = root / ".agent-kb" / "architecture" / "overview.md"
+        topic.write_text(
+            topic.read_text(encoding="utf-8").replace("None yet.", "The CLI lives in `agent-kb/scripts/agent_kb.py`."),
+            encoding="utf-8",
+        )
+        result = run_cli(root, "trim", "--write")
+        require(result.returncode == 0, "trim --write should succeed with non-empty topics", result)
+        require(topic.exists(), "non-empty topic should be kept")
+        routes = (root / ".agent-kb" / "routes.yaml").read_text(encoding="utf-8")
+        require("architecture/overview.md" in routes, "route should keep non-empty read_first")
+
+
+# Checks that trim does not delete malformed topics just because sections are missing.
+def test_trim_write_keeps_malformed_topic() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        init_root(root)
+        topic = root / ".agent-kb" / "architecture" / "overview.md"
+        topic.write_text("# Architecture Overview\n\nNo entries yet.\n", encoding="utf-8")
+        result = run_cli(root, "trim", "--write")
+        require(result.returncode == 0, "trim --write should leave validation warnings non-fatal", result)
+        require(topic.exists(), "malformed topic should not be auto-deleted")
+
+
+# Checks that trim keeps empty topics when non-deleted docs still link to them.
+def test_trim_write_keeps_linked_empty_topic() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        init_root(root)
+        overview = root / ".agent-kb" / "architecture" / "overview.md"
+        boundaries = root / ".agent-kb" / "architecture" / "boundaries.md"
+        overview.write_text(
+            overview.read_text(encoding="utf-8").replace("None yet.", "See [boundaries](boundaries.md)."),
+            encoding="utf-8",
+        )
+        result = run_cli(root, "trim", "--write")
+        require(result.returncode == 0, "trim --write should keep linked empty topics valid", result)
+        require(overview.exists(), "linking non-empty topic should remain")
+        require(boundaries.exists(), "linked empty topic should not be auto-deleted")
+
+
 # Runs all smoke tests and prints a compact success line.
 def main() -> int:
     tests = [
@@ -273,6 +367,12 @@ def main() -> int:
         test_upgrade_preserves_custom_scaffold_by_default,
         test_upgrade_can_write_start_template,
         test_upgrade_writes_map_from_routes,
+        test_trim_diagnoses_empty_scaffold,
+        test_trim_write_deletes_empty_scaffold_topics,
+        test_trim_write_promotes_remaining_route_entry,
+        test_trim_write_keeps_non_empty_topic,
+        test_trim_write_keeps_malformed_topic,
+        test_trim_write_keeps_linked_empty_topic,
     ]
     for test in tests:
         test()
