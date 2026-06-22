@@ -24,8 +24,9 @@ python3 scripts/agent_kb.py validate --root /path/to/repo
 python3 scripts/agent_kb.py note --root /path/to/repo --title "Auth session note" --target decisions/active/auth-storage.md --body "Durable fact."
 python3 scripts/agent_kb.py compile --root /path/to/repo
 python3 scripts/agent_kb.py trim --root /path/to/repo
+python3 scripts/agent_kb.py trim --root /path/to/repo --recheck
 python3 scripts/agent_kb.py trim --root /path/to/repo --write
-python3 scripts/agent_kb.py trim --root /path/to/repo --max-file-lines 200
+python3 scripts/agent_kb.py trim --root /path/to/repo --max-file-chars 12000
 python3 scripts/agent_kb.py stats --root /path/to/repo
 ```
 
@@ -52,29 +53,48 @@ Use `--root .` when working in the target repository.
    soft budget), so you never need to re-measure with `wc`. It then names the
    concrete cleanup candidates and structural signals (with actual counts), so
    the output localizes the problem; tune the budgets with `--max-file-lines`,
-   `--max-total-chars`, and `--max-inbox-notes`. The total-char budget is a
-   **soft** signal: it is reported but does not by itself drive another
-   compaction pass. The compaction loop converges on structural signals the
-   agent can deterministically fix — duplicate scaffolds, oversize files, inbox
-   backlog. So `trim` distinguishes two clean states: `KB is already lean`, and
-   `lean (above soft budget)` (structure is clean but the total exceeds the soft
-   budget — likely just legitimate durable content; do **not** keep compacting
-   to chase the number). Use `trim --write` only for deterministic cleanup:
-   deleting pristine empty scaffold topics, pruning route references,
-   regenerating `map.md`, and validating. Semantic compacting stays with the
-   agent: `trim` emits a self-converging prompt (rewrite within headings, then
-   `upgrade --write-map` -> `validate` -> rerun `trim` until lean — stopping once
-   structure is clean, even if still above the soft budget). An emptied husk
-   (content gone but `Change Log` grown) is only flagged for manual deletion,
-   never removed automatically.
+   `--max-file-chars`, `--max-total-chars`, and `--max-inbox-notes`. A file is
+   flagged oversize when it exceeds **either** the per-file char budget **or**
+   the line budget, but only **char** overage (real bulk that can't be gamed by
+   joining short lines) makes a file **major**; line-only overage stays
+   **minor**, an advisory — so the agent compacts content instead of shaving
+   lines to clear the signal. Severity is graded: char overage under ~10% (and
+   any line-only overage) is **minor — optional** (`Safe to stop here`); ~10%+
+   char overage is **major** and worth a compaction pass. Size is a *proxy, not
+   a target*: it flags files that may be repeating themselves or holding dead
+   detail. Compact by cutting redundant or stale **information** (duplicate
+   facts, superseded detail, routine Change Log churn) — shrinking bytes without
+   removing information is not progress, and the reader is a future agent that
+   must still locate and trust each fact. **Stop once what remains is genuine,
+   non-redundant durable content — even if the file is still over the signal** (a
+   large file of real, distinct facts is a correct end state, like `lean (above
+   soft budget)`). The total-char budget is likewise a **soft** signal, never on
+   its own a reason to compact. So `trim` distinguishes clean states (`KB is already
+   lean`, `lean (above soft budget)`) from `minor — optional` and from `compact
+   recommended` (major char oversize or inbox backlog).
+   To keep the compaction loop quiet, the full agent compact prompt and the
+   soft-budget note print only on first detection within a loop (or with
+   `--verbose`); later rounds show a one-line pointer instead. Use `--recheck`
+   to fold the loop's `validate` step into the same command, so each round is
+   one command (`trim --recheck`) instead of two. Use `trim --write` only for
+   deterministic cleanup: deleting pristine empty scaffold topics, pruning route
+   references, regenerating `map.md`, and validating. Semantic compacting stays
+   with the agent: `trim` emits a self-converging prompt (rewrite within
+   headings, then `upgrade --write-map` -> `validate` -> rerun `trim` until lean
+   — stopping once structure is clean, even if still above the soft budget). An
+   emptied husk (content gone but `Change Log` grown) is only flagged for manual
+   deletion, never removed automatically.
 7. Use `stats` to observe usage. Every CLI run appends one JSONL line to
    `.agent-kb/.log/events.jsonl`; `init` and `upgrade` write a KB-local
    `.agent-kb/.gitignore` so the log stays out of git. `stats` draws ASCII bar
    charts of command frequency (with failure counts), per-file change churn
    from git history, and the largest current KB files by character count, so you
    can see at a glance which commands run most, which KB documents change most,
-   and which carry the most weight right now (not just historically). Surface
-   this output to the user. Each event
+   and which carry the most weight right now (not just historically). After
+   running `stats`, paste its full output verbatim inside a fenced code block in
+   your reply to the user. Do not paraphrase or summarize the bar charts into
+   prose — the ASCII charts are the deliverable; reproduce them exactly. You may
+   add commentary after the block. Each event
    also records the run's parameters (`args`, with free text like note bodies
    redacted) and optional per-command `metrics` (e.g. validate error/warning
    counts, trim deleted/husk counts, compile merged/unresolved); `stats`

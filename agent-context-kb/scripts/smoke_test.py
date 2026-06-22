@@ -274,11 +274,14 @@ def test_trim_diagnoses_empty_scaffold() -> None:
             result,
         )
         require("trim --root" in result.stdout and "--write" in result.stdout, "trim should show the write command", result)
-        require("Agent compact prompt:" in result.stdout, "trim should print the compact prompt", result)
-        require("validate --root" in result.stdout, "compact prompt should name the deterministic validate finisher", result)
+        require(
+            "Agent compact prompt:" not in result.stdout,
+            "deletable scaffolds are deterministic cleanup, not semantic compaction; no compact prompt",
+            result,
+        )
 
 
-# Checks that a low --max-file-lines flag makes trim flag an oversized topic with a concrete count.
+# Checks that a low --max-file-lines flag flags a topic with a magnitude, and that line-only overage stays minor.
 def test_trim_threshold_flag_reports_oversize_topic() -> None:
     with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
         root = Path(tmp)
@@ -291,10 +294,71 @@ def test_trim_threshold_flag_reports_oversize_topic() -> None:
         result = run_cli(root, "trim", "--max-file-lines", "10")
         require(result.returncode == 0, "trim with a custom threshold should succeed", result)
         require(
-            "architecture/overview.md is" in result.stdout and "(max 10)" in result.stdout,
-            "trim should report the oversized topic with the configured threshold",
+            "architecture/overview.md:" in result.stdout and "over /" in result.stdout,
+            "trim should report the oversized topic with overage magnitude",
             result,
         )
+        require(
+            "minor signal: architecture/overview.md:" in result.stdout,
+            "line-only overage should stay minor, not be promoted to a compact recommendation",
+            result,
+        )
+
+
+# Checks that char overage is caught even when the line count is well under budget (line-count can't game it).
+def test_trim_flags_char_oversize_with_few_lines() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        init_root(root)
+        topic = root / ".agent-kb" / "architecture" / "overview.md"
+        # One long line: far under any line budget but far over a small char budget.
+        topic.write_text(
+            topic.read_text(encoding="utf-8").replace("None yet.", "blah " * 200),
+            encoding="utf-8",
+        )
+        result = run_cli(root, "trim", "--max-file-lines", "1000", "--max-file-chars", "200")
+        require(result.returncode == 0, "trim should succeed with a custom char budget", result)
+        require(
+            "lines (ok)" in result.stdout and "chars (" in result.stdout and "major" in result.stdout,
+            "trim should flag char overage as major even when lines are under budget",
+            result,
+        )
+        require(
+            "only a proxy" in result.stdout and "genuine, distinct durable facts" in result.stdout,
+            "a compact recommendation should always carry the proxy / stop-on-genuine guardrail",
+            result,
+        )
+
+
+# Checks that a small overage is reported as minor/optional, not a full compact recommendation.
+def test_trim_minor_overage_is_optional() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        init_root(root)
+        kb = root / ".agent-kb"
+        # Fill every empty scaffold so they are neither deletion candidates nor noise in the diagnosis.
+        for path in kb.rglob("*.md"):
+            text = path.read_text(encoding="utf-8")
+            if "None yet." in text:
+                path.write_text(text.replace("None yet.", "Durable content for this topic."), encoding="utf-8")
+        # Push one topic just over the default 120-line budget (well under the 10% major threshold).
+        overview = kb / "architecture" / "overview.md"
+        overview.write_text(overview.read_text(encoding="utf-8") + "\n".join("- detail" for _ in range(110)) + "\n", encoding="utf-8")
+        result = run_cli(root, "trim")
+        require(result.returncode == 0, "trim should succeed on a minor overage", result)
+        require("Trim diagnosis: minor — optional." in result.stdout, "small overage should be minor, not compact", result)
+        require("Safe to stop here" in result.stdout, "minor overage should tell the agent it can stop", result)
+        require("Agent compact prompt:" not in result.stdout, "minor overage should not emit the compact prompt", result)
+
+
+# Checks that --recheck runs validate inline so the compaction loop is one command per round.
+def test_trim_recheck_runs_validate() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        init_root(root)
+        result = run_cli(root, "trim", "--recheck")
+        require(result.returncode == 0, "trim --recheck should succeed", result)
+        require("Recheck (validate):" in result.stdout, "trim --recheck should print a validate summary", result)
 
 
 # Checks that trim flags an emptied husk but never auto-deletes it (its Change Log carries history).
@@ -492,6 +556,9 @@ def main() -> int:
         test_upgrade_writes_map_from_routes,
         test_trim_diagnoses_empty_scaffold,
         test_trim_threshold_flag_reports_oversize_topic,
+        test_trim_flags_char_oversize_with_few_lines,
+        test_trim_minor_overage_is_optional,
+        test_trim_recheck_runs_validate,
         test_trim_flags_husk_after_merge_without_deleting,
         test_trim_write_deletes_empty_scaffold_topics,
         test_trim_write_promotes_remaining_route_entry,
