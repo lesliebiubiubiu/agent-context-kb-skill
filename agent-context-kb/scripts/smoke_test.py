@@ -258,7 +258,7 @@ def test_upgrade_writes_map_from_routes() -> None:
         require("| Documentation | workflows/local-dev.md | conventions/comments.md |" in text, "write-map should render current routes")
 
 
-# Checks that trim diagnosis stays short while pointing to the write step.
+# Checks that trim diagnosis names concrete candidates by default and points to the write step.
 def test_trim_diagnoses_empty_scaffold() -> None:
     with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
         root = Path(tmp)
@@ -266,8 +266,63 @@ def test_trim_diagnoses_empty_scaffold() -> None:
         result = run_cli(root, "trim")
         require(result.returncode == 0, "trim diagnosis should succeed", result)
         require("Trim diagnosis: cleanup recommended." in result.stdout, "trim should recommend cleanup", result)
+        require("Details:" in result.stdout, "trim should print details by default", result)
+        require(
+            "delete empty scaffold topic: architecture/overview.md" in result.stdout,
+            "trim should name the concrete deletion candidate by default",
+            result,
+        )
         require("trim --root" in result.stdout and "--write" in result.stdout, "trim should show the write command", result)
         require("Agent compact prompt:" in result.stdout, "trim should print the compact prompt", result)
+        require("validate --root" in result.stdout, "compact prompt should name the deterministic validate finisher", result)
+
+
+# Checks that a low --max-file-lines flag makes trim flag an oversized topic with a concrete count.
+def test_trim_threshold_flag_reports_oversize_topic() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        init_root(root)
+        topic = root / ".agent-kb" / "architecture" / "overview.md"
+        topic.write_text(
+            topic.read_text(encoding="utf-8").replace("None yet.", "Real content.\n" + "padding line\n" * 30),
+            encoding="utf-8",
+        )
+        result = run_cli(root, "trim", "--max-file-lines", "10")
+        require(result.returncode == 0, "trim with a custom threshold should succeed", result)
+        require(
+            "architecture/overview.md is" in result.stdout and "(max 10)" in result.stdout,
+            "trim should report the oversized topic with the configured threshold",
+            result,
+        )
+
+
+# Checks that trim flags an emptied husk but never auto-deletes it (its Change Log carries history).
+def test_trim_flags_husk_after_merge_without_deleting() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        init_root(root)
+        topic = root / ".agent-kb" / "architecture" / "overview.md"
+        # Grow the Change Log so the emptied file looks like a post-merge husk, not a pristine scaffold.
+        topic.write_text(
+            topic.read_text(encoding="utf-8").rstrip() + "\n- 2026-06-20 - Merged inbox note `legacy`.\n",
+            encoding="utf-8",
+        )
+        result = run_cli(root, "trim")
+        require(result.returncode == 0, "trim diagnosis should succeed with a husk", result)
+        require(
+            "husk after merge: architecture/overview.md" in result.stdout,
+            "trim should flag the emptied husk",
+            result,
+        )
+        require(
+            "delete empty scaffold topic: architecture/overview.md" not in result.stdout,
+            "a husk with grown Change Log should not be offered for auto-deletion",
+            result,
+        )
+        result = run_cli(root, "trim", "--write")
+        require(result.returncode == 0, "trim --write should succeed alongside a husk", result)
+        require(topic.exists(), "trim --write must not delete a husk")
+        require("Husks after merge (delete manually):" in result.stdout, "write mode should remind about husks", result)
 
 
 # Checks that trim --write deletes empty topics and prunes routes and map output.
@@ -368,6 +423,8 @@ def main() -> int:
         test_upgrade_can_write_start_template,
         test_upgrade_writes_map_from_routes,
         test_trim_diagnoses_empty_scaffold,
+        test_trim_threshold_flag_reports_oversize_topic,
+        test_trim_flags_husk_after_merge_without_deleting,
         test_trim_write_deletes_empty_scaffold_topics,
         test_trim_write_promotes_remaining_route_entry,
         test_trim_write_keeps_non_empty_topic,

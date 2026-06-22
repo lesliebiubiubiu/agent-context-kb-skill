@@ -25,6 +25,7 @@ python3 scripts/agent_kb.py note --root /path/to/repo --title "Auth session note
 python3 scripts/agent_kb.py compile --root /path/to/repo
 python3 scripts/agent_kb.py trim --root /path/to/repo
 python3 scripts/agent_kb.py trim --root /path/to/repo --write
+python3 scripts/agent_kb.py trim --root /path/to/repo --max-file-lines 200
 ```
 
 Use `--root .` when working in the target repository.
@@ -45,9 +46,16 @@ Use `--root .` when working in the target repository.
    stable topic file is not obvious or should be reviewed later.
 5. Use `compile` to merge inbox notes that name an existing `Suggested target`.
    Notes with `unsure`, missing targets, or invalid targets remain in `inbox/`.
-6. Use `trim` to diagnose KB bloat and get a compact prompt. Use `trim --write`
-   only for deterministic cleanup: deleting empty scaffold topics, pruning
-   route references, regenerating `map.md`, and validating the result.
+6. Use `trim` to diagnose KB bloat. By default it names the concrete cleanup
+   candidates and size signals (with actual counts), so the output localizes the
+   problem; tune the budgets with `--max-file-lines`, `--max-total-chars`, and
+   `--max-inbox-notes`. Use `trim --write` only for deterministic cleanup:
+   deleting pristine empty scaffold topics, pruning route references,
+   regenerating `map.md`, and validating. Semantic compacting stays with the
+   agent: `trim` emits a self-converging prompt (rewrite within headings, then
+   `upgrade --write-map` -> `validate` -> rerun `trim` until lean). An emptied
+   husk (content gone but `Change Log` grown) is only flagged for manual
+   deletion, never removed automatically.
 
 ## Knowledge Rules
 

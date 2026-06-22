@@ -670,8 +670,8 @@ def is_initial_changelog_only(body: str) -> bool:
     return len(lines) == 1 and "Created initial KB topic." in lines[0]
 
 
-# Checks whether a stable topic is an empty scaffold that can be safely deleted.
-def is_empty_scaffold_topic(path: Path, kb: Path) -> bool:
+# Checks whether a stable topic has empty content sections and no links, ignoring its Change Log.
+def is_content_empty_topic(path: Path, kb: Path) -> bool:
     relative = path.relative_to(kb)
     if relative in {Path("start.md"), Path("map.md"), Path("plans/current.md")}:
         return False
@@ -685,9 +685,22 @@ def is_empty_scaffold_topic(path: Path, kb: Path) -> bool:
         is_placeholder_body(markdown_section_body(text, "Summary"))
         and is_placeholder_body(markdown_section_body(text, "Current Knowledge"))
         and is_placeholder_body(markdown_section_body(text, "Related"))
-        and is_initial_changelog_only(markdown_section_body(text, "Change Log"))
         and not markdown_links(text)
     )
+
+
+# Checks whether a stable topic is a pristine empty scaffold that can be safely deleted.
+def is_empty_scaffold_topic(path: Path, kb: Path) -> bool:
+    if not is_content_empty_topic(path, kb):
+        return False
+    return is_initial_changelog_only(markdown_section_body(path.read_text(encoding="utf-8"), "Change Log"))
+
+
+# Checks whether a stable topic is an emptied husk: content gone, but its Change Log shows it once held knowledge.
+def is_husk_after_merge_topic(path: Path, kb: Path) -> bool:
+    if not is_content_empty_topic(path, kb):
+        return False
+    return not is_initial_changelog_only(markdown_section_body(path.read_text(encoding="utf-8"), "Change Log"))
 
 
 # Maps internal Markdown link targets to the KB documents that reference them.
@@ -716,29 +729,61 @@ def empty_scaffold_topics(kb: Path) -> list[Path]:
     return safe
 
 
-# Builds the short agent prompt used when trim sees useful cleanup or compacting work.
-def trim_compact_prompt() -> str:
+# Finds emptied husks left after a merge; trim only warns about them because deleting a file with history is a judged act.
+def husk_after_merge_topics(kb: Path) -> list[Path]:
+    return [path for path in stable_topic_docs(kb) if is_husk_after_merge_topic(path, kb)]
+
+
+# Returns the path used to invoke this script so suggested commands copy-paste cleanly under symlinks.
+def script_invocation() -> str:
+    return sys.argv[0] or "agent_kb.py"
+
+
+# Builds the agent handoff: the semantic step (agent judgment) plus the deterministic finisher commands to run after.
+def trim_compact_prompt(args: argparse.Namespace) -> str:
+    script = script_invocation()
     return (
-        "Compact `.agent-kb/` without changing schema. Delete empty scaffold nodes, "
-        "prune routes to remaining useful entries, keep durable knowledge reachable, "
-        "regenerate map.md, and validate."
+        "  Semantic step (agent judgment): within the existing headings, merge\n"
+        "  overlapping sections and keep each Summary / Read When dense (what the\n"
+        "  file is, the current conclusion, the traps). Preserve durable decisions,\n"
+        "  constraints, failures, and links. Change Log is history: collapse routine\n"
+        "  entries (e.g. inbox merges) but keep ones that record a real decision or\n"
+        "  change. Do not change the schema or add headings.\n"
+        "  Then close the loop with the deterministic tools:\n"
+        f"    python3 {script} upgrade --root {args.root} --write-map   # regenerate map.md if you changed routes.yaml\n"
+        f"    python3 {script} validate --root {args.root}              # confirm links, schema, reachability, map==routes\n"
+        f"    python3 {script} trim --root {args.root}                  # re-diagnose; repeat the loop until it reports lean"
     )
 
 
-# Checks whether KB size suggests agent-assisted semantic compacting could help.
-def trim_compact_recommended(kb: Path) -> tuple[bool, list[str]]:
+# Builds the rerun command from this script's actual invocation path so copy-paste works under symlinks.
+def trim_write_command(args: argparse.Namespace) -> str:
+    return f"python3 {script_invocation()} trim --root {args.root} --write"
+
+
+# Checks whether KB size suggests agent-assisted semantic compacting, reporting concrete numbers per signal.
+def trim_compact_recommended(
+    kb: Path,
+    max_file_lines: int = TRIM_MAX_FILE_LINES,
+    max_total_chars: int = TRIM_MAX_TOTAL_CHARS,
+    max_inbox_notes: int = TRIM_MAX_INBOX_NOTES,
+) -> tuple[bool, list[str]]:
     reasons = []
-    docs = stable_topic_docs(kb)
-    total_chars = sum(len(path.read_text(encoding="utf-8")) for path in docs)
-    if total_chars > TRIM_MAX_TOTAL_CHARS:
-        reasons.append(f"stable KB docs exceed {TRIM_MAX_TOTAL_CHARS} characters")
-    for path in docs:
-        line_count = len(path.read_text(encoding="utf-8").splitlines())
-        if line_count > TRIM_MAX_FILE_LINES:
-            reasons.append(f"{path.relative_to(kb)} exceeds {TRIM_MAX_FILE_LINES} lines")
+    total_chars = 0
+    oversize = []
+    for path in stable_topic_docs(kb):
+        text = path.read_text(encoding="utf-8")
+        total_chars += len(text)
+        line_count = len(text.splitlines())
+        if line_count > max_file_lines:
+            oversize.append((path.relative_to(kb), line_count))
+    if total_chars > max_total_chars:
+        reasons.append(f"stable KB docs total {total_chars} chars (max {max_total_chars})")
+    for relative, line_count in oversize:
+        reasons.append(f"{relative} is {line_count} lines (max {max_file_lines})")
     inbox_count = len(list((kb / "inbox").glob("*.md"))) if (kb / "inbox").exists() else 0
-    if inbox_count > TRIM_MAX_INBOX_NOTES:
-        reasons.append(f"inbox has more than {TRIM_MAX_INBOX_NOTES} notes")
+    if inbox_count > max_inbox_notes:
+        reasons.append(f"inbox has {inbox_count} notes (max {max_inbox_notes})")
     return bool(reasons), reasons
 
 
@@ -881,29 +926,33 @@ def command_trim(args: argparse.Namespace) -> int:
         return 1
 
     candidates = empty_scaffold_topics(kb)
-    compact_recommended, compact_reasons = trim_compact_recommended(kb)
+    husks = husk_after_merge_topics(kb)
+    compact_recommended, compact_reasons = trim_compact_recommended(
+        kb, args.max_file_lines, args.max_total_chars, args.max_inbox_notes
+    )
 
     if not args.write:
-        if not candidates and not compact_recommended:
+        if not candidates and not husks and not compact_recommended:
             print("Trim diagnosis: KB is already lean.")
             print("No write step recommended.")
             return 0
-        diagnosis = "cleanup recommended" if candidates else "compact recommended"
+        diagnosis = "cleanup recommended" if candidates or husks else "compact recommended"
         print(f"Trim diagnosis: {diagnosis}.")
+        print()
+        print("Details:")
+        for path in candidates:
+            print(f"- delete empty scaffold topic: {path.relative_to(kb)}")
+        for path in husks:
+            print(f"- husk after merge: {path.relative_to(kb)} (content empty, Change Log grown; delete manually)")
+        for reason in compact_reasons:
+            print(f"- compact signal: {reason}")
         if candidates:
             print()
             print("Next:")
-            print(f"  python3 agent-kb/scripts/agent_kb.py trim --root {args.root} --write")
+            print(f"  {trim_write_command(args)}")
         print()
         print("Agent compact prompt:")
-        print(f"  {trim_compact_prompt()}")
-        if args.verbose:
-            print()
-            print("Details:")
-            for path in candidates:
-                print(f"- delete empty scaffold topic: {path.relative_to(kb)}")
-            for reason in compact_reasons:
-                print(f"- compact signal: {reason}")
+        print(trim_compact_prompt(args))
         return 0
 
     deleted = set()
@@ -922,10 +971,14 @@ def command_trim(args: argparse.Namespace) -> int:
     print(f"- Updated routes.yaml: {'yes' if deleted or routes_changed else 'no'}.")
     print(f"- Regenerated map.md: {'yes' if deleted or routes_changed else 'no'}.")
     print(f"- Validate: {'OK' if not errors else 'FAILED'}.")
-    if args.verbose and deleted:
+    if deleted:
         print("Deleted nodes:")
         for path in sorted(deleted):
             print(f"- {path}")
+    if husks:
+        print("Husks after merge (delete manually):")
+        for path in sorted(husks):
+            print(f"- {path.relative_to(kb)}")
     if compact_recommended:
         print("Agent compact still recommended for non-empty topics.")
     for error in errors:
@@ -1076,7 +1129,10 @@ def build_parser() -> argparse.ArgumentParser:
     trim_parser = subparsers.add_parser("trim", help="Diagnose or apply safe KB trimming.")
     trim_parser.add_argument("--root", default=".", help="Repository root to manage.")
     trim_parser.add_argument("--write", action="store_true", help="Apply deterministic cleanup and validate.")
-    trim_parser.add_argument("--verbose", action="store_true", help="Print detailed trim candidates.")
+    trim_parser.add_argument("--max-file-lines", type=int, default=TRIM_MAX_FILE_LINES, help=f"Lines above which a topic is flagged for compacting (default {TRIM_MAX_FILE_LINES}).")
+    trim_parser.add_argument("--max-total-chars", type=int, default=TRIM_MAX_TOTAL_CHARS, help=f"Total stable-doc character budget before compacting is suggested (default {TRIM_MAX_TOTAL_CHARS}).")
+    trim_parser.add_argument("--max-inbox-notes", type=int, default=TRIM_MAX_INBOX_NOTES, help=f"Inbox note count above which compacting is suggested (default {TRIM_MAX_INBOX_NOTES}).")
+    trim_parser.add_argument("--verbose", action="store_true", help="Deprecated: trim now prints details by default.")
     trim_parser.set_defaults(func=command_trim)
     return parser
 
