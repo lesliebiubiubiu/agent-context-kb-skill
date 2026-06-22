@@ -62,7 +62,10 @@ Use `--root .` when working in the target repository.
    `.agent-kb/.gitignore` so the log stays out of git. `stats` draws ASCII bar
    charts of command frequency (with failure counts) and per-file change churn
    from git history, so you can see at a glance which commands run most and
-   which KB documents change most. Surface this output to the user.
+   which KB documents change most. Surface this output to the user. Each event
+   also records the run's parameters (`args`, with free text like note bodies
+   redacted) and optional per-command `metrics`; `validate` logs error/warning
+   counts that `stats` surfaces as a KB health line.
    Logging is best-effort and never blocks a command. Reads of KB documents are
    done by the agent's own tools, so the CLI cannot observe them; only command
    runs and git-tracked writes are recorded.

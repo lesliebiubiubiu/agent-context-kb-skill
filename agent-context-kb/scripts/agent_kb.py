@@ -237,8 +237,27 @@ def kb_dir(root: Path) -> Path:
     return root / ".agent-kb"
 
 
-# Appends one JSONL line per CLI run; best-effort so logging never breaks a command.
-def log_event(args: argparse.Namespace, command: str, exit_code: int) -> None:
+# CLI params never logged: dispatch internals and the repo root (location, low signal).
+LOG_DROP_ARGS = {"func", "command", "root"}
+# Free-text params redacted to a length marker so the log never carries note content (secrets rule).
+LOG_REDACT_ARGS = {"title", "body"}
+
+
+# Builds a redacted dict of the CLI parameters: keeps structural flags, redacts free text, drops internals.
+def redact_args(args: argparse.Namespace) -> dict:
+    out: dict = {}
+    for key, value in vars(args).items():
+        if key in LOG_DROP_ARGS or value is None:
+            continue
+        if key in LOG_REDACT_ARGS:
+            out[key] = f"<redacted:{len(str(value))}chars>"
+        else:
+            out[key] = value
+    return out
+
+
+# Appends one JSONL line per CLI run (params plus optional metrics); best-effort so logging never breaks a command.
+def log_event(args: argparse.Namespace, command: str, exit_code: int, metrics: dict | None = None) -> None:
     try:
         kb = kb_dir(repo_root(args))
         if not kb.exists():
@@ -250,7 +269,10 @@ def log_event(args: argparse.Namespace, command: str, exit_code: int) -> None:
             "event": "cli",
             "command": command,
             "exit": int(exit_code),
+            "args": redact_args(args),
         }
+        if metrics:
+            event["metrics"] = metrics
         with (log_dir / "events.jsonl").open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event) + "\n")
     except Exception:
@@ -962,7 +984,7 @@ def reachable_docs(kb: Path, rows: list[tuple[str, str, str]]) -> set[Path]:
 
 
 # Validates the KB scaffold, routes, links, inbox notes, and topic reachability.
-def command_validate(args: argparse.Namespace) -> int:
+def command_validate(args: argparse.Namespace) -> tuple[int, dict]:
     root = repo_root(args)
     kb = kb_dir(root)
     errors, warnings = validate_kb(kb)
@@ -971,10 +993,11 @@ def command_validate(args: argparse.Namespace) -> int:
         print(f"WARN: {warning}")
     for error in errors:
         print(f"ERROR: {error}")
+    metrics = {"errors": len(errors), "warnings": len(warnings)}
     if errors:
-        return 1
+        return 1, metrics
     print(f"OK: validated {kb}")
-    return 0
+    return 0, metrics
 
 
 # Diagnoses or applies safe deterministic KB trimming.
@@ -1206,6 +1229,16 @@ def command_stats(args: argparse.Namespace) -> int:
             for path, count in churn[: args.top]
         ]
         print_bar_chart(rows)
+
+    print()
+    print("KB health (latest validate):")
+    latest = next((e for e in reversed(events) if e.get("command") == "validate" and "metrics" in e), None)
+    if latest is None:
+        print("  (no validate run logged yet)")
+    else:
+        metrics = latest["metrics"]
+        print(f"  errors:   {metrics.get('errors', 0)}")
+        print(f"  warnings: {metrics.get('warnings', 0)}    (at {latest.get('ts', '?')})")
     return 0
 
 
@@ -1261,8 +1294,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    exit_code = args.func(args)
-    log_event(args, args.command, exit_code)
+    result = args.func(args)
+    # Commands return either an exit code or (exit code, metrics dict).
+    if isinstance(result, tuple):
+        exit_code, metrics = result
+    else:
+        exit_code, metrics = result, None
+    log_event(args, args.command, exit_code, metrics)
     return exit_code
 
 

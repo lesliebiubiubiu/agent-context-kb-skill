@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import tempfile
@@ -422,6 +423,43 @@ def test_kb_gitignore_init_and_upgrade() -> None:
         require(ignore.exists(), "upgrade should recreate the KB gitignore")
 
 
+# Checks that validate logs structured metrics plus redacted args, and stats surfaces KB health.
+def test_validate_metrics_and_health() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        init_root(root)
+        orphan = root / ".agent-kb" / "architecture" / "orphan.md"
+        orphan.write_text(
+            "# Orphan\n\n## Summary\n\nx\n\n## Read When\n\n- t\n\n## Current Knowledge\n\nUnreachable.\n",
+            encoding="utf-8",
+        )
+        result = run_cli(root, "validate")
+        require(result.returncode == 0, "validate should succeed with only warnings", result)
+        log = (root / ".agent-kb" / ".log" / "events.jsonl").read_text(encoding="utf-8")
+        events = [json.loads(line) for line in log.splitlines() if line.strip()]
+        validate_events = [event for event in events if event.get("command") == "validate"]
+        require(bool(validate_events), "validate run should be logged")
+        last = validate_events[-1]
+        require("args" in last, "event should record redacted args")
+        require("metrics" in last and last["metrics"]["warnings"] >= 1, "validate should log a warning-count metric", result)
+        result = run_cli(root, "stats")
+        require("KB health (latest validate)" in result.stdout, "stats should show KB health section", result)
+        require("warnings:" in result.stdout, "stats health should show the warning count", result)
+
+
+# Checks that free-text note args are redacted in the event log (secrets rule).
+def test_note_body_redacted_in_log() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        init_root(root)
+        secret = "SENSITIVE-BODY-TEXT"
+        result = run_cli(root, "note", "--title", "T", "--target", "architecture/overview.md", "--body", secret)
+        require(result.returncode == 0, "note should succeed", result)
+        log = (root / ".agent-kb" / ".log" / "events.jsonl").read_text(encoding="utf-8")
+        require(secret not in log, "note body must never appear in the event log")
+        require("<redacted:" in log, "redacted free-text args should be marked")
+
+
 # Checks that CLI runs are logged and that stats reports command usage.
 def test_stats_reports_cli_usage() -> None:
     with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
@@ -461,6 +499,8 @@ def main() -> int:
         test_trim_write_keeps_malformed_topic,
         test_trim_write_keeps_linked_empty_topic,
         test_kb_gitignore_init_and_upgrade,
+        test_validate_metrics_and_health,
+        test_note_body_redacted_in_log,
         test_stats_reports_cli_usage,
     ]
     for test in tests:
