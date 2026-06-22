@@ -26,6 +26,7 @@ python3 scripts/agent_kb.py compile --root /path/to/repo
 python3 scripts/agent_kb.py trim --root /path/to/repo
 python3 scripts/agent_kb.py trim --root /path/to/repo --write
 python3 scripts/agent_kb.py trim --root /path/to/repo --max-file-lines 200
+python3 scripts/agent_kb.py stats --root /path/to/repo
 ```
 
 Use `--root .` when working in the target repository.
@@ -56,6 +57,13 @@ Use `--root .` when working in the target repository.
    `upgrade --write-map` -> `validate` -> rerun `trim` until lean). An emptied
    husk (content gone but `Change Log` grown) is only flagged for manual
    deletion, never removed automatically.
+7. Use `stats` to observe usage. Every CLI run appends one JSONL line to
+   `.agent-kb/.log/events.jsonl` (gitignored), and `stats` reports command
+   frequency with failure counts plus per-file change churn from git history,
+   so you can see which commands run most and which KB documents change most.
+   Logging is best-effort and never blocks a command. Reads of KB documents are
+   done by the agent's own tools, so the CLI cannot observe them; only command
+   runs and git-tracked writes are recorded.
 
 ## Knowledge Rules
 

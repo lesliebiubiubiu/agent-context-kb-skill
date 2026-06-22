@@ -407,6 +407,21 @@ def test_trim_write_keeps_linked_empty_topic() -> None:
         require(boundaries.exists(), "linked empty topic should not be auto-deleted")
 
 
+# Checks that CLI runs are logged and that stats reports command usage.
+def test_stats_reports_cli_usage() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        init_root(root)
+        run_cli(root, "validate")
+        log = root / ".agent-kb" / ".log" / "events.jsonl"
+        require(log.exists(), "CLI runs should append to the event log")
+        result = run_cli(root, "stats")
+        require(result.returncode == 0, "stats should succeed", result)
+        require("CLI command usage" in result.stdout, "stats should report command usage", result)
+        require("init" in result.stdout and "validate" in result.stdout, "stats should list run commands", result)
+        require("KB file churn" in result.stdout, "stats should report the churn section", result)
+
+
 # Runs all smoke tests and prints a compact success line.
 def main() -> int:
     tests = [
@@ -430,6 +445,7 @@ def main() -> int:
         test_trim_write_keeps_non_empty_topic,
         test_trim_write_keeps_malformed_topic,
         test_trim_write_keeps_linked_empty_topic,
+        test_stats_reports_cli_usage,
     ]
     for test in tests:
         test()

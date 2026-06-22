@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 from collections import deque
 import datetime as dt
+import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -233,6 +235,63 @@ def repo_root(args: argparse.Namespace) -> Path:
 # Returns the `.agent-kb` directory for a repository root.
 def kb_dir(root: Path) -> Path:
     return root / ".agent-kb"
+
+
+# Appends one JSONL line per CLI run; best-effort so logging never breaks a command.
+def log_event(args: argparse.Namespace, command: str, exit_code: int) -> None:
+    try:
+        kb = kb_dir(repo_root(args))
+        if not kb.exists():
+            return
+        log_dir = kb / ".log"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        event = {
+            "ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+            "event": "cli",
+            "command": command,
+            "exit": int(exit_code),
+        }
+        with (log_dir / "events.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event) + "\n")
+    except Exception:
+        return
+
+
+# Reads JSONL events from the log, skipping blank or malformed lines.
+def read_events(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    events = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return events
+
+
+# Counts how often each .agent-kb file changed in git history (write hotspots).
+def git_churn(root: Path) -> list[tuple[str, int]]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "log", "--format=", "--name-only", "--", ".agent-kb"],
+            check=True,
+            encoding="utf-8",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return []
+    counts: dict[str, int] = {}
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        counts[line] = counts.get(line, 0) + 1
+    return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
 
 
 # Writes content only when the target file does not already exist.
@@ -1094,6 +1153,40 @@ def command_compile(args: argparse.Namespace) -> int:
     return 0
 
 
+# Summarizes CLI usage from the event log and KB file churn from git history.
+def command_stats(args: argparse.Namespace) -> int:
+    root = repo_root(args)
+    kb = kb_dir(root)
+    if not kb.exists():
+        print("ERROR: missing .agent-kb/")
+        return 1
+
+    print("CLI command usage (.agent-kb/.log/events.jsonl):")
+    events = read_events(kb / ".log" / "events.jsonl")
+    if not events:
+        print("  (no events logged yet)")
+    else:
+        counts: dict[str, list[int]] = {}
+        for event in events:
+            command = str(event.get("command", "?"))
+            failed = 1 if event.get("exit", 0) != 0 else 0
+            total, fails = counts.get(command, [0, 0])
+            counts[command] = [total + 1, fails + failed]
+        for command, (total, fails) in sorted(counts.items(), key=lambda kv: (-kv[1][0], kv[0])):
+            suffix = f"  ({fails} failed)" if fails else ""
+            print(f"  {command:<10} {total}{suffix}")
+
+    print()
+    print("KB file churn (git history):")
+    churn = git_churn(root)
+    if not churn:
+        print("  (no git history for .agent-kb)")
+    else:
+        for path, count in churn[: args.top]:
+            print(f"  {count:>4}  {path}")
+    return 0
+
+
 # Builds the command-line parser for agent KB maintenance actions.
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Manage a repository-local .agent-kb knowledge base.")
@@ -1134,6 +1227,11 @@ def build_parser() -> argparse.ArgumentParser:
     trim_parser.add_argument("--max-inbox-notes", type=int, default=TRIM_MAX_INBOX_NOTES, help=f"Inbox note count above which compacting is suggested (default {TRIM_MAX_INBOX_NOTES}).")
     trim_parser.add_argument("--verbose", action="store_true", help="Deprecated: trim now prints details by default.")
     trim_parser.set_defaults(func=command_trim)
+
+    stats_parser = subparsers.add_parser("stats", help="Summarize CLI usage and KB file churn.")
+    stats_parser.add_argument("--root", default=".", help="Repository root to manage.")
+    stats_parser.add_argument("--top", type=int, default=15, help="Show at most this many churn rows (default 15).")
+    stats_parser.set_defaults(func=command_stats)
     return parser
 
 
@@ -1141,7 +1239,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return args.func(args)
+    exit_code = args.func(args)
+    log_event(args, args.command, exit_code)
+    return exit_code
 
 
 if __name__ == "__main__":
