@@ -476,6 +476,10 @@ def upsert_agents_protocol(root: Path) -> str:
     return "appended"
 
 
+# Keeps the best-effort event log out of git; lives inside the KB so it travels with the scaffold.
+KB_GITIGNORE = ".log/\n"
+
+
 # Initializes `.agent-kb/` and the AGENTS.md runtime protocol.
 def command_init(args: argparse.Namespace) -> int:
     root = repo_root(args)
@@ -499,6 +503,7 @@ def command_init(args: argparse.Namespace) -> int:
         "routes.yaml": ROUTES_YAML,
         "map.md": MAP_MD,
         "plans/current.md": render_current_plan(),
+        ".gitignore": KB_GITIGNORE,
     }.items():
         if write_if_missing(kb / relative, content):
             created.append(str(Path(".agent-kb") / relative))
@@ -543,6 +548,7 @@ def command_upgrade(args: argparse.Namespace) -> int:
         (kb / "inbox").mkdir(parents=True)
 
     protocol_action = upsert_agents_protocol(root)
+    gitignore_action = upgrade_scaffold_file(kb / ".gitignore", KB_GITIGNORE, False)
     start_action = upgrade_scaffold_file(kb / "start.md", START_MD, args.write_start)
     routes_action = upgrade_scaffold_file(kb / "routes.yaml", ROUTES_YAML, args.write_routes)
     plan_action = upgrade_scaffold_file(kb / "plans" / "current.md", render_current_plan(), args.write_plan)
@@ -553,6 +559,7 @@ def command_upgrade(args: argparse.Namespace) -> int:
 
     print(f"Upgraded KB at {kb}")
     print(f"AGENTS.md protocol {protocol_action}.")
+    print(f".agent-kb/.gitignore {gitignore_action}.")
     print(f".agent-kb/start.md {start_action}.")
     if custom_routes_preserved:
         print(".agent-kb/routes.yaml custom routes preserved.")

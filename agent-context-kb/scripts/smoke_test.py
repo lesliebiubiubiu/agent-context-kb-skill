@@ -407,6 +407,21 @@ def test_trim_write_keeps_linked_empty_topic() -> None:
         require(boundaries.exists(), "linked empty topic should not be auto-deleted")
 
 
+# Checks that init writes a KB-local .gitignore and upgrade restores it when missing.
+def test_kb_gitignore_init_and_upgrade() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        init_root(root)
+        ignore = root / ".agent-kb" / ".gitignore"
+        require(ignore.exists(), "init should create .agent-kb/.gitignore")
+        require(".log/" in ignore.read_text(encoding="utf-8"), "KB gitignore should ignore the .log/ dir")
+        ignore.unlink()
+        result = run_cli(root, "upgrade")
+        require(result.returncode == 0, "upgrade should succeed when KB gitignore is missing", result)
+        require(".agent-kb/.gitignore created." in result.stdout, "upgrade should report KB gitignore creation", result)
+        require(ignore.exists(), "upgrade should recreate the KB gitignore")
+
+
 # Checks that CLI runs are logged and that stats reports command usage.
 def test_stats_reports_cli_usage() -> None:
     with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
@@ -445,6 +460,7 @@ def main() -> int:
         test_trim_write_keeps_non_empty_topic,
         test_trim_write_keeps_malformed_topic,
         test_trim_write_keeps_linked_empty_topic,
+        test_kb_gitignore_init_and_upgrade,
         test_stats_reports_cli_usage,
     ]
     for test in tests:

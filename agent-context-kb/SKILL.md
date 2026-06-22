@@ -58,7 +58,8 @@ Use `--root .` when working in the target repository.
    husk (content gone but `Change Log` grown) is only flagged for manual
    deletion, never removed automatically.
 7. Use `stats` to observe usage. Every CLI run appends one JSONL line to
-   `.agent-kb/.log/events.jsonl` (gitignored), and `stats` reports command
+   `.agent-kb/.log/events.jsonl`; `init` and `upgrade` write a KB-local
+   `.agent-kb/.gitignore` so the log stays out of git. `stats` reports command
    frequency with failure counts plus per-file change churn from git history,
    so you can see which commands run most and which KB documents change most.
    Logging is best-effort and never blocks a command. Reads of KB documents are
