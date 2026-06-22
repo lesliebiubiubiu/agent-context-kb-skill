@@ -47,22 +47,34 @@ Use `--root .` when working in the target repository.
    stable topic file is not obvious or should be reviewed later.
 5. Use `compile` to merge inbox notes that name an existing `Suggested target`.
    Notes with `unsure`, missing targets, or invalid targets remain in `inbox/`.
-6. Use `trim` to diagnose KB bloat. By default it names the concrete cleanup
-   candidates and size signals (with actual counts), so the output localizes the
-   problem; tune the budgets with `--max-file-lines`, `--max-total-chars`, and
-   `--max-inbox-notes`. Use `trim --write` only for deterministic cleanup:
+6. Use `trim` to diagnose KB bloat. It first prints the per-file char/line
+   breakdown of every stable doc counted toward the budget (plus the total and
+   soft budget), so you never need to re-measure with `wc`. It then names the
+   concrete cleanup candidates and structural signals (with actual counts), so
+   the output localizes the problem; tune the budgets with `--max-file-lines`,
+   `--max-total-chars`, and `--max-inbox-notes`. The total-char budget is a
+   **soft** signal: it is reported but does not by itself drive another
+   compaction pass. The compaction loop converges on structural signals the
+   agent can deterministically fix — duplicate scaffolds, oversize files, inbox
+   backlog. So `trim` distinguishes two clean states: `KB is already lean`, and
+   `lean (above soft budget)` (structure is clean but the total exceeds the soft
+   budget — likely just legitimate durable content; do **not** keep compacting
+   to chase the number). Use `trim --write` only for deterministic cleanup:
    deleting pristine empty scaffold topics, pruning route references,
    regenerating `map.md`, and validating. Semantic compacting stays with the
    agent: `trim` emits a self-converging prompt (rewrite within headings, then
-   `upgrade --write-map` -> `validate` -> rerun `trim` until lean). An emptied
-   husk (content gone but `Change Log` grown) is only flagged for manual
-   deletion, never removed automatically.
+   `upgrade --write-map` -> `validate` -> rerun `trim` until lean — stopping once
+   structure is clean, even if still above the soft budget). An emptied husk
+   (content gone but `Change Log` grown) is only flagged for manual deletion,
+   never removed automatically.
 7. Use `stats` to observe usage. Every CLI run appends one JSONL line to
    `.agent-kb/.log/events.jsonl`; `init` and `upgrade` write a KB-local
    `.agent-kb/.gitignore` so the log stays out of git. `stats` draws ASCII bar
-   charts of command frequency (with failure counts) and per-file change churn
-   from git history, so you can see at a glance which commands run most and
-   which KB documents change most. Surface this output to the user. Each event
+   charts of command frequency (with failure counts), per-file change churn
+   from git history, and the largest current KB files by character count, so you
+   can see at a glance which commands run most, which KB documents change most,
+   and which carry the most weight right now (not just historically). Surface
+   this output to the user. Each event
    also records the run's parameters (`args`, with free text like note bodies
    redacted) and optional per-command `metrics` (e.g. validate error/warning
    counts, trim deleted/husk counts, compile merged/unresolved); `stats`

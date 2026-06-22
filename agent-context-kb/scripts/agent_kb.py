@@ -599,8 +599,17 @@ def command_upgrade(args: argparse.Namespace) -> int:
         print("Review .agent-kb/plans/current.md manually; use --write-plan only if you want the default empty plan.")
     if map_action == "needs review":
         print("Review .agent-kb/map.md manually; use --write-map only if you want the default routing table.")
-    actions = [protocol_action, gitignore_action, start_action, routes_action, plan_action, map_action]
-    return 0, {"needs_review": actions.count("needs review")}
+    # Name the files awaiting review (routes are excluded when intentionally preserved) so stats/output need no second run.
+    named_actions = [
+        ("start.md", start_action),
+        ("routes.yaml", "current" if custom_routes_preserved else routes_action),
+        ("plans/current.md", plan_action),
+        ("map.md", map_action),
+    ]
+    review_files = [name for name, action in named_actions if action == "needs review"]
+    if review_files:
+        print(f"needs review: {', '.join(review_files)}")
+    return 0, {"needs_review": len(review_files), "review_files": review_files}
 
 
 # Extracts the Task Routing rows from `.agent-kb/map.md` for legacy compatibility.
@@ -841,7 +850,9 @@ def trim_compact_prompt(args: argparse.Namespace) -> str:
         "  Then close the loop with the deterministic tools:\n"
         f"    python3 {script} upgrade --root {args.root} --write-map   # regenerate map.md if you changed routes.yaml\n"
         f"    python3 {script} validate --root {args.root}              # confirm links, schema, reachability, map==routes\n"
-        f"    python3 {script} trim --root {args.root}                  # re-diagnose; repeat the loop until it reports lean"
+        f"    python3 {script} trim --root {args.root}                  # re-diagnose; repeat until lean. The soft char\n"
+        "                                                              # budget alone is NOT a reason to keep compacting:\n"
+        "                                                              # stop once structure is clean, even if 'above soft budget'."
     )
 
 
@@ -850,30 +861,59 @@ def trim_write_command(args: argparse.Namespace) -> str:
     return f"python3 {script_invocation()} trim --root {args.root} --write"
 
 
-# Checks whether KB size suggests agent-assisted semantic compacting, reporting concrete numbers per signal.
-def trim_compact_recommended(
+# Lists stable topic docs with their char sizes (largest first) so size diagnostics can be shared.
+def stable_doc_sizes(kb: Path) -> list[tuple[Path, int]]:
+    sizes = [(path.relative_to(kb), len(path.read_text(encoding="utf-8"))) for path in stable_topic_docs(kb)]
+    sizes.sort(key=lambda item: item[1], reverse=True)
+    return sizes
+
+
+# Measures stable-doc sizes and separates structural signals (agent-fixable) from the soft char budget.
+def trim_size_report(
     kb: Path,
     max_file_lines: int = TRIM_MAX_FILE_LINES,
     max_total_chars: int = TRIM_MAX_TOTAL_CHARS,
     max_inbox_notes: int = TRIM_MAX_INBOX_NOTES,
-) -> tuple[bool, list[str]]:
-    reasons = []
+) -> dict:
+    files = []
     total_chars = 0
     oversize = []
     for path in stable_topic_docs(kb):
         text = path.read_text(encoding="utf-8")
-        total_chars += len(text)
-        line_count = len(text.splitlines())
-        if line_count > max_file_lines:
-            oversize.append((path.relative_to(kb), line_count))
-    if total_chars > max_total_chars:
-        reasons.append(f"stable KB docs total {total_chars} chars (max {max_total_chars})")
-    for relative, line_count in oversize:
-        reasons.append(f"{relative} is {line_count} lines (max {max_file_lines})")
+        chars = len(text)
+        lines = len(text.splitlines())
+        relative = path.relative_to(kb)
+        files.append((relative, chars, lines))
+        total_chars += chars
+        if lines > max_file_lines:
+            oversize.append((relative, lines))
+    files.sort(key=lambda item: item[1], reverse=True)
     inbox_count = len(list((kb / "inbox").glob("*.md"))) if (kb / "inbox").exists() else 0
-    if inbox_count > max_inbox_notes:
-        reasons.append(f"inbox has {inbox_count} notes (max {max_inbox_notes})")
-    return bool(reasons), reasons
+    return {
+        "files": files,
+        "total_chars": total_chars,
+        "max_total_chars": max_total_chars,
+        "oversize": oversize,
+        "inbox_count": inbox_count,
+        "max_inbox_notes": max_inbox_notes,
+        "over_budget": total_chars > max_total_chars,
+        # Structural signals are the ones the loop should converge on; the char budget alone is not.
+        "compact_recommended": bool(oversize) or inbox_count > max_inbox_notes,
+    }
+
+
+# Prints the per-file char/line breakdown trim counts toward its budget so agents never re-measure with wc.
+def print_trim_size_breakdown(report: dict, indent: str = "  ") -> None:
+    print("Budget scope (stable topic docs counted toward the char budget):")
+    files = report["files"]
+    if not files:
+        print(f"{indent}(no stable topic docs)")
+        return
+    name_width = max(len(str(rel)) for rel, _, _ in files)
+    name_width = max(name_width, len("total"))
+    for rel, chars, lines in files:
+        print(f"{indent}{str(rel):<{name_width}}  {chars:>6} chars  {lines:>4} lines")
+    print(f"{indent}{'total':<{name_width}}  {report['total_chars']:>6} chars  (soft budget {report['max_total_chars']})")
 
 
 # Removes deleted topic paths from routes and promotes remaining entries when needed.
@@ -1017,15 +1057,31 @@ def command_trim(args: argparse.Namespace) -> int:
 
     candidates = empty_scaffold_topics(kb)
     husks = husk_after_merge_topics(kb)
-    compact_recommended, compact_reasons = trim_compact_recommended(
-        kb, args.max_file_lines, args.max_total_chars, args.max_inbox_notes
-    )
+    report = trim_size_report(kb, args.max_file_lines, args.max_total_chars, args.max_inbox_notes)
+    compact_recommended = report["compact_recommended"]
+    structural = bool(candidates or husks or compact_recommended)
 
     if not args.write:
-        if not candidates and not husks and not compact_recommended:
-            print("Trim diagnosis: KB is already lean.")
+        # Always show the breakdown so the agent trusts trim's count instead of re-running wc.
+        print_trim_size_breakdown(report)
+        print()
+        if not structural:
+            if report["over_budget"]:
+                print("Trim diagnosis: lean (above soft budget).")
+                print(f"  Structure is clean: no duplicate scaffolds, oversize files, or inbox backlog.")
+                print(f"  Total {report['total_chars']} chars exceeds the {report['max_total_chars']} soft budget, but that")
+                print(f"  may just be legitimate durable content. Do NOT compact again to chase the")
+                print(f"  number; only compact if you can see real duplication or stale detail above.")
+            else:
+                print("Trim diagnosis: KB is already lean.")
             print("No write step recommended.")
-            return 0, {"candidates": 0, "husks": 0, "compact": False}
+            return 0, {
+                "candidates": 0,
+                "husks": 0,
+                "compact": False,
+                "over_budget": report["over_budget"],
+                "total_chars": report["total_chars"],
+            }
         diagnosis = "cleanup recommended" if candidates or husks else "compact recommended"
         print(f"Trim diagnosis: {diagnosis}.")
         print()
@@ -1034,8 +1090,12 @@ def command_trim(args: argparse.Namespace) -> int:
             print(f"- delete empty scaffold topic: {path.relative_to(kb)}")
         for path in husks:
             print(f"- husk after merge: {path.relative_to(kb)} (content empty, Change Log grown; delete manually)")
-        for reason in compact_reasons:
-            print(f"- compact signal: {reason}")
+        for relative, line_count in report["oversize"]:
+            print(f"- compact signal: {relative} is {line_count} lines (max {args.max_file_lines})")
+        if report["inbox_count"] > report["max_inbox_notes"]:
+            print(f"- compact signal: inbox has {report['inbox_count']} notes (max {report['max_inbox_notes']})")
+        if report["over_budget"]:
+            print(f"- soft signal: stable KB docs total {report['total_chars']} chars (above {report['max_total_chars']} soft budget; not a reason to over-compact)")
         if candidates:
             print()
             print("Next:")
@@ -1043,7 +1103,13 @@ def command_trim(args: argparse.Namespace) -> int:
         print()
         print("Agent compact prompt:")
         print(trim_compact_prompt(args))
-        return 0, {"candidates": len(candidates), "husks": len(husks), "compact": compact_recommended}
+        return 0, {
+            "candidates": len(candidates),
+            "husks": len(husks),
+            "compact": compact_recommended,
+            "over_budget": report["over_budget"],
+            "total_chars": report["total_chars"],
+        }
 
     deleted = set()
     for path in candidates:
@@ -1229,6 +1295,15 @@ def command_stats(args: argparse.Namespace) -> int:
             (path[len(".agent-kb/"):] if path.startswith(".agent-kb/") else path, count, str(count))
             for path, count in churn[: args.top]
         ]
+        print_bar_chart(rows)
+
+    print()
+    print("Largest KB files (current chars):")
+    sizes = stable_doc_sizes(kb)
+    if not sizes:
+        print("  (no stable topic docs)")
+    else:
+        rows = [(str(relative), chars, str(chars)) for relative, chars in sizes[: args.top]]
         print_bar_chart(rows)
 
     print()
