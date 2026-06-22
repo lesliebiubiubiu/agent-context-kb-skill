@@ -59,9 +59,10 @@ Use `--root .` when working in the target repository.
    deletion, never removed automatically.
 7. Use `stats` to observe usage. Every CLI run appends one JSONL line to
    `.agent-kb/.log/events.jsonl`; `init` and `upgrade` write a KB-local
-   `.agent-kb/.gitignore` so the log stays out of git. `stats` reports command
-   frequency with failure counts plus per-file change churn from git history,
-   so you can see which commands run most and which KB documents change most.
+   `.agent-kb/.gitignore` so the log stays out of git. `stats` draws ASCII bar
+   charts of command frequency (with failure counts) and per-file change churn
+   from git history, so you can see at a glance which commands run most and
+   which KB documents change most. Surface this output to the user.
    Logging is best-effort and never blocks a command. Reads of KB documents are
    done by the agent's own tools, so the CLI cannot observe them; only command
    runs and git-tracked writes are recorded.

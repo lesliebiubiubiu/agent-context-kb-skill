@@ -1160,7 +1160,17 @@ def command_compile(args: argparse.Namespace) -> int:
     return 0
 
 
-# Summarizes CLI usage from the event log and KB file churn from git history.
+# Prints (label, value, suffix) rows as a proportional ASCII bar chart for quick visual scanning.
+def print_bar_chart(rows: list[tuple[str, int, str]], indent: str = "  ", width: int = 24) -> None:
+    max_value = max((value for _, value, _ in rows), default=0)
+    label_width = max((len(label) for label, _, _ in rows), default=0)
+    for label, value, suffix in rows:
+        filled = max(1, round(value / max_value * width)) if max_value > 0 and value > 0 else 0
+        bar = "█" * filled
+        print(f"{indent}{label:<{label_width}}  {bar:<{width}}  {suffix}")
+
+
+# Summarizes CLI usage from the event log and KB file churn from git history, drawn as bar charts.
 def command_stats(args: argparse.Namespace) -> int:
     root = repo_root(args)
     kb = kb_dir(root)
@@ -1179,9 +1189,11 @@ def command_stats(args: argparse.Namespace) -> int:
             failed = 1 if event.get("exit", 0) != 0 else 0
             total, fails = counts.get(command, [0, 0])
             counts[command] = [total + 1, fails + failed]
+        rows = []
         for command, (total, fails) in sorted(counts.items(), key=lambda kv: (-kv[1][0], kv[0])):
-            suffix = f"  ({fails} failed)" if fails else ""
-            print(f"  {command:<10} {total}{suffix}")
+            suffix = f"{total}" + (f"  ({fails} failed)" if fails else "")
+            rows.append((command, total, suffix))
+        print_bar_chart(rows[: args.top])
 
     print()
     print("KB file churn (git history):")
@@ -1189,8 +1201,11 @@ def command_stats(args: argparse.Namespace) -> int:
     if not churn:
         print("  (no git history for .agent-kb)")
     else:
-        for path, count in churn[: args.top]:
-            print(f"  {count:>4}  {path}")
+        rows = [
+            (path[len(".agent-kb/"):] if path.startswith(".agent-kb/") else path, count, str(count))
+            for path, count in churn[: args.top]
+        ]
+        print_bar_chart(rows)
     return 0
 
 
@@ -1237,7 +1252,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     stats_parser = subparsers.add_parser("stats", help="Summarize CLI usage and KB file churn.")
     stats_parser.add_argument("--root", default=".", help="Repository root to manage.")
-    stats_parser.add_argument("--top", type=int, default=15, help="Show at most this many churn rows (default 15).")
+    stats_parser.add_argument("--top", type=int, default=5, help="Show at most this many rows per section (default 5).")
     stats_parser.set_defaults(func=command_stats)
     return parser
 
