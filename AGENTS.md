@@ -9,7 +9,10 @@ Current layout:
 
 - `agent-kb/` - the Codex skill, including `SKILL.md`, UI metadata, and scripts.
 - `agent-kb/scripts/agent_kb.py` - the CLI for KB init, validation, notes, and compile.
-- `.agent-kb/` - this repository's own project knowledge base scaffold.
+- `.agent-kb/` - this repository's own project knowledge base scaffold, with
+  route data in `.agent-kb/routes.yaml` and a readable view in `.agent-kb/map.md`.
+- `.agent-kb/plans/current.md` - lightweight durable focus and next-step plan
+  for agent continuity.
 - `docs/superpowers/specs/` - dated design specifications and planning documents.
 - `AGENTS.md` - contributor and agent guidance for this repository.
 
@@ -21,7 +24,8 @@ Use date-prefixed filenames for new specs, for example
 There is no package manager or build system. Use the bundled script and skill
 validator for checks:
 
-- `python3 -m py_compile agent-kb/scripts/agent_kb.py` - check Python syntax.
+- `python3 -m py_compile agent-kb/scripts/agent_kb.py agent-kb/scripts/smoke_test.py` - check Python syntax.
+- `python3 agent-kb/scripts/smoke_test.py` - run temporary-directory CLI smoke, upgrade, and edge checks.
 - `python3 agent-kb/scripts/agent_kb.py validate --root .` - validate this repo's KB.
 - `python3 /Users/lsl/.codex/skills/.system/skill-creator/scripts/quick_validate.py agent-kb` - validate skill metadata.
 - `git status --short` - review tracked and untracked changes.
@@ -39,14 +43,14 @@ For specification files, use lowercase, hyphen-separated names with a leading IS
 ## Testing Guidelines
 
 No dedicated test suite is configured. For script changes, run `py_compile`,
-`validate --root .`, and a temporary-directory smoke test for `init`, `note`, and `compile`.
+`validate --root .`, and the temporary-directory smoke test.
 
 Keep future test files close to the code they validate.
 
 ## Commit & Pull Request Guidelines
 
-This repository has no established history yet. Prefer concise imperative commit
-messages such as `Implement agent KB skill`.
+Use concise type-prefixed commit messages such as `fix: repair KB validation`
+or `test: add KB smoke checks`.
 
 Pull requests should include a summary, affected paths, and manual verification.
 
@@ -58,14 +62,17 @@ Keep changes narrow. Do not turn this repository into a broad knowledge dump.
 ## Project Knowledge Base
 
 Use `.agent-kb/` as the project knowledge base.
+Treat it as an agent-facing index and distilled knowledge layer; do not replace
+human docs with KB entries.
 
 Before non-trivial coding:
 1. Read `.agent-kb/start.md`.
-2. Read `.agent-kb/map.md`.
+2. Read `.agent-kb/routes.yaml` as the source of truth; use `.agent-kb/map.md`
+   only as a readable view if helpful.
 3. Read only KB documents relevant to the current task.
 
 After coding:
-- Update `.agent-kb/` when the work creates or changes reusable project knowledge.
+- Update `.agent-kb/` only when the work creates or changes reusable project knowledge.
 - Prefer the relevant topic file.
 - Use `.agent-kb/inbox/` when the right location is unclear.
 - Do not write ordinary progress logs or one-off chat summaries into KB.
