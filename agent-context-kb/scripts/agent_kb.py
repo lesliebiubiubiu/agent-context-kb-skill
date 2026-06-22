@@ -541,7 +541,7 @@ def command_init(args: argparse.Namespace) -> int:
         print("Created files:")
         for path in created:
             print(f"- {path}")
-    return 0
+    return 0, {"created": len(created)}
 
 
 # Updates a scaffold file when missing or when explicit overwrite is allowed.
@@ -599,7 +599,8 @@ def command_upgrade(args: argparse.Namespace) -> int:
         print("Review .agent-kb/plans/current.md manually; use --write-plan only if you want the default empty plan.")
     if map_action == "needs review":
         print("Review .agent-kb/map.md manually; use --write-map only if you want the default routing table.")
-    return 0
+    actions = [protocol_action, gitignore_action, start_action, routes_action, plan_action, map_action]
+    return 0, {"needs_review": actions.count("needs review")}
 
 
 # Extracts the Task Routing rows from `.agent-kb/map.md` for legacy compatibility.
@@ -1024,7 +1025,7 @@ def command_trim(args: argparse.Namespace) -> int:
         if not candidates and not husks and not compact_recommended:
             print("Trim diagnosis: KB is already lean.")
             print("No write step recommended.")
-            return 0
+            return 0, {"candidates": 0, "husks": 0, "compact": False}
         diagnosis = "cleanup recommended" if candidates or husks else "compact recommended"
         print(f"Trim diagnosis: {diagnosis}.")
         print()
@@ -1042,7 +1043,7 @@ def command_trim(args: argparse.Namespace) -> int:
         print()
         print("Agent compact prompt:")
         print(trim_compact_prompt(args))
-        return 0
+        return 0, {"candidates": len(candidates), "husks": len(husks), "compact": compact_recommended}
 
     deleted = set()
     for path in candidates:
@@ -1072,7 +1073,7 @@ def command_trim(args: argparse.Namespace) -> int:
         print("Agent compact still recommended for non-empty topics.")
     for error in errors:
         print(f"ERROR: {error}")
-    return 1 if errors else 0
+    return (1 if errors else 0), {"deleted": len(deleted), "husks": len(husks), "validate_errors": len(errors)}
 
 
 # Converts a note title into a short filesystem-safe slug.
@@ -1109,7 +1110,7 @@ Suggested target: {target}
 """
     path.write_text(content, encoding="utf-8")
     print(f"Wrote {path}")
-    return 0
+    return 0, {"target_unsure": target.lower() == "unsure"}
 
 
 # Parses an inbox note into title, date, suggested target, and body fields.
@@ -1180,7 +1181,7 @@ def command_compile(args: argparse.Namespace) -> int:
     print(f"Unresolved: {len(kept)}")
     for name, reason in kept:
         print(f"- {name}: {reason}")
-    return 0
+    return 0, {"merged": merged, "unresolved": len(kept)}
 
 
 # Prints (label, value, suffix) rows as a proportional ASCII bar chart for quick visual scanning.
@@ -1231,14 +1232,19 @@ def command_stats(args: argparse.Namespace) -> int:
         print_bar_chart(rows)
 
     print()
-    print("KB health (latest validate):")
-    latest = next((e for e in reversed(events) if e.get("command") == "validate" and "metrics" in e), None)
-    if latest is None:
-        print("  (no validate run logged yet)")
+    print("Latest outcomes (per command):")
+    latest_by_command: dict[str, dict] = {}
+    for event in events:
+        if "metrics" in event:
+            latest_by_command[str(event.get("command", "?"))] = event
+    if not latest_by_command:
+        print("  (no command metrics logged yet)")
     else:
-        metrics = latest["metrics"]
-        print(f"  errors:   {metrics.get('errors', 0)}")
-        print(f"  warnings: {metrics.get('warnings', 0)}    (at {latest.get('ts', '?')})")
+        label_width = max(len(command) for command in latest_by_command)
+        for command in sorted(latest_by_command):
+            metrics = latest_by_command[command]["metrics"]
+            pairs = " ".join(f"{key}={value}" for key, value in metrics.items())
+            print(f"  {command:<{label_width}}  {pairs}")
     return 0
 
 

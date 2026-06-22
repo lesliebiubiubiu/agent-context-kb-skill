@@ -443,8 +443,8 @@ def test_validate_metrics_and_health() -> None:
         require("args" in last, "event should record redacted args")
         require("metrics" in last and last["metrics"]["warnings"] >= 1, "validate should log a warning-count metric", result)
         result = run_cli(root, "stats")
-        require("KB health (latest validate)" in result.stdout, "stats should show KB health section", result)
-        require("warnings:" in result.stdout, "stats health should show the warning count", result)
+        require("Latest outcomes (per command)" in result.stdout, "stats should show the per-command outcomes section", result)
+        require("warnings=" in result.stdout, "stats outcomes should show the validate warning count", result)
 
 
 # Checks that free-text note args are redacted in the event log (secrets rule).
