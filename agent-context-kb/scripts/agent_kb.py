@@ -223,8 +223,12 @@ TRIM_PLACEHOLDER_TEXTS = PLACEHOLDER_TEXTS + (
     "None yet.",
 )
 TRIM_MAX_FILE_LINES = 120
+TRIM_MAX_FILE_CHARS = 14000
 TRIM_MAX_TOTAL_CHARS = 20000
 TRIM_MAX_INBOX_NOTES = 5
+# Char overage at or above this fraction is "major" (the file likely carries compactable bulk);
+# anything else — including line-only overage — is "minor", an advisory the agent can stop on.
+TRIM_MAJOR_OVERAGE = 0.10
 
 
 # Returns the repository root from an argparse namespace.
@@ -293,6 +297,33 @@ def read_events(path: Path) -> list[dict]:
         except json.JSONDecodeError:
             continue
     return events
+
+
+# Treats a logged event as part of the current session if its timestamp falls within the recency window.
+def event_is_recent(event: dict, window_seconds: int = 7200) -> bool:
+    ts = event.get("ts")
+    if not ts:
+        return False
+    try:
+        when = dt.datetime.fromisoformat(ts)
+    except ValueError:
+        return False
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=dt.timezone.utc)
+    return (dt.datetime.now(dt.timezone.utc) - when).total_seconds() <= window_seconds
+
+
+# Reports whether a recent trim diagnose already recommended compacting, so the loop can skip re-printing the full prompt.
+def trim_loop_in_progress(kb: Path) -> bool:
+    for event in reversed(read_events(kb / ".log" / "events.jsonl")):
+        if event.get("command") != "trim":
+            continue
+        metrics = event.get("metrics") or {}
+        # Only diagnose runs carry the "compact" signal; --write runs report deleted/husks instead.
+        if "compact" not in metrics:
+            continue
+        return bool(metrics.get("compact")) and event_is_recent(event)
+    return False
 
 
 # Counts how often each .agent-kb file changed in git history (write hotspots).
@@ -841,18 +872,25 @@ def script_invocation() -> str:
 def trim_compact_prompt(args: argparse.Namespace) -> str:
     script = script_invocation()
     return (
-        "  Semantic step (agent judgment): within the existing headings, merge\n"
-        "  overlapping sections and keep each Summary / Read When dense (what the\n"
-        "  file is, the current conclusion, the traps). Preserve durable decisions,\n"
-        "  constraints, failures, and links. Change Log is history: collapse routine\n"
-        "  entries (e.g. inbox merges) but keep ones that record a real decision or\n"
-        "  change. Do not change the schema or add headings.\n"
+        "  The size number is a PROXY for 'this file may be repeating itself or holding\n"
+        "  dead detail'. Optimize the target, not the proxy: cut redundant and stale\n"
+        "  INFORMATION. Shrinking bytes without removing information is not progress.\n"
+        "  Remove: facts stated more than once (keep one canonical copy), detail that is\n"
+        "  superseded or no longer durable, and routine Change Log churn (collapse\n"
+        "  inbox-merge noise; keep entries that record a real decision). Merge\n"
+        "  overlapping sections under the existing headings; do not change the schema.\n"
+        "  Keep: every durable decision, constraint, failure, convention, and link, plus\n"
+        "  the current conclusion and the traps. The reader is a future agent that must\n"
+        "  still locate and trust each fact, so keep the structure (headings, distinct\n"
+        "  lines, code blocks) that makes facts findable -- do not fuse content to save\n"
+        "  space.\n"
+        "  STOP when what remains is genuine and non-redundant, even if the file is still\n"
+        "  over the size signal. A large file of real, distinct durable facts is a\n"
+        "  correct end state -- report it and move on.\n"
         "  Then close the loop with the deterministic tools:\n"
         f"    python3 {script} upgrade --root {args.root} --write-map   # regenerate map.md if you changed routes.yaml\n"
-        f"    python3 {script} validate --root {args.root}              # confirm links, schema, reachability, map==routes\n"
-        f"    python3 {script} trim --root {args.root}                  # re-diagnose; repeat until lean. The soft char\n"
-        "                                                              # budget alone is NOT a reason to keep compacting:\n"
-        "                                                              # stop once structure is clean, even if 'above soft budget'."
+        f"    python3 {script} trim --root {args.root} --recheck        # validate + re-diagnose in one step; stop once\n"
+        "                                                              # the only thing over is genuine content."
     )
 
 
@@ -868,10 +906,11 @@ def stable_doc_sizes(kb: Path) -> list[tuple[Path, int]]:
     return sizes
 
 
-# Measures stable-doc sizes and separates structural signals (agent-fixable) from the soft char budget.
+# Measures stable-doc sizes (char- and line-based) and grades each oversize file by how far over budget it is.
 def trim_size_report(
     kb: Path,
     max_file_lines: int = TRIM_MAX_FILE_LINES,
+    max_file_chars: int = TRIM_MAX_FILE_CHARS,
     max_total_chars: int = TRIM_MAX_TOTAL_CHARS,
     max_inbox_notes: int = TRIM_MAX_INBOX_NOTES,
 ) -> dict:
@@ -885,21 +924,56 @@ def trim_size_report(
         relative = path.relative_to(kb)
         files.append((relative, chars, lines))
         total_chars += chars
-        if lines > max_file_lines:
-            oversize.append((relative, lines))
+        # Char overage is the primary signal: joining short lines lowers the line count but not the chars.
+        line_over = max(0, lines - max_file_lines)
+        char_over = max(0, chars - max_file_chars)
+        if line_over or char_over:
+            line_pct = line_over / max_file_lines if max_file_lines else 0.0
+            char_pct = char_over / max_file_chars if max_file_chars else 0.0
+            # Only real bulk (chars) makes a file major; line-only overage stays advisory so the
+            # agent compacts content instead of shaving lines/formatting to clear the signal.
+            severity = "major" if char_pct >= TRIM_MAJOR_OVERAGE else "minor"
+            oversize.append({
+                "rel": relative,
+                "lines": lines, "line_over": line_over, "line_pct": line_pct,
+                "chars": chars, "char_over": char_over, "char_pct": char_pct,
+                "worst_pct": max(line_pct, char_pct),
+                "severity": severity,
+            })
     files.sort(key=lambda item: item[1], reverse=True)
+    oversize.sort(key=lambda item: item["worst_pct"], reverse=True)
     inbox_count = len(list((kb / "inbox").glob("*.md"))) if (kb / "inbox").exists() else 0
+    inbox_over = inbox_count > max_inbox_notes
+    major_oversize = [item for item in oversize if item["severity"] == "major"]
     return {
         "files": files,
         "total_chars": total_chars,
         "max_total_chars": max_total_chars,
+        "max_file_lines": max_file_lines,
+        "max_file_chars": max_file_chars,
         "oversize": oversize,
+        "major_oversize": major_oversize,
         "inbox_count": inbox_count,
         "max_inbox_notes": max_inbox_notes,
+        "inbox_over": inbox_over,
         "over_budget": total_chars > max_total_chars,
-        # Structural signals are the ones the loop should converge on; the char budget alone is not.
-        "compact_recommended": bool(oversize) or inbox_count > max_inbox_notes,
+        # Only major overage or inbox backlog should drive another compaction pass; minor overage is optional.
+        "compact_recommended": bool(major_oversize) or inbox_over,
+        "minor_only": bool(oversize) and not major_oversize and not inbox_over,
     }
+
+
+# Renders one oversize file's line/char overage and severity so the agent sees magnitude, not a binary trip.
+def format_oversize_signal(item: dict) -> str:
+    line_part = (
+        f"{item['lines']} lines ({item['line_over']} over / {item['line_pct']:.0%})"
+        if item["line_over"] else f"{item['lines']} lines (ok)"
+    )
+    char_part = (
+        f"{item['chars']} chars ({item['char_over']} over / {item['char_pct']:.0%})"
+        if item["char_over"] else f"{item['chars']} chars (ok)"
+    )
+    return f"{item['rel']}: {line_part}, {char_part} — {item['severity']}"
 
 
 # Prints the per-file char/line breakdown trim counts toward its budget so agents never re-measure with wc.
@@ -1057,21 +1131,37 @@ def command_trim(args: argparse.Namespace) -> int:
 
     candidates = empty_scaffold_topics(kb)
     husks = husk_after_merge_topics(kb)
-    report = trim_size_report(kb, args.max_file_lines, args.max_total_chars, args.max_inbox_notes)
+    report = trim_size_report(
+        kb, args.max_file_lines, args.max_file_chars, args.max_total_chars, args.max_inbox_notes
+    )
     compact_recommended = report["compact_recommended"]
-    structural = bool(candidates or husks or compact_recommended)
 
     if not args.write:
+        if args.recheck:
+            # --recheck folds the loop's validate step in so the agent runs one command per round, not two.
+            errors, warnings = validate_kb(kb)
+            summary = "OK" if not errors else f"{len(errors)} error(s)"
+            if warnings:
+                summary += f", {len(warnings)} warning(s)"
+            print(f"Recheck (validate): {summary}.")
+            for error in errors:
+                print(f"  ERROR: {error}")
+            for warning in warnings:
+                print(f"  WARNING: {warning}")
+            print()
+
         # Always show the breakdown so the agent trusts trim's count instead of re-running wc.
         print_trim_size_breakdown(report)
         print()
-        if not structural:
+
+        cleanup = bool(candidates or husks)
+        minor_only = report["minor_only"]
+        if not (cleanup or compact_recommended or minor_only):
             if report["over_budget"]:
                 print("Trim diagnosis: lean (above soft budget).")
-                print(f"  Structure is clean: no duplicate scaffolds, oversize files, or inbox backlog.")
-                print(f"  Total {report['total_chars']} chars exceeds the {report['max_total_chars']} soft budget, but that")
-                print(f"  may just be legitimate durable content. Do NOT compact again to chase the")
-                print(f"  number; only compact if you can see real duplication or stale detail above.")
+                print(f"  Structure is clean: no oversize files, husks, or inbox backlog. Total "
+                      f"{report['total_chars']} chars is over the {report['max_total_chars']} soft budget, but that is")
+                print("  likely legitimate durable content — do NOT compact to chase the number.")
             else:
                 print("Trim diagnosis: KB is already lean.")
             print("No write step recommended.")
@@ -1079,10 +1169,20 @@ def command_trim(args: argparse.Namespace) -> int:
                 "candidates": 0,
                 "husks": 0,
                 "compact": False,
+                "minor_only": False,
                 "over_budget": report["over_budget"],
                 "total_chars": report["total_chars"],
             }
-        diagnosis = "cleanup recommended" if candidates or husks else "compact recommended"
+
+        # Print the full compact prompt only on first detection (or with --verbose); later loop rounds get a pointer.
+        show_full_prompt = args.verbose or not trim_loop_in_progress(kb)
+
+        if compact_recommended:
+            diagnosis = "cleanup + compact recommended" if cleanup else "compact recommended"
+        elif cleanup:
+            diagnosis = "cleanup recommended"
+        else:
+            diagnosis = "minor — optional"
         print(f"Trim diagnosis: {diagnosis}.")
         print()
         print("Details:")
@@ -1090,23 +1190,36 @@ def command_trim(args: argparse.Namespace) -> int:
             print(f"- delete empty scaffold topic: {path.relative_to(kb)}")
         for path in husks:
             print(f"- husk after merge: {path.relative_to(kb)} (content empty, Change Log grown; delete manually)")
-        for relative, line_count in report["oversize"]:
-            print(f"- compact signal: {relative} is {line_count} lines (max {args.max_file_lines})")
-        if report["inbox_count"] > report["max_inbox_notes"]:
+        for item in report["oversize"]:
+            label = "compact signal" if item["severity"] == "major" else "minor signal"
+            print(f"- {label}: {format_oversize_signal(item)}")
+        if report["inbox_over"]:
             print(f"- compact signal: inbox has {report['inbox_count']} notes (max {report['max_inbox_notes']})")
-        if report["over_budget"]:
+        if report["over_budget"] and show_full_prompt:
             print(f"- soft signal: stable KB docs total {report['total_chars']} chars (above {report['max_total_chars']} soft budget; not a reason to over-compact)")
         if candidates:
             print()
             print("Next:")
             print(f"  {trim_write_command(args)}")
-        print()
-        print("Agent compact prompt:")
-        print(trim_compact_prompt(args))
+        if compact_recommended:
+            print()
+            # Always-on guardrail so it survives even when the full prompt is suppressed in later loop rounds.
+            print("Size is only a proxy: cut redundant or stale information, not bytes. Stop once")
+            print("the rest is genuine, distinct durable facts, even if still over the signal.")
+            print()
+            if show_full_prompt:
+                print("Agent compact prompt:")
+                print(trim_compact_prompt(args))
+            else:
+                print("Agent compact prompt: omitted (already shown earlier this loop; rerun with --verbose for the full text).")
+        elif minor_only:
+            print()
+            print("Minor overage only — optional. Safe to stop here; compact only if you can see real duplication above.")
         return 0, {
             "candidates": len(candidates),
             "husks": len(husks),
             "compact": compact_recommended,
+            "minor_only": minor_only,
             "over_budget": report["over_budget"],
             "total_chars": report["total_chars"],
         }
@@ -1358,10 +1471,12 @@ def build_parser() -> argparse.ArgumentParser:
     trim_parser = subparsers.add_parser("trim", help="Diagnose or apply safe KB trimming.")
     trim_parser.add_argument("--root", default=".", help="Repository root to manage.")
     trim_parser.add_argument("--write", action="store_true", help="Apply deterministic cleanup and validate.")
+    trim_parser.add_argument("--recheck", action="store_true", help="Run validate first, then re-diagnose, so the compaction loop is one command per round.")
     trim_parser.add_argument("--max-file-lines", type=int, default=TRIM_MAX_FILE_LINES, help=f"Lines above which a topic is flagged for compacting (default {TRIM_MAX_FILE_LINES}).")
+    trim_parser.add_argument("--max-file-chars", type=int, default=TRIM_MAX_FILE_CHARS, help=f"Chars above which a topic is flagged for compacting; the primary signal since it can't be gamed by joining lines (default {TRIM_MAX_FILE_CHARS}).")
     trim_parser.add_argument("--max-total-chars", type=int, default=TRIM_MAX_TOTAL_CHARS, help=f"Total stable-doc character budget before compacting is suggested (default {TRIM_MAX_TOTAL_CHARS}).")
     trim_parser.add_argument("--max-inbox-notes", type=int, default=TRIM_MAX_INBOX_NOTES, help=f"Inbox note count above which compacting is suggested (default {TRIM_MAX_INBOX_NOTES}).")
-    trim_parser.add_argument("--verbose", action="store_true", help="Deprecated: trim now prints details by default.")
+    trim_parser.add_argument("--verbose", action="store_true", help="Always print the full agent compact prompt and soft-budget note (default prints them only on first detection in a loop).")
     trim_parser.set_defaults(func=command_trim)
 
     stats_parser = subparsers.add_parser("stats", help="Summarize CLI usage and KB file churn.")
