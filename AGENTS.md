@@ -6,8 +6,8 @@ This repository contains a Codex skill for lightweight agent knowledge bases.
 
 Current layout:
 
-- `agent-context-kb/` - the Codex skill, including `SKILL.md`, UI metadata, and scripts.
-- `agent-context-kb/scripts/agent_kb.py` - the CLI for KB init, validation, notes, and compile.
+- `skills/agent-context-kb/` - the Codex skill, including `SKILL.md`, UI metadata, and scripts.
+- `skills/agent-context-kb/scripts/agent_kb.py` - the CLI for KB init, validation, notes, and compile.
 - `AGENTS.md` - contributor and agent guidance for this repository.
 
 ## Build, Test, and Development Commands
@@ -15,9 +15,9 @@ Current layout:
 There is no package manager or build system. Use the bundled script and skill
 validator for checks:
 
-- `python3 -m py_compile agent-context-kb/scripts/agent_kb.py agent-context-kb/scripts/smoke_test.py` - check Python syntax.
-- `python3 agent-context-kb/scripts/smoke_test.py` - run temporary-directory CLI smoke, upgrade, and edge checks.
-- `python3 agent-context-kb/scripts/agent_kb.py validate --root .` - validate this repo's KB.
+- `python3 -m py_compile skills/agent-context-kb/scripts/agent_kb.py skills/agent-context-kb/scripts/smoke_test.py` - check Python syntax.
+- `python3 skills/agent-context-kb/scripts/smoke_test.py` - run temporary-directory CLI smoke, upgrade, and edge checks.
+- `python3 skills/agent-context-kb/scripts/agent_kb.py validate --root .` - validate this repo's KB.
 - `git status --short` - review tracked and untracked changes.
 
 Do not add new tooling unless generated artifacts or automated validation require it.
