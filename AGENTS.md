@@ -2,35 +2,22 @@
 
 ## Project Structure & Module Organization
 
-This repository contains a Codex skill for lightweight agent knowledge bases,
-plus the design notes that define v0 behavior.
+This repository contains a Codex skill for lightweight agent knowledge bases.
 
 Current layout:
 
-- `agent-kb/` - the Codex skill, including `SKILL.md`, UI metadata, and scripts.
-- `agent-kb/scripts/agent_kb.py` - the CLI for KB init, validation, notes, and compile.
-- `.agent-kb/` - this repository's own project knowledge base scaffold, with
-  route data in `.agent-kb/routes.yaml` and a readable view in `.agent-kb/map.md`.
-  It is a **personal nested git repo**: the parent repo gitignores `.agent-kb/`,
-  so the KB has its own history and never enters this repo's branches or PRs.
-  Commit KB changes with `git -C .agent-kb ...`, not the parent repo.
-- `.agent-kb/plans/current.md` - lightweight durable focus and next-step plan
-  for agent continuity.
-- `docs/superpowers/specs/` - dated design specifications and planning documents.
+- `agent-context-kb/` - the Codex skill, including `SKILL.md`, UI metadata, and scripts.
+- `agent-context-kb/scripts/agent_kb.py` - the CLI for KB init, validation, notes, and compile.
 - `AGENTS.md` - contributor and agent guidance for this repository.
-
-Use date-prefixed filenames for new specs, for example
-`docs/superpowers/specs/2026-06-16-agent-kb-design.md`.
 
 ## Build, Test, and Development Commands
 
 There is no package manager or build system. Use the bundled script and skill
 validator for checks:
 
-- `python3 -m py_compile agent-kb/scripts/agent_kb.py agent-kb/scripts/smoke_test.py` - check Python syntax.
-- `python3 agent-kb/scripts/smoke_test.py` - run temporary-directory CLI smoke, upgrade, and edge checks.
-- `python3 agent-kb/scripts/agent_kb.py validate --root .` - validate this repo's KB.
-- `python3 /Users/lsl/.codex/skills/.system/skill-creator/scripts/quick_validate.py agent-kb` - validate skill metadata.
+- `python3 -m py_compile agent-context-kb/scripts/agent_kb.py agent-context-kb/scripts/smoke_test.py` - check Python syntax.
+- `python3 agent-context-kb/scripts/smoke_test.py` - run temporary-directory CLI smoke, upgrade, and edge checks.
+- `python3 agent-context-kb/scripts/agent_kb.py validate --root .` - validate this repo's KB.
 - `git status --short` - review tracked and untracked changes.
 
 Do not add new tooling unless generated artifacts or automated validation require it.
@@ -39,9 +26,6 @@ Do not add new tooling unless generated artifacts or automated validation requir
 
 Write Markdown in clear prose with short sections, descriptive headings, and
 examples that use real repository paths. Use US spelling for new contributor-facing text.
-
-For specification files, use lowercase, hyphen-separated names with a leading ISO date:
-`YYYY-MM-DD-topic-name.md`.
 
 ## Testing Guidelines
 

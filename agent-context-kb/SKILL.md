@@ -1,5 +1,5 @@
 ---
-name: agent-kb
+name: agent-context-kb
 description: Initialize, upgrade, maintain, validate, and compile a lightweight `.agent-kb/` project knowledge base for coding agents. Use when Codex needs to create the KB scaffold, refresh the AGENTS.md runtime protocol, record durable project knowledge, check KB links/routes, or merge inbox notes into stable topic documents.
 ---
 
