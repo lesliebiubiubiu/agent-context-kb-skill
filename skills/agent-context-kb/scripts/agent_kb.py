@@ -13,6 +13,12 @@ import sys
 from pathlib import Path
 
 
+# KB scaffold schema version. Bump only when the on-disk KB layout/templates
+# change, so a future `upgrade` can tell what an existing KB was built with.
+# Decoupled from any general skill release version.
+SCHEMA_VERSION = 1
+
+
 RUNTIME_PROTOCOL = """## Project Knowledge Base
 
 Use `.agent-kb/` as the project knowledge base.
@@ -394,6 +400,17 @@ def render_current_plan() -> str:
     return PLAN_CURRENT_MD.format(today=dt.date.today().isoformat())
 
 
+# Builds the KB meta marker: a small versioned record so future tooling can tell
+# what schema and versioning mode this KB was built with. Not a topic file
+# (non-.md), so KB scans skip it.
+def render_kb_meta(mode: str) -> str:
+    return (
+        f"schema_version: {SCHEMA_VERSION}\n"
+        f"mode: {mode}\n"
+        f"created: {dt.date.today().isoformat()}\n"
+    )
+
+
 # Formats a list of route paths for the Markdown routing table.
 def format_route_paths(paths: list[str]) -> str:
     return ", ".join(paths) if paths else "-"
@@ -539,10 +556,67 @@ def upsert_agents_protocol(root: Path) -> str:
 KB_GITIGNORE = ".log/\n"
 
 
-# Initializes `.agent-kb/` and the AGENTS.md runtime protocol.
+# Picks the versioning mode from init flags; defaults to the personal nested repo.
+def resolve_versioning_mode(args: argparse.Namespace) -> str:
+    if getattr(args, "shared", False):
+        return "shared"
+    if getattr(args, "local", False):
+        return "local"
+    return "nested"
+
+
+# Ensures the project root .gitignore keeps .agent-kb/ out of the parent repo; appends only when the entry is missing.
+def ensure_parent_gitignore(root: Path) -> str:
+    path = root / ".gitignore"
+    entry = ".agent-kb/"
+    if not path.exists():
+        path.write_text(entry + "\n", encoding="utf-8")
+        return "created"
+    text = path.read_text(encoding="utf-8")
+    existing = {line.strip().rstrip("/") for line in text.splitlines()}
+    if ".agent-kb" in existing:
+        return "present"
+    separator = "" if text == "" or text.endswith("\n") else "\n"
+    path.write_text(text + separator + entry + "\n", encoding="utf-8")
+    return "updated"
+
+
+# Reports whether the project root sits inside a git work tree, so init can word the .gitignore note honestly instead of asserting a parent repo that may not exist.
+def parent_is_git_repo(root: Path) -> bool:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            encoding="utf-8",
+        )
+    except FileNotFoundError:
+        return False
+    return result.returncode == 0 and result.stdout.strip() == "true"
+
+
+# Makes .agent-kb/ its own git repo with an initial snapshot so KB history stays out of the parent repo; degrades to a warning if git is missing or unconfigured.
+def init_nested_repo(kb: Path) -> str:
+    if (kb / ".git").exists():
+        return "exists"
+    try:
+        for command in (
+            ["git", "init", "-q"],
+            ["git", "add", "-A"],
+            ["git", "commit", "-q", "-m", "initial KB snapshot"],
+        ):
+            subprocess.run(command, cwd=kb, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return "failed"
+    return "created"
+
+
+# Initializes the KB scaffold, AGENTS.md protocol, and the chosen versioning mode (nested by default).
 def command_init(args: argparse.Namespace) -> int:
     root = repo_root(args)
     kb = kb_dir(root)
+    mode = resolve_versioning_mode(args)
     created = []
 
     for directory in [
@@ -563,6 +637,7 @@ def command_init(args: argparse.Namespace) -> int:
         "map.md": MAP_MD,
         "plans/current.md": render_current_plan(),
         ".gitignore": KB_GITIGNORE,
+        ".kb-meta.yaml": render_kb_meta(mode),
     }.items():
         if write_if_missing(kb / relative, content):
             created.append(str(Path(".agent-kb") / relative))
@@ -572,13 +647,43 @@ def command_init(args: argparse.Namespace) -> int:
             created.append(str(Path(".agent-kb") / relative))
 
     protocol_action = upsert_agents_protocol(root)
+
+    # Set up the chosen versioning mode: nested/local keep the KB out of the parent
+    # repo via .gitignore; nested additionally gives the KB its own git history.
+    gitignore_action = None
+    nested_status = None
+    if mode in ("nested", "local"):
+        gitignore_action = ensure_parent_gitignore(root)
+    if mode == "nested":
+        nested_status = init_nested_repo(kb)
+
     print(f"Initialized KB at {kb}")
     print(f"AGENTS.md protocol {protocol_action}.")
     if created:
         print("Created files:")
         for path in created:
             print(f"- {path}")
-    return 0, {"created": len(created)}
+
+    print(f"Versioning mode: {mode}.")
+    if gitignore_action is not None:
+        if parent_is_git_repo(root):
+            print(f"Root .gitignore {gitignore_action} (.agent-kb/ ignored by the parent repo).")
+        else:
+            print(f"Root .gitignore {gitignore_action}; .agent-kb/ is ignored and ready for when you git init the project.")
+    if mode == "nested":
+        if nested_status == "created":
+            print("Nested KB repo initialized with an initial commit.")
+            print("Commit future KB changes with: git -C .agent-kb add -A && git -C .agent-kb commit")
+        elif nested_status == "exists":
+            print("Nested KB repo already present; left as-is.")
+        elif nested_status == "failed":
+            print("WARNING: could not initialize the nested KB repo (git missing or unconfigured).")
+            print("Set it up manually: git -C .agent-kb init && git -C .agent-kb add -A && git -C .agent-kb commit -m 'initial KB snapshot'")
+    elif mode == "shared":
+        print("KB will travel with the parent repo; commit .agent-kb/ alongside your code.")
+    elif mode == "local":
+        print("KB is local-only and git-ignored; it has no version history.")
+    return 0, {"created": len(created), "mode": mode}
 
 
 # Updates a scaffold file when missing or when explicit overwrite is allowed.
@@ -1449,6 +1554,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     init_parser = subparsers.add_parser("init", help="Initialize .agent-kb and AGENTS.md protocol.")
     init_parser.add_argument("--root", default=".", help="Repository root to manage.")
+    init_mode = init_parser.add_mutually_exclusive_group()
+    init_mode.add_argument("--shared", action="store_true", help="Version the KB inside the parent repo instead of a personal nested repo.")
+    init_mode.add_argument("--local", action="store_true", help="Keep the KB local-only and git-ignored, with no version history.")
     init_parser.set_defaults(func=command_init)
 
     upgrade_parser = subparsers.add_parser("upgrade", help="Upgrade generated KB protocol files conservatively.")

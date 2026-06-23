@@ -539,6 +539,38 @@ def test_stats_reports_cli_usage() -> None:
         require("KB file churn" in result.stdout, "stats should report the churn section", result)
 
 
+# Checks that init sets up the chosen versioning mode (nested default, shared, local).
+def test_init_versioning_modes() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        result = run_cli(root, "init")
+        require(result.returncode == 0, "default init should succeed", result)
+        require("Versioning mode: nested." in result.stdout, "default mode should be nested", result)
+        ignore = (root / ".gitignore").read_text(encoding="utf-8")
+        require(".agent-kb/" in ignore, "nested init should ignore .agent-kb/ in the parent repo", result)
+        require((root / ".agent-kb" / ".git").exists(), "nested init should create the nested repo")
+        meta = (root / ".agent-kb" / ".kb-meta.yaml").read_text(encoding="utf-8")
+        require("mode: nested" in meta, "meta should record nested mode")
+
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        result = run_cli(root, "init", "--shared")
+        require(result.returncode == 0, "shared init should succeed", result)
+        require(not (root / ".gitignore").exists(), "shared init should not gitignore the KB")
+        require(not (root / ".agent-kb" / ".git").exists(), "shared init should not create a nested repo")
+        meta = (root / ".agent-kb" / ".kb-meta.yaml").read_text(encoding="utf-8")
+        require("mode: shared" in meta, "meta should record shared mode")
+
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        result = run_cli(root, "init", "--local")
+        require(result.returncode == 0, "local init should succeed", result)
+        require(".agent-kb/" in (root / ".gitignore").read_text(encoding="utf-8"), "local init should gitignore the KB", result)
+        require(not (root / ".agent-kb" / ".git").exists(), "local init should not create a nested repo")
+        meta = (root / ".agent-kb" / ".kb-meta.yaml").read_text(encoding="utf-8")
+        require("mode: local" in meta, "meta should record local mode")
+
+
 # Runs all smoke tests and prints a compact success line.
 def main() -> int:
     tests = [
@@ -569,6 +601,7 @@ def main() -> int:
         test_validate_metrics_and_health,
         test_note_body_redacted_in_log,
         test_stats_reports_cli_usage,
+        test_init_versioning_modes,
     ]
     for test in tests:
         test()

@@ -36,7 +36,9 @@ Use `--root .` when working in the target repository.
 
 1. Use `init` to create `.agent-kb/`, starter topic documents, `inbox/`,
    `plans/current.md`, `start.md`, `routes.yaml`, `map.md`, and the short
-   `AGENTS.md` runtime protocol.
+   `AGENTS.md` runtime protocol. By default `init` also sets up the personal
+   nested-repo versioning mode (see Versioning & privacy); use `--shared` or
+   `--local` to choose another mode.
 2. Use `upgrade` to refresh generated protocol text conservatively. It updates
    `AGENTS.md`, creates missing scaffold files, and leaves existing `start.md`,
    `routes.yaml`, `map.md`, or `plans/current.md` for manual review unless
@@ -158,19 +160,25 @@ The KB is just files under `.agent-kb/`, so you choose how it is versioned. The
 KB-local `.gitignore` always keeps `.log/` out of version control; the rest is up
 to the mode:
 
-- **Personal nested repo (default):** add `.agent-kb/` to the project repo's
-  `.gitignore`, then `git init` inside `.agent-kb/` so it is its own repository
-  (optionally with a private remote for backup). This keeps a full, restorable
+- **Personal nested repo (default):** `init` sets this up automatically — it adds
+  `.agent-kb/` to the project repo's `.gitignore`, runs `git init` inside
+  `.agent-kb/`, and makes an initial commit, so the KB is its own repository
+  (optionally add a private remote for backup). This keeps a full, restorable
   history while the KB never enters the project's branches, `main`, or PRs — a
   per-developer knowledge base, since habits differ and a shared KB tends to grow
-  large and hard to manage. Commit it with `git -C .agent-kb ...`. Git has no
-  per-file privacy and merges carry tracked files, so this nested-repo split is
-  what makes "versioned but never merged" actually work. `stats` churn reads this
-  nested repo automatically when `.agent-kb/.git` exists. A remote is optional:
-  everything (history, rollback) works locally; the remote only adds backup and
-  cross-machine sync.
-- **Shared:** commit `.agent-kb/` inside the project repo. The KB travels with
-  branches and PRs as team memory. Use this when the whole team deliberately
-  wants one shared knowledge base.
-- **Local-only:** add `.agent-kb/` to `.gitignore` and do not version it at all.
-  Simplest, but there is no history to roll back to.
+  large and hard to manage. Commit later changes with `git -C .agent-kb ...`. Git
+  has no per-file privacy and merges carry tracked files, so this nested-repo
+  split is what makes "versioned but never merged" actually work. `stats` churn
+  reads this nested repo automatically when `.agent-kb/.git` exists. A remote is
+  optional: everything (history, rollback) works locally; the remote only adds
+  backup and cross-machine sync. (If git is missing or unconfigured, `init`
+  prints the manual commands instead of failing.)
+- **Shared:** run `init --shared`; it records the mode and leaves the KB tracked
+  by the project repo, so it travels with branches and PRs as team memory. Use
+  this when the whole team deliberately wants one shared knowledge base.
+- **Local-only:** run `init --local`; it gitignores `.agent-kb/` but does not
+  create a nested repo, so the KB is never versioned. Simplest, but there is no
+  history to roll back to.
+
+The chosen mode is recorded in `.agent-kb/.kb-meta.yaml` alongside the KB schema
+version, so future tooling can tell how a KB was set up.
