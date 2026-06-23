@@ -259,6 +259,38 @@ def test_upgrade_writes_map_from_routes() -> None:
         require("| Documentation | workflows/local-dev.md | conventions/comments.md |" in text, "write-map should render current routes")
 
 
+# Checks that init respects a CLAUDE.md-primary repo when AGENTS.md is only a pointer.
+def test_init_uses_claude_when_agents_points_to_it() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        agents = root / "AGENTS.md"
+        claude = root / "CLAUDE.md"
+        agents.write_text("See CLAUDE.md for agent instructions.\n", encoding="utf-8")
+        claude.write_text("# Claude Instructions\n\nKeep the main instructions here.\n", encoding="utf-8")
+        result = run_cli(root, "init")
+        require(result.returncode == 0, "init should succeed with CLAUDE.md-primary instructions", result)
+        require("CLAUDE.md protocol appended." in result.stdout, "init should report the CLAUDE.md protocol target", result)
+        require(agents.read_text(encoding="utf-8") == "See CLAUDE.md for agent instructions.\n", "AGENTS.md pointer should be left unchanged")
+        require("## Project Knowledge Base" in claude.read_text(encoding="utf-8"), "CLAUDE.md should receive the KB protocol")
+
+
+# Checks that upgrade refreshes the KB protocol in CLAUDE.md when that is the existing protocol owner.
+def test_upgrade_updates_claude_protocol_owner() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        (root / "AGENTS.md").write_text("See CLAUDE.md for agent instructions.\n", encoding="utf-8")
+        (root / "CLAUDE.md").write_text("# Claude Instructions\n\nKeep the main instructions here.\n", encoding="utf-8")
+        init_root(root)
+        claude = root / "CLAUDE.md"
+        claude.write_text("# Claude Instructions\n\n## Project Knowledge Base\n\nOld protocol.\n", encoding="utf-8")
+        result = run_cli(root, "upgrade")
+        require(result.returncode == 0, "upgrade should succeed with CLAUDE.md as protocol owner", result)
+        require("CLAUDE.md protocol updated." in result.stdout, "upgrade should report the CLAUDE.md protocol target", result)
+        text = claude.read_text(encoding="utf-8")
+        require("Old protocol." not in text, "upgrade should replace the old CLAUDE.md protocol section")
+        require("Read `.agent-kb/routes.yaml`" in text, "upgrade should write the current protocol into CLAUDE.md")
+
+
 # Checks that trim diagnosis names concrete candidates by default and points to the write step.
 def test_trim_diagnoses_empty_scaffold() -> None:
     with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
@@ -586,6 +618,8 @@ def main() -> int:
         test_upgrade_preserves_custom_scaffold_by_default,
         test_upgrade_can_write_start_template,
         test_upgrade_writes_map_from_routes,
+        test_init_uses_claude_when_agents_points_to_it,
+        test_upgrade_updates_claude_protocol_owner,
         test_trim_diagnoses_empty_scaffold,
         test_trim_threshold_flag_reports_oversize_topic,
         test_trim_flags_char_oversize_with_few_lines,

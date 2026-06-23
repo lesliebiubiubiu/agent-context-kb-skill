@@ -38,6 +38,8 @@ After coding:
 - Do not write ordinary progress logs or one-off chat summaries into KB.
 """
 
+PROTOCOL_SECTION_RE = re.compile(r"^## Project Knowledge Base\n.*?(?=^## |\Z)", re.M | re.S)
+
 START_MD = """# Agent KB Start
 
 This directory is the project knowledge base for coding agents.
@@ -533,23 +535,54 @@ def rows_from_routes(routes: list[dict[str, object]]) -> list[tuple[str, str, st
     return rows
 
 
-# Adds or replaces the Project Knowledge Base section in AGENTS.md.
-def upsert_agents_protocol(root: Path) -> str:
-    agents_path = root / "AGENTS.md"
-    if not agents_path.exists():
-        agents_path.write_text(RUNTIME_PROTOCOL, encoding="utf-8")
-        return "created"
+# Checks whether an instruction file already contains the KB runtime protocol section.
+def has_protocol_section(path: Path) -> bool:
+    return path.exists() and bool(PROTOCOL_SECTION_RE.search(path.read_text(encoding="utf-8")))
 
-    text = agents_path.read_text(encoding="utf-8")
-    pattern = re.compile(r"^## Project Knowledge Base\n.*?(?=^## |\Z)", re.M | re.S)
-    if pattern.search(text):
-        updated = pattern.sub(RUNTIME_PROTOCOL.rstrip() + "\n\n", text).rstrip() + "\n"
-        agents_path.write_text(updated, encoding="utf-8")
-        return "updated"
+
+# Checks whether a short instruction file only points agents to another instruction file.
+def is_pointer_file(path: Path, target_name: str) -> bool:
+    if not path.exists():
+        return False
+    text = path.read_text(encoding="utf-8")
+    text_lower = text.lower()
+    if has_protocol_section(path) or target_name.lower() not in text_lower:
+        return False
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    pointer_words = ["see", "read", "refer", "follow", "use"]
+    return len(lines) <= 8 and len(text) <= 1000 and any(word in text_lower for word in pointer_words)
+
+
+# Picks the instruction file that should receive the KB runtime protocol, preserving CLAUDE.md-primary repos.
+def protocol_target_path(root: Path) -> Path:
+    agents_path = root / "AGENTS.md"
+    claude_path = root / "CLAUDE.md"
+    for path in [agents_path, claude_path]:
+        if has_protocol_section(path):
+            return path
+    if agents_path.exists() and claude_path.exists() and is_pointer_file(agents_path, "CLAUDE.md"):
+        return claude_path
+    if claude_path.exists() and not agents_path.exists():
+        return claude_path
+    return agents_path
+
+
+# Adds or replaces the Project Knowledge Base section in the selected agent instruction file.
+def upsert_runtime_protocol(root: Path) -> tuple[Path, str]:
+    protocol_path = protocol_target_path(root)
+    if not protocol_path.exists():
+        protocol_path.write_text(RUNTIME_PROTOCOL, encoding="utf-8")
+        return protocol_path, "created"
+
+    text = protocol_path.read_text(encoding="utf-8")
+    if PROTOCOL_SECTION_RE.search(text):
+        updated = PROTOCOL_SECTION_RE.sub(RUNTIME_PROTOCOL.rstrip() + "\n\n", text).rstrip() + "\n"
+        protocol_path.write_text(updated, encoding="utf-8")
+        return protocol_path, "updated"
 
     separator = "" if text.endswith("\n\n") else "\n\n" if text.endswith("\n") else "\n\n"
-    agents_path.write_text(text + separator + RUNTIME_PROTOCOL, encoding="utf-8")
-    return "appended"
+    protocol_path.write_text(text + separator + RUNTIME_PROTOCOL, encoding="utf-8")
+    return protocol_path, "appended"
 
 
 # Keeps the best-effort event log out of git; lives inside the KB so it travels with the scaffold.
@@ -612,7 +645,7 @@ def init_nested_repo(kb: Path) -> str:
     return "created"
 
 
-# Initializes the KB scaffold, AGENTS.md protocol, and the chosen versioning mode (nested by default).
+# Initializes the KB scaffold, runtime protocol, and the chosen versioning mode (nested by default).
 def command_init(args: argparse.Namespace) -> int:
     root = repo_root(args)
     kb = kb_dir(root)
@@ -646,7 +679,7 @@ def command_init(args: argparse.Namespace) -> int:
         if write_if_missing(kb / relative, render_topic(title, read_when)):
             created.append(str(Path(".agent-kb") / relative))
 
-    protocol_action = upsert_agents_protocol(root)
+    protocol_path, protocol_action = upsert_runtime_protocol(root)
 
     # Set up the chosen versioning mode: nested/local keep the KB out of the parent
     # repo via .gitignore; nested additionally gives the KB its own git history.
@@ -658,7 +691,7 @@ def command_init(args: argparse.Namespace) -> int:
         nested_status = init_nested_repo(kb)
 
     print(f"Initialized KB at {kb}")
-    print(f"AGENTS.md protocol {protocol_action}.")
+    print(f"{protocol_path.name} protocol {protocol_action}.")
     if created:
         print("Created files:")
         for path in created:
@@ -711,7 +744,7 @@ def command_upgrade(args: argparse.Namespace) -> int:
     if not (kb / "inbox").exists():
         (kb / "inbox").mkdir(parents=True)
 
-    protocol_action = upsert_agents_protocol(root)
+    protocol_path, protocol_action = upsert_runtime_protocol(root)
     gitignore_action = upgrade_scaffold_file(kb / ".gitignore", KB_GITIGNORE, False)
     start_action = upgrade_scaffold_file(kb / "start.md", START_MD, args.write_start)
     routes_action = upgrade_scaffold_file(kb / "routes.yaml", ROUTES_YAML, args.write_routes)
@@ -722,7 +755,7 @@ def command_upgrade(args: argparse.Namespace) -> int:
     custom_routes_preserved = routes_action == "needs review" and args.write_map and not args.write_routes and not route_errors
 
     print(f"Upgraded KB at {kb}")
-    print(f"AGENTS.md protocol {protocol_action}.")
+    print(f"{protocol_path.name} protocol {protocol_action}.")
     print(f".agent-kb/.gitignore {gitignore_action}.")
     print(f".agent-kb/start.md {start_action}.")
     if custom_routes_preserved:
@@ -1552,7 +1585,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Manage a repository-local .agent-kb knowledge base.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    init_parser = subparsers.add_parser("init", help="Initialize .agent-kb and AGENTS.md protocol.")
+    init_parser = subparsers.add_parser("init", help="Initialize .agent-kb and the runtime protocol.")
     init_parser.add_argument("--root", default=".", help="Repository root to manage.")
     init_mode = init_parser.add_mutually_exclusive_group()
     init_mode.add_argument("--shared", action="store_true", help="Version the KB inside the parent repo instead of a personal nested repo.")
