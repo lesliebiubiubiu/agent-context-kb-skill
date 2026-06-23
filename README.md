@@ -1,47 +1,39 @@
 # Agent Context KB
 
-A lightweight, agent-facing knowledge base for your repository. It gives coding
-agents a small, durable memory (`.agent-kb/`) they read *before* working and
-update *after* — so context survives across sessions and across different agents.
+A lightweight, agent-facing knowledge base that gives coding agents a durable,
+shared memory of your project. They read *before* working and
+update *after*, so context survives across sessions and across
+different agents.
 
 ## The Problem
 
-Coding agents start cold. Every new session — and every different agent or tool —
-begins with no memory of:
+A coding agent starts cold. Each new session — and each different agent — opens
+your project knowing nothing about it: how the system is built and why it's
+shaped that way, how the pieces fit together, the decisions already settled, the
+approaches already ruled out, and the bugs already chased down.
 
-- the architecture decisions you already made,
-- the conventions the project follows,
-- the bugs you already chased down, and why,
-- or even where to start reading.
+You can write some of that down, but as a project grows the durable knowledge
+piles up faster than any single document can hold. An agent is then stuck between
+two bad options: read everything (slow, noisy, and mostly irrelevant to the task
+at hand), or read nothing and re-derive — re-asking what you've already answered
+and re-breaking what you already fixed. Often the hardest part is simply knowing
+*where to start*.
 
-That knowledge ends up scattered across chat logs and human docs that agents
-don't reliably read. So they re-ask, re-derive, and re-break things you already
-solved.
-
-**Agent Context KB** fixes this with a tiny, structured knowledge base that lives
-in your repo. `start.md` points the agent in; `routes.yaml` sends it to the few
-docs that matter for the task at hand; topic files hold the durable facts. Any
-agent, any session, reads the same memory first — and writes durable findings
-back.
+**Agent Context KB** organizes that knowledge as a small, navigable graph rather
+than a flat pile. Each kind of task has an entry point that routes the agent to
+just the few pieces relevant to it, and each piece links to related ones. So
+every agent, in every session, lands in the right place, reads only what matters,
+and writes what it learns back.
 
 ## Highlights
 
-(Not the full list — just the parts that matter most.)
-
-- **Routing, not a dump.** `routes.yaml` maps a task to the few docs worth
-  reading, so agents read *little* and read the *right* thing.
-- **Frictionless capture.** `note` drops a durable fact into an inbox;
-  `compile` merges it into the correct topic file later.
-- **Stays lean.** `trim` diagnoses bloat against soft budgets and drives an
-  agent-led compaction loop — it flags redundancy, never auto-truncates real
-  knowledge.
-- **Observability.** `stats` shows which commands run, which docs change most,
-  and which are heaviest right now.
-- **Versioning your way.** Run it as shared team memory, or as a *personal
-  nested repo* that is versioned and restorable yet never enters your project's
-  branches or PRs.
-- **Zero dependencies.** Pure Python standard library; the CLI even parses its
-  own small YAML subset.
+- **Reads little, reads the right thing.** A task pulls in just the knowledge
+  relevant to it — not the whole pile.
+- **Stays lean as it grows.** The knowledge base is actively kept compact, so it
+  stays trustworthy instead of decaying into a dump nobody reads.
+- **Improves as the work happens.** Agents write durable findings back, so the
+  project's memory compounds over time instead of evaporating when a session
+  ends.
 
 ## Quickstart
 
@@ -68,19 +60,26 @@ python3 scripts/agent_kb.py init --root /path/to/repo
 
 ## Using the skill
 
-Once installed, your agent invokes the skill whenever it needs to set up or
-maintain the KB. The core commands:
+You mostly drive this in plain language — your agent picks the right command. A few typical prompts:
+
+- *"Set up an agent-kb knowledge base in this repo."*
+- *"Update the agent-kb with what we just figured out."*
+- *"Record why we picked Postgres over Mongo here."*
+- *"Trim kb"*
+- *"Show me the kb stats."*
+
+Those map onto the commands you'll touch directly:
 
 | Command | When to use it |
 |---|---|
-| `init` | Create the `.agent-kb/` scaffold in a repo |
-| `upgrade` | Refresh the generated protocol / add missing scaffold files |
-| `validate` | Check links, routes, and structure after changes |
-| `note` / `compile` | Capture a durable fact, then merge it into a topic file |
-| `trim` | Diagnose bloat and run the compaction loop |
-| `stats` | See command usage and per-file churn |
+| `init` | Set up the knowledge base in a repo |
+| `note` | Record a durable fact worth keeping |
+| `trim` | Tidy the knowledge base when it's grown bloated |
+| `stats` | See how the knowledge base is being used |
 
-Run any command with `--root .` from the target repo.
+The rest run automatically as the agent maintains the knowledge base — `validate`
+(check structure after edits), `compile` (file captured notes into the right
+place), and `upgrade` (refresh the protocol) — so you rarely call them yourself.
 
 ### What goes in the KB
 
