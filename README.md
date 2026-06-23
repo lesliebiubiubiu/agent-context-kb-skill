@@ -49,8 +49,8 @@ Then, in any repo, ask your agent to set it up — for example:
 > "Initialize an agent-kb knowledge base in this repo."
 
 That triggers the skill, which scaffolds `.agent-kb/` with `start.md`,
-`routes.yaml`, starter topic files, and a short `AGENTS.md` protocol telling
-agents how to use it.
+`routes.yaml`, starter topic files, and a short runtime protocol in the main
+agent instruction file telling agents how to use it.
 
 You can also run the bundled CLI directly from the installed skill directory:
 

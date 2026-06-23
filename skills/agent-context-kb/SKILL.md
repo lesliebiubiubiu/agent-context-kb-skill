@@ -1,6 +1,6 @@
 ---
 name: agent-context-kb
-description: Initialize, upgrade, maintain, validate, and compile a lightweight `.agent-kb/` project knowledge base for coding agents. Use when Codex needs to create the KB scaffold, refresh the AGENTS.md runtime protocol, record durable project knowledge, check KB links/routes, or merge inbox notes into stable topic documents.
+description: Initialize, upgrade, maintain, validate, and compile a lightweight `.agent-kb/` project knowledge base for coding agents. Use when Codex needs to create the KB scaffold, refresh the runtime protocol in the main agent instruction file, record durable project knowledge, check KB links/routes, or merge inbox notes into stable topic documents.
 ---
 
 # Agent KB
@@ -36,13 +36,14 @@ Use `--root .` when working in the target repository.
 
 1. Use `init` to create `.agent-kb/`, starter topic documents, `inbox/`,
    `plans/current.md`, `start.md`, `routes.yaml`, `map.md`, and the short
-   `AGENTS.md` runtime protocol. By default `init` also sets up the personal
-   nested-repo versioning mode (see Versioning & privacy); use `--shared` or
-   `--local` to choose another mode.
+   runtime protocol in the main agent instruction file (`AGENTS.md` by
+   default, or `CLAUDE.md` when it is the existing primary file). By default
+   `init` also sets up the personal nested-repo versioning mode (see Versioning
+   & privacy); use `--shared` or `--local` to choose another mode.
 2. Use `upgrade` to refresh generated protocol text conservatively. It updates
-   `AGENTS.md`, creates missing scaffold files, and leaves existing `start.md`,
-   `routes.yaml`, `map.md`, or `plans/current.md` for manual review unless
-   explicit write flags are passed.
+   the main agent instruction file, creates missing scaffold files, and leaves
+   existing `start.md`, `routes.yaml`, `map.md`, or `plans/current.md` for
+   manual review unless explicit write flags are passed.
 3. Use `validate` after changes to check required files, map routes, Markdown
    links, inbox shape, placeholder text, and whether stable topic files are
    reachable.
