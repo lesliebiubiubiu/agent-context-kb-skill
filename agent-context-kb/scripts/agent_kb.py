@@ -326,11 +326,17 @@ def trim_loop_in_progress(kb: Path) -> bool:
     return False
 
 
-# Counts how often each .agent-kb file changed in git history (write hotspots).
+# Counts how often each KB file changed in git history; reads the nested .agent-kb repo when present, else the parent repo's .agent-kb path.
 def git_churn(root: Path) -> list[tuple[str, int]]:
+    kb = kb_dir(root)
+    if (kb / ".git").exists():
+        # KB is its own repo: every tracked file is a KB file, so no pathspec; paths come back relative to .agent-kb.
+        cmd = ["git", "-C", str(kb), "log", "--format=", "--name-only"]
+    else:
+        cmd = ["git", "-C", str(root), "log", "--format=", "--name-only", "--", ".agent-kb"]
     try:
         result = subprocess.run(
-            ["git", "-C", str(root), "log", "--format=", "--name-only", "--", ".agent-kb"],
+            cmd,
             check=True,
             encoding="utf-8",
             stdout=subprocess.PIPE,

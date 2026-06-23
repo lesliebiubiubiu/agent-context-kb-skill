@@ -88,7 +88,9 @@ Use `--root .` when working in the target repository.
    `.agent-kb/.log/events.jsonl`; `init` and `upgrade` write a KB-local
    `.agent-kb/.gitignore` so the log stays out of git. `stats` draws ASCII bar
    charts of command frequency (with failure counts), per-file change churn
-   from git history, and the largest current KB files by character count, so you
+   from git history (read from the nested `.agent-kb/` repo when the KB is
+   versioned on its own — see Versioning & privacy — otherwise from the parent
+   repo), and the largest current KB files by character count, so you
    can see at a glance which commands run most, which KB documents change most,
    and which carry the most weight right now (not just historically). After
    running `stats`, paste its full output verbatim inside a fenced code block in
@@ -149,3 +151,26 @@ Paths are relative to `.agent-kb/`. Keep `read_first` to one file and
 view of the routes; regenerate or update it when routes change. Keep each stable
 topic document reachable from `routes.yaml` or from another reachable document's
 Markdown links.
+
+## Versioning & privacy
+
+The KB is just files under `.agent-kb/`, so you choose how it is versioned. The
+KB-local `.gitignore` always keeps `.log/` out of version control; the rest is up
+to the mode:
+
+- **Personal nested repo (default):** add `.agent-kb/` to the project repo's
+  `.gitignore`, then `git init` inside `.agent-kb/` so it is its own repository
+  (optionally with a private remote for backup). This keeps a full, restorable
+  history while the KB never enters the project's branches, `main`, or PRs — a
+  per-developer knowledge base, since habits differ and a shared KB tends to grow
+  large and hard to manage. Commit it with `git -C .agent-kb ...`. Git has no
+  per-file privacy and merges carry tracked files, so this nested-repo split is
+  what makes "versioned but never merged" actually work. `stats` churn reads this
+  nested repo automatically when `.agent-kb/.git` exists. A remote is optional:
+  everything (history, rollback) works locally; the remote only adds backup and
+  cross-machine sync.
+- **Shared:** commit `.agent-kb/` inside the project repo. The KB travels with
+  branches and PRs as team memory. Use this when the whole team deliberately
+  wants one shared knowledge base.
+- **Local-only:** add `.agent-kb/` to `.gitignore` and do not version it at all.
+  Simplest, but there is no history to roll back to.

@@ -11,6 +11,9 @@ Current layout:
 - `agent-kb/scripts/agent_kb.py` - the CLI for KB init, validation, notes, and compile.
 - `.agent-kb/` - this repository's own project knowledge base scaffold, with
   route data in `.agent-kb/routes.yaml` and a readable view in `.agent-kb/map.md`.
+  It is a **personal nested git repo**: the parent repo gitignores `.agent-kb/`,
+  so the KB has its own history and never enters this repo's branches or PRs.
+  Commit KB changes with `git -C .agent-kb ...`, not the parent repo.
 - `.agent-kb/plans/current.md` - lightweight durable focus and next-step plan
   for agent continuity.
 - `docs/superpowers/specs/` - dated design specifications and planning documents.
