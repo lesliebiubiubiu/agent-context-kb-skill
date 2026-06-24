@@ -21,21 +21,22 @@ SCHEMA_VERSION = 1
 
 RUNTIME_PROTOCOL = """## Project Knowledge Base
 
-Use `.agent-kb/` as the project knowledge base.
-Treat it as an agent-facing index and distilled knowledge layer; do not replace
-human docs with KB entries.
+`.agent-kb/` is the project knowledge base for coding agents — a distilled index
+of architecture, decisions, conventions, and pitfalls.
 
-Before non-trivial coding:
+When you need to understand how this codebase works — to plan, build, debug,
+review, or answer a question about it — start here, before opening a broad code
+search:
+
 1. Read `.agent-kb/start.md`.
-2. Read `.agent-kb/routes.yaml` as the source of truth; use `.agent-kb/map.md`
-   only as a readable view if helpful.
-3. Read only KB documents relevant to the current task.
+2. Read `.agent-kb/routes.yaml` (the source of truth; `.agent-kb/map.md` is a
+   readable view) and pick only the routes relevant to your task.
+3. Read the KB documents those routes point to. Use open-ended code search for
+   what the KB does not cover.
 
-After coding:
-- Update `.agent-kb/` only when the work creates or changes reusable project knowledge.
-- Prefer the relevant topic file.
-- Use `.agent-kb/inbox/` when the right location is unclear.
-- Do not write ordinary progress logs or one-off chat summaries into KB.
+After the task, only when it created or changed reusable project knowledge:
+- Update the relevant topic file (use `.agent-kb/inbox/` if the target is unclear).
+- Do not write progress logs or one-off chat summaries into the KB.
 """
 
 PROTOCOL_SECTION_RE = re.compile(r"^## Project Knowledge Base\n.*?(?=^## |\Z)", re.M | re.S)
@@ -567,7 +568,34 @@ def protocol_target_path(root: Path) -> Path:
     return agents_path
 
 
+# Finds where to slot a new protocol: under the file's lead section, not above it — after the
+# H1/intro and the first `## ` section, before the second `## ` (or end of file as a fallback).
+def protocol_insert_index(text: str) -> int:
+    lines = text.splitlines(keepends=True)
+    pos = 0
+    i = 0
+    # Skip a leading H1 title line if present, so the protocol sits under it, not above.
+    if i < len(lines) and lines[i].lstrip().startswith("# "):
+        pos += len(lines[i])
+        i += 1
+    # Skip the title's intro paragraph up to the first `## ` subheading.
+    while i < len(lines) and not lines[i].lstrip().startswith("## "):
+        pos += len(lines[i])
+        i += 1
+    # If a first section exists, skip past it so the protocol lands under it, not above the
+    # consumer's lead section; with no `## ` at all this returns end-of-file (graceful append).
+    if i < len(lines):
+        pos += len(lines[i])
+        i += 1
+        while i < len(lines) and not lines[i].lstrip().startswith("## "):
+            pos += len(lines[i])
+            i += 1
+    return pos
+
+
 # Adds or replaces the Project Knowledge Base section in the selected agent instruction file.
+# New sections land high (under the title/intro, before the first `## `); existing sections
+# are swapped in place to avoid churning the user's chosen placement.
 def upsert_runtime_protocol(root: Path) -> tuple[Path, str]:
     protocol_path = protocol_target_path(root)
     if not protocol_path.exists():
@@ -580,8 +608,12 @@ def upsert_runtime_protocol(root: Path) -> tuple[Path, str]:
         protocol_path.write_text(updated, encoding="utf-8")
         return protocol_path, "updated"
 
-    separator = "" if text.endswith("\n\n") else "\n\n" if text.endswith("\n") else "\n\n"
-    protocol_path.write_text(text + separator + RUNTIME_PROTOCOL, encoding="utf-8")
+    index = protocol_insert_index(text)
+    head, tail = text[:index], text[index:]
+    head = head.rstrip("\n") + "\n\n" if head.strip() else head
+    block = RUNTIME_PROTOCOL.rstrip() + "\n"
+    block = block + "\n" + tail.lstrip("\n") if tail.strip() else block
+    protocol_path.write_text((head + block).rstrip() + "\n", encoding="utf-8")
     return protocol_path, "appended"
 
 
