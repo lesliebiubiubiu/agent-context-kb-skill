@@ -10,7 +10,7 @@
     "agent_effort": "medium",
     "judge_models": {
       "claude": "sonnet",
-      "codex": "gpt-5-codex"
+      "codex": "gpt-5.5"
     },
     "judge_efforts": {
       "claude": "medium",
