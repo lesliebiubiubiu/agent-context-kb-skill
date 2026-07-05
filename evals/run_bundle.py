@@ -25,7 +25,7 @@ JUDGE_PROMPT_TEMPLATE = (
     "Judge the agent answer against the assertions using the reference files as ground truth. "
     "Return only JSON with this schema: "
     '{"assertions":[{"id":"...","passed":true,"reason":"...","confidence":0.0}]}. '
-    "Do not include markdown.\n\n{payload}"
+    "Do not include markdown.\n\n"
 )
 
 
@@ -508,7 +508,7 @@ def judge_prompt(task: dict, final_answer: str, semantic_assertions: list[dict],
             for assertion in semantic_assertions
         ],
     }
-    return JUDGE_PROMPT_TEMPLATE.format(payload=json.dumps(payload, indent=2, sort_keys=True))
+    return JUDGE_PROMPT_TEMPLATE + json.dumps(payload, indent=2, sort_keys=True)
 
 
 # Extracts the first JSON object from Claude judge text.

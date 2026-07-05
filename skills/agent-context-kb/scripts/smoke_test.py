@@ -1419,6 +1419,13 @@ def test_eval_runner_behavior_and_judge_parsers() -> None:
     require(judged["assertions"][0]["id"] == "semantic", "judge parser should parse assertion rows")
     require(judged["cost_usd"] == 0.02, "judge parser should capture cost")
     require(judged["actual_model"] == "claude-sonnet-test", "judge parser should capture actual model")
+    prompt = runner.judge_prompt(
+        {"id": "task", "prompt": "Answer."},
+        "Final answer.",
+        [{"id": "semantic", "description": "Matches."}],
+        [{"path": "README.md", "text": "Reference.", "truncated": False}],
+    )
+    require('"assertions"' in prompt and "Final answer." in prompt, "judge prompt should render schema and payload")
     codex_judge_stdout = "\n".join(
         [
             json.dumps({"type": "turn.started", "model": "gpt-5-test"}),
