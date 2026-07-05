@@ -321,7 +321,39 @@ def test_upgrade_updates_claude_protocol_owner() -> None:
         require("CLAUDE.md protocol updated." in result.stdout, "upgrade should report the CLAUDE.md protocol target", result)
         text = claude.read_text(encoding="utf-8")
         require("Old protocol." not in text, "upgrade should replace the old CLAUDE.md protocol section")
-        require("Read `.agent-kb/routes.yaml`" in text, "upgrade should write the current protocol into CLAUDE.md")
+        require("Use `.agent-kb/` before broad code search" in text, "upgrade should write the current protocol into CLAUDE.md")
+
+
+# Checks that upgrade replaces the old long runtime protocol with the slim protocol.
+def test_upgrade_replaces_long_runtime_protocol() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        init_root(root)
+        agents = root / "AGENTS.md"
+        agents.write_text(
+            """# Agent Instructions
+
+## Project Knowledge Base
+
+`.agent-kb/` is the project knowledge base for coding agents.
+
+When you need to understand how this codebase works, start here.
+
+1. Read `.agent-kb/start.md`.
+2. Read `.agent-kb/routes.yaml`.
+3. Read the KB documents those routes point to.
+
+After the task, only when it created reusable project knowledge:
+- Update the relevant topic file.
+- Do not write progress logs.
+""",
+            encoding="utf-8",
+        )
+        result = run_cli(root, "upgrade")
+        require(result.returncode == 0, "upgrade should succeed with an old long protocol", result)
+        text = agents.read_text(encoding="utf-8")
+        require("Use `.agent-kb/` before broad code search" in text, "upgrade should write the slim protocol", result)
+        require("When you need to understand how this codebase works" not in text, "upgrade should remove old rationale prose")
 
 
 # Checks that trim diagnosis names concrete candidates by default and points to the write step.
@@ -728,6 +760,7 @@ def main() -> int:
         test_upgrade_writes_map_from_routes,
         test_init_uses_claude_when_agents_points_to_it,
         test_upgrade_updates_claude_protocol_owner,
+        test_upgrade_replaces_long_runtime_protocol,
         test_trim_diagnoses_empty_scaffold,
         test_trim_threshold_flag_reports_oversize_topic,
         test_trim_flags_char_oversize_with_few_lines,
