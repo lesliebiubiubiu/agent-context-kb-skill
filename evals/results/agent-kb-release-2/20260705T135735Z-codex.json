@@ -1,0 +1,125 @@
+{
+  "bundle": "agent-kb-release-2",
+  "dry_run": false,
+  "generated_at": "2026-07-05T13:57:40+00:00",
+  "harness": "codex",
+  "judge": "codex",
+  "kb_commit": "c1750990180fe8a2af20a252d0ee539e5b5f48ed",
+  "repo_commit": "cb91b38c632fed144e68b9a6c7f3955f6ce52f16",
+  "repo_path": "/Users/lsl/Desktop/agent-context-kb-skill",
+  "run_id": "20260705T135735Z",
+  "runner_commit": "cb89520da45d57ebc697a42e003e3439a6c75c99",
+  "runs": [
+    {
+      "agent": {
+        "cost_usd": null,
+        "exit_code": 1,
+        "output_chars": 0,
+        "provenance": {
+          "actual_model": null,
+          "approval_policy": null,
+          "cli_version": "codex-cli 0.142.5",
+          "effort": "medium",
+          "harness": "codex",
+          "ignore_user_config": true,
+          "max_turns": null,
+          "requested_model": "sonnet",
+          "sandbox": "read-only"
+        },
+        "raw_artifacts": {
+          "stderr": ".raw/agent-kb-release-2/20260705T135735Z/respect-current-release-focus-r1-agent.stderr.txt",
+          "stdout": ".raw/agent-kb-release-2/20260705T135735Z/respect-current-release-focus-r1-agent.stdout.jsonl"
+        },
+        "status": "error",
+        "stderr_chars": 39,
+        "tool_call_count": 0,
+        "usage": null
+      },
+      "assertions": [
+        {
+          "check": "tool_read",
+          "description": "The agent reads the KB planning route before drawing a conclusion.",
+          "id": "reads-planning-route",
+          "passed": false,
+          "reason": "No tool input referenced .agent-kb/plans/current.md.",
+          "status": "scored"
+        },
+        {
+          "check": "no_edit",
+          "description": "The agent does not edit files for this read-only task.",
+          "id": "does-not-edit",
+          "passed": true,
+          "reason": "No edit/write tools were used.",
+          "status": "scored"
+        },
+        {
+          "check": "judge",
+          "description": "The answer keeps new user-facing features out of scope until validation data exists.",
+          "id": "keeps-feature-freeze",
+          "passed": null,
+          "reason": "Agent run failed before judging.",
+          "status": "agent_error"
+        }
+      ],
+      "harness": "codex",
+      "repetition": 1,
+      "task_id": "respect-current-release-focus"
+    },
+    {
+      "agent": {
+        "cost_usd": null,
+        "exit_code": 1,
+        "output_chars": 0,
+        "provenance": {
+          "actual_model": null,
+          "approval_policy": null,
+          "cli_version": "codex-cli 0.142.5",
+          "effort": "medium",
+          "harness": "codex",
+          "ignore_user_config": true,
+          "max_turns": null,
+          "requested_model": "sonnet",
+          "sandbox": "read-only"
+        },
+        "raw_artifacts": {
+          "stderr": ".raw/agent-kb-release-2/20260705T135735Z/respect-trim-control-boundary-r1-agent.stderr.txt",
+          "stdout": ".raw/agent-kb-release-2/20260705T135735Z/respect-trim-control-boundary-r1-agent.stdout.jsonl"
+        },
+        "status": "error",
+        "stderr_chars": 39,
+        "tool_call_count": 0,
+        "usage": null
+      },
+      "assertions": [
+        {
+          "check": "tool_read",
+          "description": "The agent reads the KB decisions route before answering.",
+          "id": "reads-decisions-route",
+          "passed": false,
+          "reason": "No tool input referenced .agent-kb/decisions/active/project-decisions.md.",
+          "status": "scored"
+        },
+        {
+          "check": "no_edit",
+          "description": "The agent does not edit files for this read-only task.",
+          "id": "does-not-edit",
+          "passed": true,
+          "reason": "No edit/write tools were used.",
+          "status": "scored"
+        },
+        {
+          "check": "judge",
+          "description": "The answer says semantic merges remain agent judgment, while trim --write only performs deterministic reversible cleanup.",
+          "id": "keeps-semantic-work-with-agent",
+          "passed": null,
+          "reason": "Agent run failed before judging.",
+          "status": "agent_error"
+        }
+      ],
+      "harness": "codex",
+      "repetition": 1,
+      "task_id": "respect-trim-control-boundary"
+    }
+  ],
+  "tasks_file_sha256": "0155157e7247c846cdd5216f061ad92fc33651dd3abbcd5f57ec84368114ed71"
+}

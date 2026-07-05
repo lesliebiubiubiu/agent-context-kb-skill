@@ -6,10 +6,14 @@
   "task_file": "tasks.yaml",
   "runner": {
     "default_harness": "claude",
-    "agent_model": "sonnet",
+    "agent_model": "opus",
+    "agent_models": {
+      "claude": "opus",
+      "codex": "gpt-5.5"
+    },
     "agent_effort": "medium",
     "judge_models": {
-      "claude": "sonnet",
+      "claude": "opus",
       "codex": "gpt-5.5"
     },
     "judge_efforts": {

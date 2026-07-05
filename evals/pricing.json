@@ -1,0 +1,75 @@
+{
+  "_source": {
+    "url": "https://openai.com/api/pricing/",
+    "retrieved_at": "2026-07-05",
+    "unit": "USD per 1M tokens"
+  },
+  "_default": {
+    "tier": "standard",
+    "context": "short_context"
+  },
+  "codex": {
+    "_default": {
+      "tier": "standard",
+      "context": "short_context"
+    },
+    "gpt-5.5": {
+      "standard": {
+        "short_context": {
+          "input_per_million": 5.0,
+          "cached_input_per_million": 0.5,
+          "output_per_million": 30.0,
+          "reasoning_output_per_million": 30.0
+        },
+        "long_context": {
+          "input_per_million": 10.0,
+          "cached_input_per_million": 1.0,
+          "output_per_million": 45.0,
+          "reasoning_output_per_million": 45.0
+        }
+      },
+      "batch": {
+        "short_context": {
+          "input_per_million": 2.5,
+          "cached_input_per_million": 0.25,
+          "output_per_million": 15.0,
+          "reasoning_output_per_million": 15.0
+        },
+        "long_context": {
+          "input_per_million": 5.0,
+          "cached_input_per_million": 0.5,
+          "output_per_million": 22.5,
+          "reasoning_output_per_million": 22.5
+        }
+      },
+      "flex": {
+        "short_context": {
+          "input_per_million": 2.5,
+          "cached_input_per_million": 0.25,
+          "output_per_million": 15.0,
+          "reasoning_output_per_million": 15.0
+        },
+        "long_context": {
+          "input_per_million": 5.0,
+          "cached_input_per_million": 0.5,
+          "output_per_million": 22.5,
+          "reasoning_output_per_million": 22.5
+        }
+      },
+      "priority": {
+        "short_context": {
+          "input_per_million": 10.0,
+          "cached_input_per_million": 1.0,
+          "output_per_million": 60.0,
+          "reasoning_output_per_million": 60.0
+        },
+        "long_context": {
+          "input_per_million": 20.0,
+          "cached_input_per_million": 2.0,
+          "output_per_million": 90.0,
+          "reasoning_output_per_million": 90.0
+        }
+      }
+    }
+  }
+}

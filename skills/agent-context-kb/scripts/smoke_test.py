@@ -1253,8 +1253,10 @@ def test_eval_runner_dry_run() -> None:
                 "kb_commit": kb_commit,
                 "task_file": "tasks.yaml",
                 "runner": {
+                    "default_harness": "codex",
                     "repetitions": 1,
                     "agent_model": "sonnet",
+                    "agent_models": {"claude": "sonnet", "codex": "gpt-5"},
                     "agent_effort": "medium",
                     "judge_models": {"claude": "sonnet", "codex": "gpt-5"},
                     "judge_efforts": {"codex": "medium"},
@@ -1303,12 +1305,19 @@ def test_eval_runner_dry_run() -> None:
         require(len(output_files) == 1, "eval runner should write one summary JSON", result)
         summary = json.loads(output_files[0].read_text(encoding="utf-8"))
         require(summary["dry_run"] is True, "eval summary should record dry-run mode")
+        require(summary["harness"] == "codex", "eval summary should use the bundle default harness")
         require(summary["judge"] is None, "eval summary should record absent judge harness")
         require(summary["repo_path"] == str(repo.resolve()), "eval summary should record bundle repo_path")
+        require("runner_commit" in summary, "eval summary should record runner commit provenance")
+        require("tasks_file_sha256" in summary, "eval summary should record task file provenance")
         require(summary["runs"][0]["agent"]["status"] == "dry_run", "eval summary should avoid agent calls")
         require(
-            summary["runs"][0]["agent"]["provenance"]["requested_model"] == "sonnet",
+            summary["runs"][0]["agent"]["provenance"]["requested_model"] == "gpt-5",
             "eval summary should record requested agent model",
+        )
+        require(
+            summary["runs"][0]["agent"]["provenance"]["sandbox"] == "read-only",
+            "Codex dry-run provenance should record the sandbox",
         )
         require(
             summary["runs"][0]["assertions"][0]["status"] == "dry_run",
@@ -1401,6 +1410,96 @@ def test_eval_runner_behavior_and_judge_parsers() -> None:
     require(scored["passed"] is True, "kb_access assertion should pass for shell searches under the KB")
     scored = runner.score_behavior_assertion({"id": "no-edit", "check": "no_edit"}, parsed["tool_calls"])
     require(scored["passed"] is True, "no_edit assertion should pass without edit tools")
+    codex_stream = "\n".join(
+        [
+            json.dumps({"type": "turn.started", "model": "gpt-5-test"}),
+            json.dumps({"type": "session_meta", "payload": {"cwd": str(Path("/tmp/eval-workspace"))}}),
+            json.dumps(
+                {
+                    "type": "item.started",
+                    "item": {
+                        "type": "command_execution",
+                        "command": "/bin/zsh -lc \"sed -n '1,40p' .agent-kb/routes.yaml\"",
+                        "status": "in_progress",
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "command_execution",
+                        "command": "/bin/zsh -lc \"sed -n '1,40p' .agent-kb/routes.yaml\"",
+                        "status": "completed",
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "shell",
+                        "arguments": json.dumps(
+                            {
+                                "command": ["bash", "-lc", "sed -n '1,40p' .agent-kb/start.md"],
+                                "workdir": "/tmp/eval-workspace",
+                            }
+                        ),
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "function_call",
+                    "payload": {
+                        "name": "apply_patch",
+                        "arguments": json.dumps({"patch": "*** Begin Patch\n*** End Patch\n"}),
+                    },
+                }
+            ),
+            json.dumps({"type": "agent_message", "text": "Codex final answer."}),
+        ]
+    )
+    codex_parsed = runner.parse_codex_stream(codex_stream)
+    require(codex_parsed["actual_model"] == "gpt-5-test", "Codex stream parser should capture actual model")
+    require(codex_parsed["final_answer"] == "Codex final answer.", "Codex stream parser should capture final answer")
+    require([call["name"] for call in codex_parsed["tool_calls"]] == ["shell", "shell", "apply_patch"], "Codex tool calls should normalize")
+    prices = runner.price_table({"pricing": runner.default_pricing()}, "codex", "gpt-5.5")
+    require(prices is not None and prices["input_per_million"] == 5.0, "runner should load shared Codex pricing")
+    estimated = runner.estimate_cost_usd(
+        {"input_tokens": 1000, "cached_input_tokens": 1000, "output_tokens": 1000, "reasoning_output_tokens": 1000},
+        prices,
+    )
+    require(abs(estimated - 0.0655) < 0.000001, "runner should estimate Codex cost from shared pricing")
+    scored = runner.score_behavior_assertion(
+        {"id": "read-start", "check": "tool_read", "path": ".agent-kb/start.md"},
+        codex_parsed["tool_calls"],
+    )
+    require(scored["passed"] is True, "Codex shell reads should satisfy tool_read")
+    scored = runner.score_behavior_assertion({"id": "no-edit", "check": "no_edit"}, codex_parsed["tool_calls"])
+    require(scored["passed"] is False, "Codex apply_patch should fail no_edit")
+    with tempfile.TemporaryDirectory(prefix="agent-kb-rollout-") as rollout_tmp:
+        rollout = Path(rollout_tmp) / "rollout.jsonl"
+        write_jsonl(
+            rollout,
+            [
+                {"type": "session_meta", "payload": {"cwd": "/tmp/eval-workspace"}},
+                {
+                    "type": "function_call",
+                    "payload": {
+                        "name": "functions.exec_command",
+                        "arguments": json.dumps({"cmd": "cat .agent-kb/routes.yaml", "workdir": "/tmp/eval-workspace"}),
+                    },
+                },
+            ],
+        )
+        rollout_calls = runner.parse_codex_rollout_tool_calls(rollout)
+    scored = runner.score_behavior_assertion(
+        {"id": "read-routes", "check": "tool_read", "path": ".agent-kb/routes.yaml"},
+        rollout_calls,
+    )
+    require(scored["passed"] is True, "Codex rollout fallback should normalize shell reads")
     judge_stdout = json.dumps(
         {
             "result": json.dumps(
@@ -1527,8 +1626,10 @@ def test_eval_runner_behavior_and_judge_parsers() -> None:
         require("--effort" in captured["args"] and "medium" in captured["args"], "Claude agent command should pass configured effort")
         require(agent_result["status"] == "ok", "fake Claude run should parse as ok")
         require(agent_result["provenance"]["actual_model"] == "claude-sonnet-test", "agent provenance should record actual model")
-        codex_command = runner.codex_command("Judge.", config, "judge")
+        codex_command = runner.codex_command("Judge.", config, "judge", base)
         require("--model" in codex_command and "gpt-5" in codex_command, "Codex judge command should pass configured model")
+        require("--cd" in codex_command and str(base) in codex_command, "Codex command should pass the pinned workspace")
+        require("--ignore-user-config" in codex_command, "Codex command should avoid ambient user config")
         require(
             any(item.startswith("model_reasoning_effort=") for item in codex_command),
             "Codex judge command should pass configured effort",

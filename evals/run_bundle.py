@@ -9,16 +9,34 @@ import hashlib
 import io
 import json
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
 
-EDIT_TOOL_NAMES = {"Edit", "MultiEdit", "Write", "NotebookEdit"}
-COMMAND_TOOL_NAMES = {"Bash", "Shell", "functions.exec_command"}
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_DIR = SCRIPT_DIR.parent
+PRICING_PATH = SCRIPT_DIR / "pricing.json"
+TRANSCRIPT_SCRIPT_DIR = REPO_DIR / "skills" / "agent-context-kb" / "scripts"
+sys.path.insert(0, str(TRANSCRIPT_SCRIPT_DIR))
+from transcript_reads import (  # noqa: E402
+    codex_command_arg,
+    codex_record_tool_payload,
+    codex_tool_call,
+    iter_jsonl,
+    path_is_inside_root,
+    resolve_path,
+)
+
+
+EDIT_TOOL_NAMES = {"Edit", "MultiEdit", "Write", "NotebookEdit", "apply_patch"}
+COMMAND_TOOL_NAMES = {"Bash", "Shell", "shell", "functions.exec_command"}
+CODEX_SANDBOX = "read-only"
 REFERENCE_FILE_CHAR_LIMIT = 6000
 REFERENCE_TOTAL_CHAR_LIMIT = 20000
 JUDGE_PROMPT_TEMPLATE = (
@@ -34,32 +52,55 @@ def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+# Reads the runner-level pricing table shared by all bundles.
+def default_pricing() -> dict:
+    if not PRICING_PATH.exists():
+        return {}
+    pricing = read_json_yaml(PRICING_PATH)
+    if not isinstance(pricing, dict):
+        raise ValueError(f"{PRICING_PATH} must contain a pricing object")
+    return pricing
+
+
 # Reads optional runner settings from bundle.yaml with one normalized shape.
 def runner_config(bundle: dict) -> dict:
     config = bundle.get("runner", {})
     if not isinstance(config, dict):
         raise ValueError("bundle.yaml runner must be an object when present")
+    agent_models = config.get("agent_models", {})
+    agent_efforts = config.get("agent_efforts", {})
     judge_models = config.get("judge_models", {})
     judge_efforts = config.get("judge_efforts", {})
+    pricing = config.get("pricing", default_pricing())
+    if agent_models and not isinstance(agent_models, dict):
+        raise ValueError("bundle.yaml runner.agent_models must be an object when present")
+    if agent_efforts and not isinstance(agent_efforts, dict):
+        raise ValueError("bundle.yaml runner.agent_efforts must be an object when present")
     if judge_models and not isinstance(judge_models, dict):
         raise ValueError("bundle.yaml runner.judge_models must be an object when present")
     if judge_efforts and not isinstance(judge_efforts, dict):
         raise ValueError("bundle.yaml runner.judge_efforts must be an object when present")
+    if pricing and not isinstance(pricing, dict):
+        raise ValueError("bundle.yaml runner.pricing must be an object when present")
     return {
+        "default_harness": str(config.get("default_harness") or "claude"),
         "repetitions": int(config.get("repetitions", 1)),
         "agent_model": config.get("agent_model"),
+        "agent_models": agent_models,
         "agent_effort": config.get("agent_effort"),
+        "agent_efforts": agent_efforts,
         "judge_model": config.get("judge_model"),
         "judge_models": judge_models,
         "judge_effort": config.get("judge_effort"),
         "judge_efforts": judge_efforts,
+        "pricing": pricing,
     }
 
 
 # Selects a runner setting, allowing judge settings to vary by harness.
 def runner_value(config: dict, role: str, field: str, harness: str | None = None):
-    if role == "judge" and harness:
-        plural = {"model": "judge_models", "effort": "judge_efforts"}.get(field)
+    if harness:
+        plural = {"model": f"{role}_models", "effort": f"{role}_efforts"}.get(field)
         values = config.get(plural)
         if isinstance(values, dict) and harness in values:
             return values[harness]
@@ -95,6 +136,62 @@ def base_provenance(harness: str, config: dict, role: str, versions: dict[str, s
     }
 
 
+# Looks up per-million-token prices for a harness/model/tier in runner pricing.
+def price_table(config: dict, harness: str, model: str | None) -> dict | None:
+    pricing = config.get("pricing")
+    if not isinstance(pricing, dict) or not model:
+        return None
+    defaults = pricing.get("_default") if isinstance(pricing.get("_default"), dict) else {}
+    harness_prices = pricing.get(harness)
+    harness_defaults = {}
+    if isinstance(harness_prices, dict) and isinstance(harness_prices.get("_default"), dict):
+        harness_defaults = harness_prices["_default"]
+    table = None
+    if isinstance(harness_prices, dict) and isinstance(harness_prices.get(model), dict):
+        table = harness_prices[model]
+    elif isinstance(pricing.get(model), dict):
+        table = pricing[model]
+    if not isinstance(table, dict):
+        return None
+    if "input_per_million" in table:
+        return table
+    tier = str(harness_defaults.get("tier") or defaults.get("tier") or "standard")
+    context = str(harness_defaults.get("context") or defaults.get("context") or "short_context")
+    tier_table = table.get(tier)
+    if isinstance(tier_table, dict) and "input_per_million" in tier_table:
+        return tier_table
+    if isinstance(tier_table, dict) and isinstance(tier_table.get(context), dict):
+        return tier_table[context]
+    return None
+
+
+# Estimates USD cost from token usage and a per-million pricing table.
+def estimate_cost_usd(usage, prices: dict | None) -> float | None:
+    if not isinstance(usage, dict) or not isinstance(prices, dict):
+        return None
+    fields = {
+        "input_tokens": "input_per_million",
+        "cached_input_tokens": "cached_input_per_million",
+        "cache_read_input_tokens": "cached_input_per_million",
+        "output_tokens": "output_per_million",
+        "reasoning_output_tokens": "reasoning_output_per_million",
+    }
+    total = 0.0
+    used = False
+    for token_field, price_field in fields.items():
+        tokens = usage.get(token_field)
+        price = prices.get(price_field)
+        if tokens is None:
+            continue
+        if price is None and token_field == "reasoning_output_tokens":
+            price = prices.get("output_per_million")
+        if price is None:
+            return None
+        total += float(tokens) * float(price) / 1_000_000
+        used = True
+    return total if used else None
+
+
 # Reads a JSON-compatible YAML file using the standard library.
 def read_json_yaml(path: Path) -> dict:
     try:
@@ -104,6 +201,11 @@ def read_json_yaml(path: Path) -> dict:
     if not isinstance(value, dict):
         raise ValueError(f"{path} must contain an object at the top level")
     return value
+
+
+# Hashes a file's bytes so task definitions can be compared across result files.
+def sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 # Runs git in a repository and returns completed output or raises a clear error.
@@ -119,6 +221,14 @@ def git_run(repo: Path, args: list[str], stdout: int | None = subprocess.PIPE) -
         detail = result.stderr.decode("utf-8", errors="replace").strip()
         raise ValueError(f"git {' '.join(args)} failed in {repo}: {detail}")
     return result
+
+
+# Returns HEAD for a repository, or None if git cannot resolve it.
+def git_head(repo: Path) -> str | None:
+    try:
+        return git_run(repo, ["rev-parse", "HEAD"]).stdout.decode("utf-8", errors="replace").strip()
+    except ValueError:
+        return None
 
 
 # Returns a stable UTC timestamp for naming result files.
@@ -218,6 +328,17 @@ def write_raw_artifact(results_root: Path, raw_root: Path, name: str, text: str)
     raw_root.mkdir(parents=True, exist_ok=True)
     path = raw_root / name
     path.write_text(text, encoding="utf-8")
+    try:
+        return str(path.relative_to(results_root))
+    except ValueError:
+        return str(path)
+
+
+# Copies a raw local artifact and returns its path relative to the results root.
+def copy_raw_artifact(results_root: Path, raw_root: Path, name: str, source: Path) -> str:
+    raw_root.mkdir(parents=True, exist_ok=True)
+    path = raw_root / name
+    shutil.copyfile(source, path)
     try:
         return str(path.relative_to(results_root))
     except ValueError:
@@ -329,6 +450,136 @@ def parse_jsonl_agent_output(stdout: str) -> dict:
     }
 
 
+# Converts a Codex function call payload into the scorer's existing tool-call shape.
+def normalize_codex_tool_payload(payload: dict, fallback_workdir: Path | None = None) -> dict:
+    name, args = codex_tool_call(payload)
+    if "apply_patch" in name:
+        return {"name": "apply_patch", "input": args}
+    command = codex_command_arg(args)
+    if command:
+        workdir = args.get("workdir") or (str(fallback_workdir) if fallback_workdir else None)
+        tool_input = {"command": command, "cmd": command}
+        if workdir:
+            tool_input["workdir"] = str(workdir)
+        return {"name": "shell", "input": tool_input}
+    return {"name": name or "tool", "input": args}
+
+
+# Converts a Codex command_execution item into the scorer's shell-call shape.
+def normalize_codex_command_execution(item: dict, fallback_workdir: Path | None = None) -> dict | None:
+    if item.get("status") == "in_progress":
+        return None
+    command = item.get("command")
+    if not isinstance(command, str) or not command:
+        return None
+    tool_input = {"command": command, "cmd": command}
+    if fallback_workdir is not None:
+        tool_input["workdir"] = str(fallback_workdir)
+    return {"name": "shell", "input": tool_input}
+
+
+# Finds Codex function-call records anywhere inside one JSON event.
+def extract_codex_tool_calls(value, fallback_workdir: Path | None = None) -> list[dict]:
+    calls = []
+    if isinstance(value, dict):
+        if value.get("type") == "command_execution":
+            call = normalize_codex_command_execution(value, fallback_workdir)
+            return [call] if call is not None else []
+        payload = codex_record_tool_payload(value)
+        if payload is not None:
+            return [normalize_codex_tool_payload(payload, fallback_workdir)]
+        elif value.get("type") in {"function_call", "custom_tool_call"} and (value.get("name") or value.get("tool_name")):
+            return [normalize_codex_tool_payload(value, fallback_workdir)]
+        for child in value.values():
+            calls.extend(extract_codex_tool_calls(child, fallback_workdir))
+    elif isinstance(value, list):
+        for child in value:
+            calls.extend(extract_codex_tool_calls(child, fallback_workdir))
+    return calls
+
+
+# Parses Codex JSONL output into final text, usage, cost, model, and normalized tool calls.
+def parse_codex_stream(stdout: str) -> dict:
+    parsed = parse_jsonl_agent_output(stdout)
+    tool_calls = []
+    current_workdir: Path | None = None
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        payload = event.get("payload") if isinstance(event, dict) and isinstance(event.get("payload"), dict) else {}
+        if isinstance(event, dict) and event.get("type") == "session_meta":
+            cwd = str(payload.get("cwd") or payload.get("workdir") or "")
+            current_workdir = resolve_path(cwd) if cwd else current_workdir
+        tool_calls.extend(extract_codex_tool_calls(event, current_workdir))
+    parsed["tool_calls"] = tool_calls
+    return parsed
+
+
+# Extracts the Codex thread id from JSONL stdout when the CLI reports one.
+def codex_thread_id(stdout: str) -> str | None:
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "thread.started" and event.get("thread_id"):
+            return str(event["thread_id"])
+    return None
+
+
+# Parses a Codex rollout JSONL file into normalized tool calls for fallback scoring.
+def parse_codex_rollout_tool_calls(path: Path) -> list[dict]:
+    calls = []
+    current_workdir: Path | None = None
+    for record in iter_jsonl(path):
+        payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+        if record.get("type") == "session_meta":
+            cwd = str(payload.get("cwd") or payload.get("workdir") or "")
+            current_workdir = resolve_path(cwd) if cwd else current_workdir
+            continue
+        calls.extend(extract_codex_tool_calls(record, current_workdir))
+    return calls
+
+
+# Finds the Codex rollout JSONL produced for a workspace after a run starts.
+def find_codex_rollout(
+    workspace: Path,
+    started_at: float,
+    sessions_dir: Path | None = None,
+    thread_id: str | None = None,
+) -> Path | None:
+    base = sessions_dir or (Path.home() / ".codex" / "sessions")
+    if not base.exists():
+        return None
+    candidates = []
+    for path in base.rglob("*.jsonl"):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if stat.st_mtime >= started_at - 5:
+            candidates.append((stat.st_mtime, path))
+    if thread_id:
+        for _mtime, path in sorted(candidates, reverse=True):
+            if thread_id in path.name:
+                return path
+    for _mtime, path in sorted(candidates, reverse=True):
+        for record in iter_jsonl(path):
+            payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+            if record.get("type") != "session_meta":
+                continue
+            cwd = str(payload.get("cwd") or payload.get("workdir") or "")
+            if cwd and path_is_inside_root(resolve_path(cwd), workspace):
+                return path
+    return None
+
+
 # Builds the Claude print command with explicit runner-controlled settings.
 def claude_command(prompt: str, output_format: str, config: dict, role: str, verbose: bool = False) -> list[str]:
     command = ["claude", "-p", "--output-format", output_format]
@@ -345,8 +596,10 @@ def claude_command(prompt: str, output_format: str, config: dict, role: str, ver
 
 
 # Builds the Codex exec command with explicit runner-controlled settings.
-def codex_command(prompt: str, config: dict, role: str) -> list[str]:
-    command = ["codex", "exec", "--json", "--sandbox", "read-only"]
+def codex_command(prompt: str, config: dict, role: str, workspace: Path | None = None) -> list[str]:
+    command = ["codex", "exec", "--json", "--sandbox", CODEX_SANDBOX, "--ignore-user-config"]
+    if workspace is not None:
+        command.extend(["--cd", str(workspace)])
     model = runner_value(config, role, "model", "codex")
     effort = runner_value(config, role, "effort", "codex")
     if model:
@@ -397,6 +650,10 @@ def run_claude(
     }
     parsed = parse_claude_stream(result.stdout)
     provenance = {**provenance, "actual_model": parsed["actual_model"]}
+    estimated_cost_usd = estimate_cost_usd(
+        parsed["usage"],
+        price_table(config, "claude", parsed["actual_model"] or provenance.get("requested_model")),
+    )
     return {
         "status": "ok" if result.returncode == 0 else "error",
         "exit_code": result.returncode,
@@ -405,6 +662,79 @@ def run_claude(
         "tool_call_count": len(parsed["tool_calls"]),
         "usage": parsed["usage"],
         "cost_usd": parsed["cost_usd"],
+        "estimated_cost_usd": estimated_cost_usd,
+        "raw_artifacts": raw_artifacts,
+        "provenance": provenance,
+        "final_answer": parsed["final_answer"],
+        "tool_calls": parsed["tool_calls"],
+    }
+
+
+# Runs Codex once in the pinned workspace and stores raw JSONL plus rollout output locally.
+def run_codex(
+    prompt: str,
+    workspace: Path,
+    dry_run: bool,
+    results_root: Path,
+    raw_root: Path,
+    task_id: str,
+    repetition: int,
+    config: dict,
+    provenance: dict,
+) -> dict:
+    provenance = {
+        **provenance,
+        "sandbox": CODEX_SANDBOX,
+        "approval_policy": None,
+        "ignore_user_config": True,
+    }
+    if dry_run:
+        return {
+            "status": "dry_run",
+            "exit_code": 0,
+            "output_chars": 0,
+            "tool_call_count": 0,
+            "usage": None,
+            "cost_usd": None,
+            "raw_artifacts": {},
+            "provenance": provenance,
+            "final_answer": "",
+            "tool_calls": [],
+        }
+    started_at = time.time()
+    result = subprocess.run(
+        codex_command(prompt, config, "agent", workspace),
+        cwd=workspace,
+        check=False,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    prefix = f"{safe_name(task_id)}-r{repetition}-agent"
+    raw_artifacts = {
+        "stdout": write_raw_artifact(results_root, raw_root, f"{prefix}.stdout.jsonl", result.stdout),
+        "stderr": write_raw_artifact(results_root, raw_root, f"{prefix}.stderr.txt", result.stderr),
+    }
+    parsed = parse_codex_stream(result.stdout)
+    rollout = find_codex_rollout(workspace, started_at, thread_id=codex_thread_id(result.stdout))
+    if rollout is not None:
+        raw_artifacts["rollout"] = copy_raw_artifact(results_root, raw_root, f"{prefix}.rollout.jsonl", rollout)
+        if not parsed["tool_calls"]:
+            parsed["tool_calls"] = parse_codex_rollout_tool_calls(rollout)
+    provenance = {**provenance, "actual_model": parsed["actual_model"]}
+    estimated_cost_usd = estimate_cost_usd(
+        parsed["usage"],
+        price_table(config, "codex", parsed["actual_model"] or provenance.get("requested_model")),
+    )
+    return {
+        "status": "ok" if result.returncode == 0 else "error",
+        "exit_code": result.returncode,
+        "output_chars": len(parsed["final_answer"]),
+        "stderr_chars": len(result.stderr),
+        "tool_call_count": len(parsed["tool_calls"]),
+        "usage": parsed["usage"],
+        "cost_usd": parsed["cost_usd"],
+        "estimated_cost_usd": estimated_cost_usd,
         "raw_artifacts": raw_artifacts,
         "provenance": provenance,
         "final_answer": parsed["final_answer"],
@@ -572,7 +902,7 @@ def run_judge(
         command = claude_command(prompt, "json", config, "judge")
         stdout_name = f"{safe_name(task_id)}-r{repetition}-judge.stdout.json"
     elif judge_harness == "codex":
-        command = codex_command(prompt, config, "judge")
+        command = codex_command(prompt, config, "judge", workspace)
         stdout_name = f"{safe_name(task_id)}-r{repetition}-judge.stdout.jsonl"
     else:
         raise ValueError(f"unsupported judge harness: {judge_harness}")
@@ -613,6 +943,10 @@ def run_judge(
             "provenance": provenance,
         }
     provenance = {**provenance, "actual_model": parsed["actual_model"]}
+    estimated_cost_usd = estimate_cost_usd(
+        parsed["usage"],
+        price_table(config, judge_harness, parsed["actual_model"] or provenance.get("requested_model")),
+    )
     return {
         "status": "ok",
         "exit_code": result.returncode,
@@ -620,6 +954,7 @@ def run_judge(
         "assertions": parsed["assertions"],
         "usage": parsed["usage"],
         "cost_usd": parsed["cost_usd"],
+        "estimated_cost_usd": estimated_cost_usd,
         "provenance": provenance,
     }
 
@@ -716,6 +1051,8 @@ def resolve_raw_artifact(results_root: Path, artifact: str) -> Path:
 def parse_agent_raw(harness: str, stdout: str) -> dict:
     if harness == "claude":
         return parse_claude_stream(stdout)
+    if harness == "codex":
+        return parse_codex_stream(stdout)
     return parse_jsonl_agent_output(stdout)
 
 
@@ -839,6 +1176,7 @@ def run_bundle(
 ) -> dict:
     bundle = read_json_yaml(bundle_dir / "bundle.yaml")
     config = runner_config(bundle)
+    harness = harness or config["default_harness"]
     repo_root = resolve_repo_root(bundle_dir, bundle, repo_root)
     kb_repo = resolve_kb_repo(repo_root, kb_repo)
     tasks_path = bundle_dir / str(bundle.get("task_file", "tasks.yaml"))
@@ -846,8 +1184,8 @@ def run_bundle(
     tasks = tasks_doc.get("tasks", [])
     if not isinstance(tasks, list) or not tasks:
         raise ValueError(f"{tasks_path} must define a non-empty tasks list")
-    if harness != "claude":
-        raise ValueError("runner v1 only supports --harness claude")
+    if harness not in {"claude", "codex"}:
+        raise ValueError("--harness must be claude or codex")
     if judge_harness and judge_harness not in {"claude", "codex"}:
         raise ValueError("--judge must be claude or codex")
     repetitions = config["repetitions"]
@@ -860,6 +1198,7 @@ def run_bundle(
     versions = {"claude": cli_version("claude"), "codex": cli_version("codex")}
     agent_provenance = base_provenance(harness, config, "agent", versions)
     judge_provenance = base_provenance(judge_harness, config, "judge", versions) if judge_harness else None
+    agent_runner = run_claude if harness == "claude" else run_codex
     with prepared_workspace(repo_root, kb_repo, repo_commit, kb_commit) as workspace:
         for task in tasks:
             if not isinstance(task, dict):
@@ -869,7 +1208,7 @@ def run_bundle(
                 raise ValueError(f"{tasks_path} contains a task without id")
             prompt = task_prompt(task)
             for repetition in range(1, repetitions + 1):
-                agent_result = run_claude(
+                agent_result = agent_runner(
                     prompt,
                     workspace,
                     dry_run,
@@ -910,6 +1249,8 @@ def run_bundle(
         "repo_path": str(repo_root),
         "repo_commit": repo_commit,
         "kb_commit": kb_commit,
+        "runner_commit": git_head(REPO_DIR),
+        "tasks_file_sha256": sha256_file(tasks_path),
         "harness": harness,
         "dry_run": dry_run,
         "judge": judge_harness,
@@ -925,7 +1266,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bundle", required=True, help="Bundle directory containing bundle.yaml and tasks.yaml.")
     parser.add_argument("--repo-root", default=".", help="Fallback git repository when bundle.yaml omits repo_path.")
     parser.add_argument("--kb-repo", default=None, help="Override nested KB git repository used for kb_commit archives.")
-    parser.add_argument("--harness", default="claude", help="Harness runner to use; v1 supports claude.")
+    parser.add_argument(
+        "--harness",
+        choices=["claude", "codex"],
+        default=None,
+        help="Harness runner to use; defaults to bundle runner.default_harness or claude.",
+    )
     parser.add_argument("--results-dir", default="evals/results", help="Directory for summary result JSON files.")
     parser.add_argument("--dry-run", action="store_true", help="Validate the bundle without invoking the agent.")
     parser.add_argument(
@@ -969,7 +1315,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.calibrate_summary:
         suffix = f"{summary['judge']}-judge-calibration"
     else:
-        suffix = "dry-run" if args.dry_run else args.harness
+        suffix = "dry-run" if args.dry_run else summary["harness"]
     output_path = bundle_results / f"{run_id}-{suffix}.json"
     output_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"Wrote {output_path}")
