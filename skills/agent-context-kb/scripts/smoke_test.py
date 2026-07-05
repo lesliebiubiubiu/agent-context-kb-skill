@@ -1252,7 +1252,13 @@ def test_eval_runner_dry_run() -> None:
                 "repo_commit": repo_commit,
                 "kb_commit": kb_commit,
                 "task_file": "tasks.yaml",
-                "runner": {"repetitions": 1},
+                "runner": {
+                    "repetitions": 1,
+                    "agent_model": "sonnet",
+                    "agent_effort": "medium",
+                    "judge_models": {"claude": "sonnet", "codex": "gpt-5"},
+                    "judge_efforts": {"codex": "medium"},
+                },
             },
         )
         write_json_yaml(
@@ -1297,8 +1303,13 @@ def test_eval_runner_dry_run() -> None:
         require(len(output_files) == 1, "eval runner should write one summary JSON", result)
         summary = json.loads(output_files[0].read_text(encoding="utf-8"))
         require(summary["dry_run"] is True, "eval summary should record dry-run mode")
+        require(summary["judge"] is None, "eval summary should record absent judge harness")
         require(summary["repo_path"] == str(repo.resolve()), "eval summary should record bundle repo_path")
         require(summary["runs"][0]["agent"]["status"] == "dry_run", "eval summary should avoid agent calls")
+        require(
+            summary["runs"][0]["agent"]["provenance"]["requested_model"] == "sonnet",
+            "eval summary should record requested agent model",
+        )
         require(
             summary["runs"][0]["assertions"][0]["status"] == "dry_run",
             "eval assertions should be marked dry_run without agent calls",
@@ -1354,6 +1365,7 @@ def test_eval_runner_behavior_and_judge_parsers() -> None:
     runner = load_eval_runner_module()
     stream = "\n".join(
         [
+            json.dumps({"type": "system", "model": "claude-sonnet-test"}),
             json.dumps(
                 {
                     "type": "assistant",
@@ -1371,6 +1383,7 @@ def test_eval_runner_behavior_and_judge_parsers() -> None:
     parsed = runner.parse_claude_stream(stream)
     require(parsed["final_answer"] == "Final answer.", "stream parser should prefer the final result text")
     require(parsed["cost_usd"] == 0.01, "stream parser should capture cost")
+    require(parsed["actual_model"] == "claude-sonnet-test", "stream parser should capture actual model")
     scored = runner.score_behavior_assertion(
         {"id": "read-start", "check": "tool_read", "path": ".agent-kb/start.md"},
         parsed["tool_calls"],
@@ -1399,42 +1412,197 @@ def test_eval_runner_behavior_and_judge_parsers() -> None:
             ),
             "usage": {"input_tokens": 1},
             "cost_usd": 0.02,
+            "model": "claude-sonnet-test",
         }
     )
     judged = runner.parse_judge_output(judge_stdout)
     require(judged["assertions"][0]["id"] == "semantic", "judge parser should parse assertion rows")
     require(judged["cost_usd"] == 0.02, "judge parser should capture cost")
+    require(judged["actual_model"] == "claude-sonnet-test", "judge parser should capture actual model")
+    codex_judge_stdout = "\n".join(
+        [
+            json.dumps({"type": "turn.started", "model": "gpt-5-test"}),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "message",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": json.dumps(
+                                    {
+                                        "assertions": [
+                                            {
+                                                "id": "semantic",
+                                                "passed": False,
+                                                "reason": "Does not match.",
+                                                "confidence": 0.8,
+                                            }
+                                        ]
+                                    }
+                                ),
+                            }
+                        ],
+                    },
+                }
+            ),
+        ]
+    )
+    codex_judged = runner.parse_judge_output(codex_judge_stdout)
+    require(codex_judged["assertions"][0]["passed"] is False, "judge parser should parse Codex JSONL output")
+    require(codex_judged["actual_model"] == "gpt-5-test", "judge parser should capture Codex model")
     with tempfile.TemporaryDirectory(prefix="agent-kb-eval-") as tmp:
         base = Path(tmp)
         captured = {}
         original_run = runner.subprocess.run
 
+        # Captures the subprocess command while returning a synthetic Claude stream.
         def fake_run(args, **kwargs):
             captured["args"] = args
             return subprocess.CompletedProcess(args, 0, stdout=stream, stderr="")
 
         try:
             runner.subprocess.run = fake_run
-            agent_result = runner.run_claude("Prompt.", base, False, base / "results", base / "results" / ".raw", "task", 1)
+            config = {
+                "agent_model": "sonnet",
+                "agent_effort": "medium",
+                "judge_model": None,
+                "judge_models": {"codex": "gpt-5"},
+                "judge_effort": None,
+                "judge_efforts": {"codex": "medium"},
+            }
+            provenance = {
+                "harness": "claude",
+                "cli_version": "claude-test",
+                "requested_model": "sonnet",
+                "actual_model": None,
+                "effort": "medium",
+                "max_turns": None,
+            }
+            agent_result = runner.run_claude("Prompt.", base, False, base / "results", base / "results" / ".raw", "task", 1, config, provenance)
         finally:
             runner.subprocess.run = original_run
         require("--output-format" in captured["args"], "Claude agent command should set output format")
         require("stream-json" in captured["args"], "Claude agent command should request stream-json output")
         require("--verbose" in captured["args"], "Claude stream-json command should include --verbose")
+        require("--model" in captured["args"] and "sonnet" in captured["args"], "Claude agent command should pass configured model")
+        require("--effort" in captured["args"] and "medium" in captured["args"], "Claude agent command should pass configured effort")
         require(agent_result["status"] == "ok", "fake Claude run should parse as ok")
+        require(agent_result["provenance"]["actual_model"] == "claude-sonnet-test", "agent provenance should record actual model")
+        codex_command = runner.codex_command("Judge.", config, "judge")
+        require("--model" in codex_command and "gpt-5" in codex_command, "Codex judge command should pass configured model")
+        require(
+            any(item.startswith("model_reasoning_effort=") for item in codex_command),
+            "Codex judge command should pass configured effort",
+        )
         rows, judge_result = runner.assertion_rows(
             {"assertions": [{"id": "semantic", "check": "judge", "description": "Semantic assertion."}]},
             {"status": "error", "tool_calls": [], "final_answer": ""},
             base,
-            True,
+            "claude",
             False,
             base / "results",
             base / "results" / ".raw",
             "task",
             1,
+            config,
+            {
+                "harness": "claude",
+                "cli_version": "claude-test",
+                "requested_model": "sonnet",
+                "actual_model": None,
+                "effort": None,
+                "max_turns": None,
+            },
         )
         require(judge_result is None, "failed agent run should not invoke judge")
         require(rows[0]["status"] == "agent_error", "semantic assertion should record agent_error")
+
+
+# Checks that raw-answer calibration rejudges existing summaries and computes agreement.
+def test_eval_runner_calibration_from_raw() -> None:
+    runner = load_eval_runner_module()
+    with tempfile.TemporaryDirectory(prefix="agent-kb-eval-") as tmp:
+        base = Path(tmp)
+        repo = base / "repo"
+        kb_repo = base / "kb"
+        repo_commit = create_fixture_commit(repo, {"README.md": "# Fixture\n"})
+        kb_commit = create_fixture_commit(kb_repo, {"start.md": "# Agent KB Start\n"})
+        bundle = base / "bundles" / "demo"
+        results = base / "results"
+        run_id = "20260705T000000Z"
+        raw_dir = results / ".raw" / "demo" / run_id
+        raw_stdout = raw_dir / "task-r1-agent.stdout.jsonl"
+        raw_stdout.parent.mkdir(parents=True, exist_ok=True)
+        raw_stdout.write_text(json.dumps({"type": "result", "result": "Final answer."}) + "\n", encoding="utf-8")
+        write_json_yaml(
+            bundle / "bundle.yaml",
+            {
+                "name": "demo",
+                "repo_path": str(repo),
+                "repo_commit": repo_commit,
+                "kb_commit": kb_commit,
+                "task_file": "tasks.yaml",
+                "runner": {"repetitions": 1, "judge_models": {"codex": "gpt-5"}},
+            },
+        )
+        write_json_yaml(
+            bundle / "tasks.yaml",
+            {
+                "tasks": [
+                    {
+                        "id": "task",
+                        "prompt": "Answer.",
+                        "assertions": [{"id": "semantic", "check": "judge", "description": "Matches."}],
+                    }
+                ]
+            },
+        )
+        summary_path = results / "demo" / "source.json"
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(
+            json.dumps(
+                {
+                    "bundle": "demo",
+                    "repo_commit": repo_commit,
+                    "kb_commit": kb_commit,
+                    "harness": "claude",
+                    "runs": [
+                        {
+                            "task_id": "task",
+                            "repetition": 1,
+                            "harness": "claude",
+                            "agent": {"raw_artifacts": {"stdout": str(raw_stdout.relative_to(results))}},
+                            "assertions": [
+                                {"id": "semantic", "check": "judge", "status": "scored", "passed": True, "reason": "Old."}
+                            ],
+                        }
+                    ],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        original_run_judge = runner.run_judge
+
+        # Returns a deterministic rejudge result without invoking an external CLI.
+        def fake_run_judge(*args, **kwargs):
+            return {
+                "status": "ok",
+                "raw_artifacts": {"stdout": ".raw/demo/calibration/task-r1-judge.stdout.jsonl"},
+                "assertions": [{"id": "semantic", "passed": True, "reason": "New.", "confidence": 0.9}],
+                "provenance": {"harness": "codex", "requested_model": "gpt-5"},
+            }
+
+        try:
+            runner.run_judge = fake_run_judge
+            calibration = runner.calibrate_summary(bundle, repo, kb_repo, summary_path, "codex", results, "calibration")
+        finally:
+            runner.run_judge = original_run_judge
+        require(calibration["agreement"]["compared"] == 1, "calibration should compare one semantic assertion")
+        require(calibration["agreement"]["agreed"] == 1, "calibration should count matching judge decisions")
+        require(calibration["rows"][0]["agreement"] is True, "calibration row should record agreement")
 
 
 # Checks that init sets up the chosen versioning mode (nested default, shared, local).
@@ -1509,6 +1677,7 @@ def main() -> int:
         test_eval_runner_dry_run,
         test_eval_runner_rejects_bad_pin,
         test_eval_runner_behavior_and_judge_parsers,
+        test_eval_runner_calibration_from_raw,
         test_init_versioning_modes,
     ]
     for test in tests:

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import io
 import json
 import re
@@ -20,6 +21,78 @@ EDIT_TOOL_NAMES = {"Edit", "MultiEdit", "Write", "NotebookEdit"}
 COMMAND_TOOL_NAMES = {"Bash", "Shell", "functions.exec_command"}
 REFERENCE_FILE_CHAR_LIMIT = 6000
 REFERENCE_TOTAL_CHAR_LIMIT = 20000
+JUDGE_PROMPT_TEMPLATE = (
+    "Judge the agent answer against the assertions using the reference files as ground truth. "
+    "Return only JSON with this schema: "
+    '{"assertions":[{"id":"...","passed":true,"reason":"...","confidence":0.0}]}. '
+    "Do not include markdown.\n\n{payload}"
+)
+
+
+# Hashes stable text so prompt and task definitions can be compared across runs.
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+# Reads optional runner settings from bundle.yaml with one normalized shape.
+def runner_config(bundle: dict) -> dict:
+    config = bundle.get("runner", {})
+    if not isinstance(config, dict):
+        raise ValueError("bundle.yaml runner must be an object when present")
+    judge_models = config.get("judge_models", {})
+    judge_efforts = config.get("judge_efforts", {})
+    if judge_models and not isinstance(judge_models, dict):
+        raise ValueError("bundle.yaml runner.judge_models must be an object when present")
+    if judge_efforts and not isinstance(judge_efforts, dict):
+        raise ValueError("bundle.yaml runner.judge_efforts must be an object when present")
+    return {
+        "repetitions": int(config.get("repetitions", 1)),
+        "agent_model": config.get("agent_model"),
+        "agent_effort": config.get("agent_effort"),
+        "judge_model": config.get("judge_model"),
+        "judge_models": judge_models,
+        "judge_effort": config.get("judge_effort"),
+        "judge_efforts": judge_efforts,
+    }
+
+
+# Selects a runner setting, allowing judge settings to vary by harness.
+def runner_value(config: dict, role: str, field: str, harness: str | None = None):
+    if role == "judge" and harness:
+        plural = {"model": "judge_models", "effort": "judge_efforts"}.get(field)
+        values = config.get(plural)
+        if isinstance(values, dict) and harness in values:
+            return values[harness]
+    return config.get(f"{role}_{field}")
+
+
+# Captures a local CLI version without letting version lookup failures break evals.
+def cli_version(command: str) -> str | None:
+    try:
+        result = subprocess.run(
+            [command, "--version"],
+            check=False,
+            encoding="utf-8",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+    except OSError:
+        return None
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    lines = [line for line in lines if not line.startswith("WARNING: proceeding")]
+    return "\n".join(lines) or None
+
+
+# Builds the provenance fields that are known before an agent or judge runs.
+def base_provenance(harness: str, config: dict, role: str, versions: dict[str, str | None]) -> dict:
+    return {
+        "harness": harness,
+        "cli_version": versions.get(harness),
+        "requested_model": runner_value(config, role, "model", harness),
+        "actual_model": None,
+        "effort": runner_value(config, role, "effort", harness),
+        "max_turns": None,
+    }
 
 
 # Reads a JSON-compatible YAML file using the standard library.
@@ -169,7 +242,7 @@ def extract_tool_calls(value) -> list[dict]:
 def extract_text_parts(value) -> list[str]:
     parts = []
     if isinstance(value, dict):
-        if value.get("type") == "text" and isinstance(value.get("text"), str):
+        if value.get("type") in {"text", "output_text"} and isinstance(value.get("text"), str):
             parts.append(value["text"])
         for child in value.values():
             parts.extend(extract_text_parts(child))
@@ -196,13 +269,14 @@ def find_nested_key(value, key: str):
     return None
 
 
-# Parses Claude stream-json output into final text, usage, cost, and tool calls.
+# Parses Claude stream-json output into final text, usage, cost, model, and tool calls.
 def parse_claude_stream(stdout: str) -> dict:
     tool_calls = []
     text_parts = []
     final_result = ""
     usage = None
     cost_usd = None
+    actual_model = None
     for line in stdout.splitlines():
         if not line.strip():
             continue
@@ -217,12 +291,84 @@ def parse_claude_stream(stdout: str) -> dict:
             final_result = event["result"]
         usage = usage or find_nested_key(event, "usage")
         cost_usd = cost_usd or find_nested_key(event, "total_cost_usd") or find_nested_key(event, "cost_usd") or find_nested_key(event, "cost")
+        actual_model = actual_model or find_nested_key(event, "model")
     final_answer = final_result or "\n".join(part for part in text_parts if part).strip()
-    return {"final_answer": final_answer, "tool_calls": tool_calls, "usage": usage, "cost_usd": cost_usd}
+    return {
+        "final_answer": final_answer,
+        "tool_calls": tool_calls,
+        "usage": usage,
+        "cost_usd": cost_usd,
+        "actual_model": actual_model,
+    }
+
+
+# Parses generic JSONL agent output into final text, usage, cost, and model.
+def parse_jsonl_agent_output(stdout: str) -> dict:
+    text_parts = []
+    usage = None
+    cost_usd = None
+    actual_model = None
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            text_parts.append(line)
+            continue
+        text_parts.extend(extract_text_parts(event))
+        usage = usage or find_nested_key(event, "usage")
+        cost_usd = cost_usd or find_nested_key(event, "total_cost_usd") or find_nested_key(event, "cost_usd") or find_nested_key(event, "cost")
+        actual_model = actual_model or find_nested_key(event, "model")
+    return {
+        "final_answer": "\n".join(part for part in text_parts if part).strip(),
+        "tool_calls": [],
+        "usage": usage,
+        "cost_usd": cost_usd,
+        "actual_model": actual_model,
+    }
+
+
+# Builds the Claude print command with explicit runner-controlled settings.
+def claude_command(prompt: str, output_format: str, config: dict, role: str, verbose: bool = False) -> list[str]:
+    command = ["claude", "-p", "--output-format", output_format]
+    model = runner_value(config, role, "model", "claude")
+    effort = runner_value(config, role, "effort", "claude")
+    if verbose:
+        command.append("--verbose")
+    if model:
+        command.extend(["--model", str(model)])
+    if effort:
+        command.extend(["--effort", str(effort)])
+    command.append(prompt)
+    return command
+
+
+# Builds the Codex exec command with explicit runner-controlled settings.
+def codex_command(prompt: str, config: dict, role: str) -> list[str]:
+    command = ["codex", "exec", "--json", "--sandbox", "read-only"]
+    model = runner_value(config, role, "model", "codex")
+    effort = runner_value(config, role, "effort", "codex")
+    if model:
+        command.extend(["--model", str(model)])
+    if effort:
+        command.extend(["-c", f"model_reasoning_effort={json.dumps(str(effort))}"])
+    command.append(prompt)
+    return command
 
 
 # Runs Claude once in the pinned workspace and stores raw stream output locally.
-def run_claude(prompt: str, workspace: Path, dry_run: bool, results_root: Path, raw_root: Path, task_id: str, repetition: int) -> dict:
+def run_claude(
+    prompt: str,
+    workspace: Path,
+    dry_run: bool,
+    results_root: Path,
+    raw_root: Path,
+    task_id: str,
+    repetition: int,
+    config: dict,
+    provenance: dict,
+) -> dict:
     if dry_run:
         return {
             "status": "dry_run",
@@ -232,11 +378,12 @@ def run_claude(prompt: str, workspace: Path, dry_run: bool, results_root: Path, 
             "usage": None,
             "cost_usd": None,
             "raw_artifacts": {},
+            "provenance": provenance,
             "final_answer": "",
             "tool_calls": [],
         }
     result = subprocess.run(
-        ["claude", "-p", "--output-format", "stream-json", "--verbose", prompt],
+        claude_command(prompt, "stream-json", config, "agent", verbose=True),
         cwd=workspace,
         check=False,
         encoding="utf-8",
@@ -249,6 +396,7 @@ def run_claude(prompt: str, workspace: Path, dry_run: bool, results_root: Path, 
         "stderr": write_raw_artifact(results_root, raw_root, f"{prefix}.stderr.txt", result.stderr),
     }
     parsed = parse_claude_stream(result.stdout)
+    provenance = {**provenance, "actual_model": parsed["actual_model"]}
     return {
         "status": "ok" if result.returncode == 0 else "error",
         "exit_code": result.returncode,
@@ -258,6 +406,7 @@ def run_claude(prompt: str, workspace: Path, dry_run: bool, results_root: Path, 
         "usage": parsed["usage"],
         "cost_usd": parsed["cost_usd"],
         "raw_artifacts": raw_artifacts,
+        "provenance": provenance,
         "final_answer": parsed["final_answer"],
         "tool_calls": parsed["tool_calls"],
     }
@@ -359,13 +508,7 @@ def judge_prompt(task: dict, final_answer: str, semantic_assertions: list[dict],
             for assertion in semantic_assertions
         ],
     }
-    return (
-        "Judge the agent answer against the assertions using the reference files as ground truth. "
-        "Return only JSON with this schema: "
-        '{"assertions":[{"id":"...","passed":true,"reason":"...","confidence":0.0}]}. '
-        "Do not include markdown.\n\n"
-        + json.dumps(payload, indent=2, sort_keys=True)
-    )
+    return JUDGE_PROMPT_TEMPLATE.format(payload=json.dumps(payload, indent=2, sort_keys=True))
 
 
 # Extracts the first JSON object from Claude judge text.
@@ -384,24 +527,57 @@ def extract_json_object(text: str) -> dict:
     return value
 
 
-# Parses Claude json output and returns the judge payload plus usage and cost.
+# Parses judge output and returns the judge payload plus usage, cost, and model.
 def parse_judge_output(stdout: str) -> dict:
-    outer = extract_json_object(stdout)
-    usage = outer.get("usage")
-    cost_usd = outer.get("cost_usd") or outer.get("total_cost_usd") or outer.get("cost")
-    result_text = outer.get("result") or outer.get("content") or stdout
+    usage = None
+    cost_usd = None
+    actual_model = None
+    try:
+        outer = extract_json_object(stdout)
+    except ValueError:
+        parsed = parse_jsonl_agent_output(stdout)
+        usage = parsed["usage"]
+        cost_usd = parsed["cost_usd"]
+        actual_model = parsed["actual_model"]
+        result_text = parsed["final_answer"]
+    else:
+        usage = outer.get("usage")
+        cost_usd = outer.get("cost_usd") or outer.get("total_cost_usd") or outer.get("cost")
+        actual_model = find_nested_key(outer, "model")
+        result_text = outer.get("result") or outer.get("content") or stdout
     payload = extract_json_object(str(result_text))
     assertions = payload.get("assertions")
     if not isinstance(assertions, list):
         raise ValueError("judge JSON must contain an assertions list")
-    return {"assertions": assertions, "usage": usage, "cost_usd": cost_usd}
+    return {"assertions": assertions, "usage": usage, "cost_usd": cost_usd, "actual_model": actual_model}
 
 
-# Runs Claude as the semantic judge and stores raw judge output locally.
-def run_judge(task: dict, agent_result: dict, workspace: Path, results_root: Path, raw_root: Path, task_id: str, repetition: int, semantic_assertions: list[dict]) -> dict:
+# Runs the selected semantic judge and stores raw judge output locally.
+def run_judge(
+    task: dict,
+    agent_result: dict,
+    workspace: Path,
+    results_root: Path,
+    raw_root: Path,
+    task_id: str,
+    repetition: int,
+    semantic_assertions: list[dict],
+    judge_harness: str,
+    config: dict,
+    provenance: dict,
+) -> dict:
     references = load_reference_context(workspace, task)
+    prompt = judge_prompt(task, agent_result["final_answer"], semantic_assertions, references)
+    if judge_harness == "claude":
+        command = claude_command(prompt, "json", config, "judge")
+        stdout_name = f"{safe_name(task_id)}-r{repetition}-judge.stdout.json"
+    elif judge_harness == "codex":
+        command = codex_command(prompt, config, "judge")
+        stdout_name = f"{safe_name(task_id)}-r{repetition}-judge.stdout.jsonl"
+    else:
+        raise ValueError(f"unsupported judge harness: {judge_harness}")
     result = subprocess.run(
-        ["claude", "-p", "--output-format", "json", judge_prompt(task, agent_result["final_answer"], semantic_assertions, references)],
+        command,
         cwd=workspace,
         check=False,
         encoding="utf-8",
@@ -409,12 +585,22 @@ def run_judge(task: dict, agent_result: dict, workspace: Path, results_root: Pat
         stderr=subprocess.PIPE,
     )
     prefix = f"{safe_name(task_id)}-r{repetition}-judge"
+    provenance = {
+        **provenance,
+        "prompt_template_sha256": sha256_text(JUDGE_PROMPT_TEMPLATE),
+    }
     raw_artifacts = {
-        "stdout": write_raw_artifact(results_root, raw_root, f"{prefix}.stdout.json", result.stdout),
+        "stdout": write_raw_artifact(results_root, raw_root, stdout_name, result.stdout),
         "stderr": write_raw_artifact(results_root, raw_root, f"{prefix}.stderr.txt", result.stderr),
     }
     if result.returncode != 0:
-        return {"status": "error", "exit_code": result.returncode, "raw_artifacts": raw_artifacts, "assertions": []}
+        return {
+            "status": "error",
+            "exit_code": result.returncode,
+            "raw_artifacts": raw_artifacts,
+            "assertions": [],
+            "provenance": provenance,
+        }
     try:
         parsed = parse_judge_output(result.stdout)
     except ValueError as error:
@@ -424,7 +610,9 @@ def run_judge(task: dict, agent_result: dict, workspace: Path, results_root: Pat
             "raw_artifacts": raw_artifacts,
             "assertions": [],
             "error": str(error),
+            "provenance": provenance,
         }
+    provenance = {**provenance, "actual_model": parsed["actual_model"]}
     return {
         "status": "ok",
         "exit_code": result.returncode,
@@ -432,11 +620,24 @@ def run_judge(task: dict, agent_result: dict, workspace: Path, results_root: Pat
         "assertions": parsed["assertions"],
         "usage": parsed["usage"],
         "cost_usd": parsed["cost_usd"],
+        "provenance": provenance,
     }
 
 
 # Builds assertion rows by mixing deterministic checks with optional judge output.
-def assertion_rows(task: dict, agent_result: dict, workspace: Path, judge: bool, dry_run: bool, results_root: Path, raw_root: Path, task_id: str, repetition: int) -> tuple[list[dict], dict | None]:
+def assertion_rows(
+    task: dict,
+    agent_result: dict,
+    workspace: Path,
+    judge_harness: str | None,
+    dry_run: bool,
+    results_root: Path,
+    raw_root: Path,
+    task_id: str,
+    repetition: int,
+    config: dict,
+    judge_provenance: dict | None,
+) -> tuple[list[dict], dict | None]:
     assertions = task.get("assertions", [])
     if not isinstance(assertions, list):
         raise ValueError(f"task {task.get('id', '<missing>')} assertions must be a list")
@@ -458,13 +659,27 @@ def assertion_rows(task: dict, agent_result: dict, workspace: Path, judge: bool,
             raise ValueError(f"assertion {assertion.get('id', '<missing>')} has unsupported check: {check}")
         rows.append(row)
     judge_result = None
-    if judge and semantic_assertions and not dry_run:
+    if judge_harness and semantic_assertions and not dry_run:
         if agent_result["status"] != "ok":
             for row in rows:
                 if row["check"] == "judge":
                     row.update({"status": "agent_error", "passed": None, "reason": "Agent run failed before judging."})
             return rows, None
-        judge_result = run_judge(task, agent_result, workspace, results_root, raw_root, task_id, repetition, semantic_assertions)
+        if judge_provenance is None:
+            raise ValueError("judge provenance is required when judge_harness is set")
+        judge_result = run_judge(
+            task,
+            agent_result,
+            workspace,
+            results_root,
+            raw_root,
+            task_id,
+            repetition,
+            semantic_assertions,
+            judge_harness,
+            config,
+            judge_provenance,
+        )
         if judge_result.get("status") != "ok":
             for row in rows:
                 if row["check"] == "judge":
@@ -489,9 +704,141 @@ def assertion_rows(task: dict, agent_result: dict, workspace: Path, judge: bool,
     return rows, judge_result
 
 
-# Runs every task in a pinned workspace and returns the JSON-serializable summary.
-def run_bundle(bundle_dir: Path, repo_root: Path, kb_repo: Path | None, harness: str, dry_run: bool, judge: bool, results_root: Path, run_id: str) -> dict:
+# Resolves a raw artifact path that may be stored relative to the results root.
+def resolve_raw_artifact(results_root: Path, artifact: str) -> Path:
+    path = Path(artifact)
+    if path.is_absolute():
+        return path
+    return results_root / path
+
+
+# Parses a stored agent raw artifact back into the final answer needed for rejudging.
+def parse_agent_raw(harness: str, stdout: str) -> dict:
+    if harness == "claude":
+        return parse_claude_stream(stdout)
+    return parse_jsonl_agent_output(stdout)
+
+
+# Returns the judge assertions from a task definition.
+def semantic_assertions_for_task(task: dict) -> list[dict]:
+    assertions = task.get("assertions", [])
+    if not isinstance(assertions, list):
+        raise ValueError(f"task {task.get('id', '<missing>')} assertions must be a list")
+    return [assertion for assertion in assertions if isinstance(assertion, dict) and str(assertion.get("check") or "judge") == "judge"]
+
+
+# Rejudges semantic assertions from an existing summary and records inter-judge agreement.
+def calibrate_summary(
+    bundle_dir: Path,
+    repo_root: Path,
+    kb_repo: Path | None,
+    summary_path: Path,
+    judge_harness: str,
+    results_root: Path,
+    run_id: str,
+) -> dict:
     bundle = read_json_yaml(bundle_dir / "bundle.yaml")
+    config = runner_config(bundle)
+    repo_root = resolve_repo_root(bundle_dir, bundle, repo_root)
+    kb_repo = resolve_kb_repo(repo_root, kb_repo)
+    tasks_path = bundle_dir / str(bundle.get("task_file", "tasks.yaml"))
+    tasks_doc = read_json_yaml(tasks_path)
+    tasks_by_id = {str(task.get("id")): task for task in tasks_doc.get("tasks", []) if isinstance(task, dict)}
+    original = json.loads(summary_path.read_text(encoding="utf-8"))
+    repo_commit = str(original.get("repo_commit") or bundle.get("repo_commit") or "")
+    kb_commit = str(original.get("kb_commit") or bundle.get("kb_commit") or "")
+    if not repo_commit or not kb_commit:
+        raise ValueError("calibration needs repo_commit and kb_commit in the summary or bundle")
+    versions = {"claude": cli_version("claude"), "codex": cli_version("codex")}
+    judge_provenance = base_provenance(judge_harness, config, "judge", versions)
+    raw_root = results_root / ".raw" / str(bundle.get("name", bundle_dir.name)) / run_id
+    rows = []
+    compared = 0
+    agreed = 0
+    with prepared_workspace(repo_root, kb_repo, repo_commit, kb_commit) as workspace:
+        for run in original.get("runs", []):
+            task_id = str(run.get("task_id") or "")
+            task = tasks_by_id.get(task_id)
+            if task is None:
+                raise ValueError(f"summary references unknown task: {task_id}")
+            semantic_assertions = semantic_assertions_for_task(task)
+            if not semantic_assertions:
+                continue
+            agent_stdout = run.get("agent", {}).get("raw_artifacts", {}).get("stdout")
+            if not agent_stdout:
+                raise ValueError(f"summary run {task_id} is missing agent stdout raw artifact")
+            stdout_path = resolve_raw_artifact(results_root, str(agent_stdout))
+            parsed_agent = parse_agent_raw(str(run.get("harness") or original.get("harness") or "claude"), stdout_path.read_text(encoding="utf-8"))
+            agent_result = {"final_answer": parsed_agent["final_answer"], "tool_calls": parsed_agent["tool_calls"], "status": "ok"}
+            judge_result = run_judge(
+                task,
+                agent_result,
+                workspace,
+                results_root,
+                raw_root,
+                task_id,
+                int(run.get("repetition") or 1),
+                semantic_assertions,
+                judge_harness,
+                config,
+                judge_provenance,
+            )
+            old_by_id = {
+                assertion.get("id"): assertion
+                for assertion in run.get("assertions", [])
+                if isinstance(assertion, dict) and assertion.get("check") == "judge"
+            }
+            new_by_id = {item.get("id"): item for item in judge_result.get("assertions", []) if isinstance(item, dict)}
+            for assertion in semantic_assertions:
+                assertion_id = assertion.get("id")
+                old = old_by_id.get(assertion_id, {})
+                new = new_by_id.get(assertion_id, {})
+                old_passed = old.get("passed")
+                new_passed = new.get("passed")
+                agreement = old_passed == new_passed if isinstance(old_passed, bool) and isinstance(new_passed, bool) else None
+                if agreement is not None:
+                    compared += 1
+                    agreed += 1 if agreement else 0
+                rows.append(
+                    {
+                        "task_id": task_id,
+                        "repetition": run.get("repetition"),
+                        "assertion_id": assertion_id,
+                        "old_passed": old_passed,
+                        "new_passed": new_passed,
+                        "agreement": agreement,
+                        "old_reason": old.get("reason"),
+                        "new_reason": new.get("reason"),
+                        "judge_status": judge_result.get("status"),
+                        "judge_raw_artifacts": judge_result.get("raw_artifacts"),
+                        "judge_provenance": judge_result.get("provenance"),
+                    }
+                )
+    agreement_rate = agreed / compared if compared else None
+    return {
+        "bundle": bundle.get("name", bundle_dir.name),
+        "source_summary": str(summary_path),
+        "judge": judge_harness,
+        "run_id": run_id,
+        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        "agreement": {"compared": compared, "agreed": agreed, "rate": agreement_rate},
+        "rows": rows,
+    }
+
+
+# Runs every task in a pinned workspace and returns the JSON-serializable summary.
+def run_bundle(
+    bundle_dir: Path,
+    repo_root: Path,
+    kb_repo: Path | None,
+    harness: str,
+    dry_run: bool,
+    judge_harness: str | None,
+    results_root: Path,
+    run_id: str,
+) -> dict:
+    bundle = read_json_yaml(bundle_dir / "bundle.yaml")
+    config = runner_config(bundle)
     repo_root = resolve_repo_root(bundle_dir, bundle, repo_root)
     kb_repo = resolve_kb_repo(repo_root, kb_repo)
     tasks_path = bundle_dir / str(bundle.get("task_file", "tasks.yaml"))
@@ -501,13 +848,18 @@ def run_bundle(bundle_dir: Path, repo_root: Path, kb_repo: Path | None, harness:
         raise ValueError(f"{tasks_path} must define a non-empty tasks list")
     if harness != "claude":
         raise ValueError("runner v1 only supports --harness claude")
-    repetitions = int(bundle.get("runner", {}).get("repetitions", 1))
+    if judge_harness and judge_harness not in {"claude", "codex"}:
+        raise ValueError("--judge must be claude or codex")
+    repetitions = config["repetitions"]
     repo_commit = str(bundle.get("repo_commit") or "")
     kb_commit = str(bundle.get("kb_commit") or "")
     if not repo_commit or not kb_commit:
         raise ValueError("bundle.yaml must define repo_commit and kb_commit")
     runs = []
     raw_root = results_root / ".raw" / str(bundle.get("name", bundle_dir.name)) / run_id
+    versions = {"claude": cli_version("claude"), "codex": cli_version("codex")}
+    agent_provenance = base_provenance(harness, config, "agent", versions)
+    judge_provenance = base_provenance(judge_harness, config, "judge", versions) if judge_harness else None
     with prepared_workspace(repo_root, kb_repo, repo_commit, kb_commit) as workspace:
         for task in tasks:
             if not isinstance(task, dict):
@@ -517,8 +869,30 @@ def run_bundle(bundle_dir: Path, repo_root: Path, kb_repo: Path | None, harness:
                 raise ValueError(f"{tasks_path} contains a task without id")
             prompt = task_prompt(task)
             for repetition in range(1, repetitions + 1):
-                agent_result = run_claude(prompt, workspace, dry_run, results_root, raw_root, task_id, repetition)
-                assertions, judge_result = assertion_rows(task, agent_result, workspace, judge, dry_run, results_root, raw_root, task_id, repetition)
+                agent_result = run_claude(
+                    prompt,
+                    workspace,
+                    dry_run,
+                    results_root,
+                    raw_root,
+                    task_id,
+                    repetition,
+                    config,
+                    agent_provenance,
+                )
+                assertions, judge_result = assertion_rows(
+                    task,
+                    agent_result,
+                    workspace,
+                    judge_harness,
+                    dry_run,
+                    results_root,
+                    raw_root,
+                    task_id,
+                    repetition,
+                    config,
+                    judge_provenance,
+                )
                 run = {
                     "task_id": task_id,
                     "repetition": repetition,
@@ -538,7 +912,7 @@ def run_bundle(bundle_dir: Path, repo_root: Path, kb_repo: Path | None, harness:
         "kb_commit": kb_commit,
         "harness": harness,
         "dry_run": dry_run,
-        "judge": judge,
+        "judge": judge_harness,
         "run_id": run_id,
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "runs": runs,
@@ -554,7 +928,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--harness", default="claude", help="Harness runner to use; v1 supports claude.")
     parser.add_argument("--results-dir", default="evals/results", help="Directory for summary result JSON files.")
     parser.add_argument("--dry-run", action="store_true", help="Validate the bundle without invoking the agent.")
-    parser.add_argument("--judge", action="store_true", help="Run semantic assertions through the Claude judge.")
+    parser.add_argument(
+        "--judge",
+        nargs="?",
+        const="claude",
+        choices=["claude", "codex"],
+        default=None,
+        help="Run semantic assertions through the selected judge; omitted value defaults to claude.",
+    )
+    parser.add_argument("--calibrate-summary", default=None, help="Existing summary JSON whose raw answers should be rejudged.")
     return parser
 
 
@@ -567,13 +949,27 @@ def main(argv: list[str] | None = None) -> int:
     results_root = Path(args.results_dir).expanduser().resolve()
     run_id = result_timestamp()
     try:
-        summary = run_bundle(bundle_dir, repo_root, kb_repo, args.harness, args.dry_run, args.judge, results_root, run_id)
+        if args.calibrate_summary:
+            summary = calibrate_summary(
+                bundle_dir,
+                repo_root,
+                kb_repo,
+                Path(args.calibrate_summary).expanduser().resolve(),
+                args.judge or "codex",
+                results_root,
+                run_id,
+            )
+        else:
+            summary = run_bundle(bundle_dir, repo_root, kb_repo, args.harness, args.dry_run, args.judge, results_root, run_id)
     except (OSError, ValueError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
     bundle_results = results_root / str(summary["bundle"])
     bundle_results.mkdir(parents=True, exist_ok=True)
-    suffix = "dry-run" if args.dry_run else args.harness
+    if args.calibrate_summary:
+        suffix = f"{summary['judge']}-judge-calibration"
+    else:
+        suffix = "dry-run" if args.dry_run else args.harness
     output_path = bundle_results / f"{run_id}-{suffix}.json"
     output_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"Wrote {output_path}")

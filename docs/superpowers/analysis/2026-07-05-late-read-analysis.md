@@ -74,3 +74,14 @@ After the placement fix, rerun the analyzer and compare:
 
 The remaining late-read cases should then be sampled separately for benign
 "looked at scene first" behavior versus real work before KB read.
+
+## Eval-Driven Route Repair
+
+The first C1 eval pass exposed a knowledge-placement miss: eval tasks need the
+current Release 2 plan and the durable project decisions together. The KB now has
+an `evals` route that reads `plans/current.md` and also considers
+`decisions/active/project-decisions.md`.
+
+This is the first route repair driven by eval evidence rather than up-front
+design taste. Existing bundles remain pinned to their old `kb_commit`; future
+bundle versions should absorb the route fix through a new KB commit.
