@@ -1279,6 +1279,11 @@ def test_eval_runner_dry_run() -> None:
                             },
                             {"id": "placeholder", "check": "judge", "description": "A judge can score this later."},
                         ],
+                    },
+                    {
+                        "id": "skipped-task",
+                        "prompt": "This task should not run.",
+                        "assertions": [],
                     }
                 ]
             },
@@ -1294,6 +1299,8 @@ def test_eval_runner_dry_run() -> None:
                 "--results-dir",
                 str(results),
                 "--dry-run",
+                "--task",
+                "dry-run-task",
             ],
             check=False,
             encoding="utf-8",
@@ -1310,6 +1317,8 @@ def test_eval_runner_dry_run() -> None:
         require(summary["repo_path"] == str(repo.resolve()), "eval summary should record bundle repo_path")
         require("runner_commit" in summary, "eval summary should record runner commit provenance")
         require("tasks_file_sha256" in summary, "eval summary should record task file provenance")
+        require(len(summary["runs"]) == 1, "eval --task should only run the selected task")
+        require(summary["runs"][0]["task_id"] == "dry-run-task", "eval --task should preserve the requested task")
         require(summary["runs"][0]["agent"]["status"] == "dry_run", "eval summary should avoid agent calls")
         require(
             summary["runs"][0]["agent"]["provenance"]["requested_model"] == "gpt-5",

@@ -1250,7 +1250,20 @@ def calibrate_summary(
     }
 
 
-# Runs every task in a pinned workspace and returns the JSON-serializable summary.
+# Filters tasks to the requested ids while preserving bundle order.
+def select_tasks(tasks: list, task_ids: list[str]) -> list:
+    if not task_ids:
+        return tasks
+    requested = set(task_ids)
+    selected = [task for task in tasks if isinstance(task, dict) and str(task.get("id") or "") in requested]
+    found = {str(task.get("id") or "") for task in selected}
+    missing = sorted(requested - found)
+    if missing:
+        raise ValueError(f"requested task id not found: {', '.join(missing)}")
+    return selected
+
+
+# Runs selected tasks in a pinned workspace and returns the JSON-serializable summary.
 def run_bundle(
     bundle_dir: Path,
     repo_root: Path,
@@ -1260,6 +1273,7 @@ def run_bundle(
     judge_harness: str | None,
     results_root: Path,
     run_id: str,
+    task_ids: list[str] | None = None,
 ) -> dict:
     bundle = read_json_yaml(bundle_dir / "bundle.yaml")
     config = runner_config(bundle)
@@ -1270,6 +1284,9 @@ def run_bundle(
     tasks = tasks_doc.get("tasks", [])
     if not isinstance(tasks, list) or not tasks:
         raise ValueError(f"{tasks_path} must define a non-empty tasks list")
+    tasks = select_tasks(tasks, task_ids or [])
+    if not tasks:
+        raise ValueError(f"{tasks_path} has no tasks selected")
     if harness not in {"claude", "codex"}:
         raise ValueError("--harness must be claude or codex")
     if judge_harness and judge_harness not in {"claude", "codex"}:
@@ -1368,6 +1385,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run semantic assertions through the selected judge; omitted value defaults to claude.",
     )
     parser.add_argument("--calibrate-summary", default=None, help="Existing summary JSON whose raw answers should be rejudged.")
+    parser.add_argument("--task", action="append", default=[], help="Run only the task id; repeat to select multiple tasks.")
     return parser
 
 
@@ -1391,7 +1409,17 @@ def main(argv: list[str] | None = None) -> int:
                 run_id,
             )
         else:
-            summary = run_bundle(bundle_dir, repo_root, kb_repo, args.harness, args.dry_run, args.judge, results_root, run_id)
+            summary = run_bundle(
+                bundle_dir,
+                repo_root,
+                kb_repo,
+                args.harness,
+                args.dry_run,
+                args.judge,
+                results_root,
+                run_id,
+                args.task,
+            )
     except (OSError, ValueError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1

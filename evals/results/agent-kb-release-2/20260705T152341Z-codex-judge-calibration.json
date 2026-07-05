@@ -1,0 +1,62 @@
+{
+  "agreement": {
+    "agreed": 2,
+    "compared": 2,
+    "rate": 1.0
+  },
+  "bundle": "agent-kb-release-2",
+  "generated_at": "2026-07-05T15:25:16+00:00",
+  "judge": "codex",
+  "rows": [
+    {
+      "agreement": true,
+      "assertion_id": "keeps-feature-freeze",
+      "judge_provenance": {
+        "actual_model": null,
+        "cli_version": "codex-cli 0.142.5",
+        "effort": "medium",
+        "harness": "codex",
+        "max_turns": null,
+        "prompt_template_sha256": "7041fe15d4dd73f252c10d73866979b3635ef8273baeb3b36c69c56289bf9196",
+        "requested_model": "gpt-5.5"
+      },
+      "judge_raw_artifacts": {
+        "stderr": ".raw/agent-kb-release-2/20260705T152341Z/respect-current-release-focus-r1-judge.stderr.txt",
+        "stdout": ".raw/agent-kb-release-2/20260705T152341Z/respect-current-release-focus-r1-judge.stdout.jsonl"
+      },
+      "judge_status": "ok",
+      "new_passed": true,
+      "new_reason": "The answer identifies the P0 validation step as next, explicitly defers hooks and other P1/P2 work, and cites the feature-freeze/validation-first language from the reference files.",
+      "old_passed": true,
+      "old_reason": "The answer identifies the next step as manually sampling late-read compliance misses before touching runtime protocol, and explicitly notes P1 items (hooks, regression eval bundle) are deferred until after this validation step, consistent with the plan's feature-freeze-until-utility-eval mandate. No new user-facing features are proposed or treated as in-scope.",
+      "repetition": 1,
+      "task_id": "respect-current-release-focus"
+    },
+    {
+      "agreement": true,
+      "assertion_id": "keeps-semantic-work-with-agent",
+      "judge_provenance": {
+        "actual_model": null,
+        "cli_version": "codex-cli 0.142.5",
+        "effort": "medium",
+        "harness": "codex",
+        "max_turns": null,
+        "prompt_template_sha256": "7041fe15d4dd73f252c10d73866979b3635ef8273baeb3b36c69c56289bf9196",
+        "requested_model": "gpt-5.5"
+      },
+      "judge_raw_artifacts": {
+        "stderr": ".raw/agent-kb-release-2/20260705T152341Z/respect-trim-control-boundary-r1-judge.stderr.txt",
+        "stdout": ".raw/agent-kb-release-2/20260705T152341Z/respect-trim-control-boundary-r1-judge.stdout.jsonl"
+      },
+      "judge_status": "ok",
+      "new_passed": true,
+      "new_reason": "The answer matches the reference: it states that semantic merges require agent judgment and that `trim --write` is limited to safe deterministic cleanup such as deleting pristine empty scaffolds, pruning routes, regenerating `map.md`, and validation.",
+      "old_passed": true,
+      "old_reason": "The reference decisions doc confirms the exact boundary the answer describes: deterministic/reversible work (deleting empty scaffolds, pruning routes, regenerating map.md) runs in --write, while semantic merges/judgment are left to the agent via the compact prompt. The agent's answer accurately reflects this, citing consistent code locations (SKILL.md:37, command_trim, trim_compact_prompt) and correctly notes husks are only reported, never auto-deleted, matching the reference's 'husk-after-merge is warning-only' point.",
+      "repetition": 1,
+      "task_id": "respect-trim-control-boundary"
+    }
+  ],
+  "run_id": "20260705T152341Z",
+  "source_summary": "/Users/lsl/Desktop/agent-context-kb-skill/evals/results/agent-kb-release-2/20260705T133112Z-claude.json"
+}
