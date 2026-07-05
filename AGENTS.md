@@ -8,6 +8,7 @@ Current layout:
 
 - `skills/agent-context-kb/` - the Codex skill, including `SKILL.md`, UI metadata, and scripts.
 - `skills/agent-context-kb/scripts/agent_kb.py` - the CLI for KB init, validation, notes, and compile.
+- `evals/` - Release 2 eval bundles, runners, and summary result JSON files.
 - `AGENTS.md` - contributor and agent guidance for this repository.
 
 ## Project Knowledge Base

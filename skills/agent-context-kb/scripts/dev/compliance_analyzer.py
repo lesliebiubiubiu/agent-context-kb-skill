@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from datetime import datetime
+import subprocess
 import sys
 from pathlib import Path
 
@@ -32,6 +34,49 @@ class SessionResult:
     first_source_path: str
 
 
+@dataclass(frozen=True)
+class SinceFilterResult:
+    events: list[ToolEvent]
+    cutoff: datetime
+    excluded_missing_timestamp: int
+
+
+# Parses an ISO timestamp into an aware datetime, accepting transcript UTC `Z`.
+def parse_timestamp(value: str) -> datetime | None:
+    if not value:
+        return None
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed
+
+
+# Resolves a --since value as ISO first, then as a git ref in the target repo.
+def resolve_since(value: str, root: Path) -> datetime:
+    parsed = parse_timestamp(value)
+    if parsed is not None:
+        return parsed
+    result = subprocess.run(
+        ["git", "show", "-s", "--format=%cI", value],
+        cwd=root,
+        check=False,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "unknown git error"
+        raise ValueError(f"could not parse --since as ISO timestamp or git ref: {detail}")
+    parsed = parse_timestamp(result.stdout.strip())
+    if parsed is None:
+        raise ValueError("git ref resolved to an invalid commit timestamp")
+    return parsed
+
+
 # Groups events by session while preserving their observed order.
 def group_events_by_session(events: list[ToolEvent]) -> dict[str, list[ToolEvent]]:
     grouped: dict[str, list[ToolEvent]] = {}
@@ -40,6 +85,26 @@ def group_events_by_session(events: list[ToolEvent]) -> dict[str, list[ToolEvent
     for session_events in grouped.values():
         session_events.sort(key=lambda event: (event.order, event.timestamp))
     return grouped
+
+
+# Returns the earliest real timestamp observed in a session.
+def session_start_time(events: list[ToolEvent]) -> datetime | None:
+    timestamps = [parsed for event in events if (parsed := parse_timestamp(event.timestamp)) is not None]
+    return min(timestamps) if timestamps else None
+
+
+# Keeps sessions on or after the cutoff and counts sessions without real timestamps.
+def filter_events_since(events: list[ToolEvent], cutoff: datetime) -> SinceFilterResult:
+    filtered: list[ToolEvent] = []
+    excluded_missing_timestamp = 0
+    for session_events in group_events_by_session(events).values():
+        started_at = session_start_time(session_events)
+        if started_at is None:
+            excluded_missing_timestamp += 1
+            continue
+        if started_at >= cutoff:
+            filtered.extend(session_events)
+    return SinceFilterResult(filtered, cutoff, excluded_missing_timestamp)
 
 
 # Returns the late-read bucket for the distance between source and KB entry reads.
@@ -216,6 +281,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-claude", action="store_true", help="Skip Claude Code transcripts.")
     parser.add_argument("--no-codex", action="store_true", help="Skip Codex transcripts.")
     parser.add_argument("--details", action="store_true", help="Print per-session compliance details.")
+    parser.add_argument("--since", help="Only include sessions on or after an ISO timestamp or git ref.")
     return parser
 
 
@@ -229,6 +295,17 @@ def main(argv: list[str] | None = None) -> int:
         print("ERROR: --root must point to a repo with .agent-kb/", file=sys.stderr)
         return 1
     events = collect_tool_events(root, claude_dir, codex_dir)
+    since_filter = None
+    if args.since:
+        try:
+            cutoff = resolve_since(args.since, root)
+        except ValueError as error:
+            print(f"ERROR: {error}", file=sys.stderr)
+            return 1
+        since_filter = filter_events_since(events, cutoff)
+        events = since_filter.events
+        print(f"Since filter: {args.since} -> {since_filter.cutoff.isoformat()}")
+        print(f"Sessions excluded by missing/invalid timestamp: {since_filter.excluded_missing_timestamp}")
     print_report(summarize_sessions(events), args.details)
     return 0
 

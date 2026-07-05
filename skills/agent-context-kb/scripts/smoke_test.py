@@ -13,6 +13,7 @@ from pathlib import Path
 
 SCRIPT = Path(__file__).with_name("agent_kb.py")
 DEV_COMPLIANCE_SCRIPT = Path(__file__).parent / "dev" / "compliance_analyzer.py"
+EVAL_RUNNER = Path(__file__).resolve().parents[3] / "evals" / "run_bundle.py"
 sys.path.insert(0, str(Path(__file__).parent))
 from transcript_reads import claude_project_name  # noqa: E402
 
@@ -53,6 +54,41 @@ def run_compliance(root: Path, claude_dir: Path, codex_dir: Path, *args: str) ->
 def write_jsonl(path: Path, records: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+
+
+# Writes a JSON-compatible YAML document for eval runner fixtures.
+def write_json_yaml(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+
+
+# Runs git in a fixture repository and returns stripped stdout.
+def run_fixture_git(repo: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        check=False,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    require(result.returncode == 0, f"fixture git {' '.join(args)} should succeed", result)
+    return result.stdout.strip()
+
+
+# Creates a minimal git repo and returns its current HEAD commit.
+def create_fixture_commit(repo: Path, files: dict[str, str]) -> str:
+    repo.mkdir(parents=True, exist_ok=True)
+    run_fixture_git(repo, "init")
+    run_fixture_git(repo, "config", "user.email", "agent-kb@example.test")
+    run_fixture_git(repo, "config", "user.name", "Agent KB Smoke")
+    for relative, text in files.items():
+        path = repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    run_fixture_git(repo, "add", ".")
+    run_fixture_git(repo, "commit", "-m", "fixture")
+    return run_fixture_git(repo, "rev-parse", "HEAD")
 
 
 # Builds the fixture Claude project directory with the observed dot-to-dash encoding.
@@ -1146,6 +1182,110 @@ def test_compliance_analyzer_synthetic_transcripts() -> None:
             result,
         )
 
+        write_jsonl(
+            codex_dir / "2026" / "07" / "05" / "rollout-post-cutoff.jsonl",
+            [
+                {"timestamp": "2026-07-05T00:01:00Z", "type": "session_meta", "payload": {"cwd": str(root)}},
+                {
+                    "timestamp": "2026-07-05T00:01:01Z",
+                    "type": "function_call",
+                    "payload": {
+                        "name": "functions.exec_command",
+                        "arguments": json.dumps({"cmd": "sed -n '1,40p' .agent-kb/start.md", "workdir": str(root)}),
+                    },
+                },
+            ],
+        )
+        write_jsonl(
+            codex_dir / "2026" / "07" / "05" / "rollout-missing-timestamp.jsonl",
+            [
+                {"type": "session_meta", "payload": {"cwd": str(root)}},
+                {
+                    "type": "function_call",
+                    "payload": {
+                        "name": "functions.exec_command",
+                        "arguments": json.dumps({"cmd": "rg print src.py", "workdir": str(root)}),
+                    },
+                },
+            ],
+        )
+        result = run_compliance(root, claude_dir, codex_dir, "--since", "2026-07-05T00:00:30Z")
+        require(result.returncode == 0, "--since ISO filter should succeed", result)
+        require(
+            "Since filter: 2026-07-05T00:00:30Z -> 2026-07-05T00:00:30+00:00" in result.stdout,
+            "since filter should report the resolved cutoff",
+            result,
+        )
+        require(
+            "Sessions excluded by missing/invalid timestamp: 1" in result.stdout,
+            "since filter should count sessions without real timestamps",
+            result,
+        )
+        require("Sessions analyzed: 1" in result.stdout, "since filter should keep only post-cutoff sessions", result)
+
+
+# Checks that the Release 2 eval runner can parse a bundle and write summary JSON without invoking an agent.
+def test_eval_runner_dry_run() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-eval-") as tmp:
+        base = Path(tmp)
+        repo = base / "repo"
+        kb_repo = base / "kb"
+        repo_commit = create_fixture_commit(repo, {"README.md": "# Fixture\n"})
+        kb_commit = create_fixture_commit(kb_repo, {"start.md": "# Agent KB Start\n"})
+        bundle = base / "bundles" / "demo"
+        results = base / "results"
+        write_json_yaml(
+            bundle / "bundle.yaml",
+            {
+                "name": "demo",
+                "repo_commit": repo_commit,
+                "kb_commit": kb_commit,
+                "task_file": "tasks.yaml",
+                "runner": {"repetitions": 1},
+            },
+        )
+        write_json_yaml(
+            bundle / "tasks.yaml",
+            {
+                "tasks": [
+                    {
+                        "id": "dry-run-task",
+                        "prompt": "Say this is a dry run.",
+                        "assertions": [{"id": "placeholder", "description": "A judge can score this later."}],
+                    }
+                ]
+            },
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(EVAL_RUNNER),
+                "--bundle",
+                str(bundle),
+                "--repo-root",
+                str(repo),
+                "--kb-repo",
+                str(kb_repo),
+                "--results-dir",
+                str(results),
+                "--dry-run",
+            ],
+            check=False,
+            encoding="utf-8",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        require(result.returncode == 0, "eval runner dry-run should succeed", result)
+        output_files = list((results / "demo").glob("*.json"))
+        require(len(output_files) == 1, "eval runner should write one summary JSON", result)
+        summary = json.loads(output_files[0].read_text(encoding="utf-8"))
+        require(summary["dry_run"] is True, "eval summary should record dry-run mode")
+        require(summary["runs"][0]["agent"]["status"] == "dry_run", "eval summary should avoid agent calls")
+        require(
+            summary["runs"][0]["assertions"][0]["status"] == "pending_judge",
+            "eval assertions should be marked for the future judge step",
+        )
+
 
 # Checks that init sets up the chosen versioning mode (nested default, shared, local).
 def test_init_versioning_modes() -> None:
@@ -1216,6 +1356,7 @@ def main() -> int:
         test_stats_reports_cli_usage,
         test_stats_backfills_kb_reads,
         test_compliance_analyzer_synthetic_transcripts,
+        test_eval_runner_dry_run,
         test_init_versioning_modes,
     ]
     for test in tests:

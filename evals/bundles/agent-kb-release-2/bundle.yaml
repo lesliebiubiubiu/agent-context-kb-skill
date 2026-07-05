@@ -1,0 +1,10 @@
+{
+  "name": "agent-kb-release-2",
+  "repo_commit": "cb91b38c632fed144e68b9a6c7f3955f6ce52f16",
+  "kb_commit": "c1750990180fe8a2af20a252d0ee539e5b5f48ed",
+  "task_file": "tasks.yaml",
+  "runner": {
+    "default_harness": "claude",
+    "repetitions": 1
+  }
+}

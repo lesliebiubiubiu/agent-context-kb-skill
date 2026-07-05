@@ -1,0 +1,22 @@
+{
+  "tasks": [
+    {
+      "id": "respect-current-release-focus",
+      "prompt": "In this repository, identify the next Release 2 development step and state which project knowledge files justify it. Do not edit files.",
+      "assertions": [
+        {
+          "id": "reads-planning-route",
+          "description": "The agent uses the KB planning route before drawing a conclusion."
+        },
+        {
+          "id": "keeps-feature-freeze",
+          "description": "The answer keeps new user-facing features out of scope until validation data exists."
+        },
+        {
+          "id": "mentions-compliance-before-utility",
+          "description": "The answer treats compliance measurement as the gate before utility claims."
+        }
+      ]
+    }
+  ]
+}

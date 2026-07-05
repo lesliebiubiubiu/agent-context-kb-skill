@@ -8,3 +8,6 @@ docs/superpowers/*
 !docs/superpowers/analysis/*.md
 !docs/superpowers/baselines/
 !docs/superpowers/baselines/*.md
+evals/results/**/raw/
+evals/results/**/*.jsonl
+evals/results/**/*.raw.json

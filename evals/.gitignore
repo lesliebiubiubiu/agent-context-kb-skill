@@ -1,0 +1,3 @@
+results/**/raw/
+results/**/*.jsonl
+results/**/*.raw.json
