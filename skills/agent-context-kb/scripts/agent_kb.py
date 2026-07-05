@@ -703,18 +703,32 @@ def is_pointer_file(path: Path, target_name: str) -> bool:
     return len(lines) <= 8 and len(text) <= 1000 and any(word in text_lower for word in pointer_words)
 
 
-# Picks the instruction file that should receive the KB runtime protocol, preserving CLAUDE.md-primary repos.
+# Picks the instruction file that should receive the KB runtime protocol, preserving Claude-visible delivery.
 def protocol_target_path(root: Path) -> Path:
     agents_path = root / "AGENTS.md"
     claude_path = root / "CLAUDE.md"
-    for path in [agents_path, claude_path]:
-        if has_protocol_section(path):
-            return path
     if agents_path.exists() and claude_path.exists() and is_pointer_file(agents_path, "CLAUDE.md"):
         return claude_path
+    if agents_path.exists() and claude_path.exists() and is_pointer_file(claude_path, "AGENTS.md"):
+        return claude_path
+    if has_protocol_section(claude_path):
+        return claude_path
+    if has_protocol_section(agents_path):
+        return agents_path
     if claude_path.exists() and not agents_path.exists():
         return claude_path
     return agents_path
+
+
+# Refreshes an existing AGENTS.md protocol copy when CLAUDE.md is the selected owner.
+def sync_existing_agents_protocol(root: Path, protocol_path: Path) -> None:
+    agents_path = root / "AGENTS.md"
+    claude_path = root / "CLAUDE.md"
+    if protocol_path != claude_path or not has_protocol_section(agents_path):
+        return
+    text = agents_path.read_text(encoding="utf-8")
+    updated = PROTOCOL_SECTION_RE.sub(RUNTIME_PROTOCOL.rstrip() + "\n\n", text).rstrip() + "\n"
+    agents_path.write_text(updated, encoding="utf-8")
 
 
 # Finds where to slot a new protocol: under the file's lead section, not above it — after the
@@ -749,12 +763,14 @@ def upsert_runtime_protocol(root: Path) -> tuple[Path, str]:
     protocol_path = protocol_target_path(root)
     if not protocol_path.exists():
         protocol_path.write_text(RUNTIME_PROTOCOL, encoding="utf-8")
+        sync_existing_agents_protocol(root, protocol_path)
         return protocol_path, "created"
 
     text = protocol_path.read_text(encoding="utf-8")
     if PROTOCOL_SECTION_RE.search(text):
         updated = PROTOCOL_SECTION_RE.sub(RUNTIME_PROTOCOL.rstrip() + "\n\n", text).rstrip() + "\n"
         protocol_path.write_text(updated, encoding="utf-8")
+        sync_existing_agents_protocol(root, protocol_path)
         return protocol_path, "updated"
 
     index = protocol_insert_index(text)
@@ -763,6 +779,7 @@ def upsert_runtime_protocol(root: Path) -> tuple[Path, str]:
     block = RUNTIME_PROTOCOL.rstrip() + "\n"
     block = block + "\n" + tail.lstrip("\n") if tail.strip() else block
     protocol_path.write_text((head + block).rstrip() + "\n", encoding="utf-8")
+    sync_existing_agents_protocol(root, protocol_path)
     return protocol_path, "appended"
 
 

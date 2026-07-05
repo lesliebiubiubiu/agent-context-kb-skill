@@ -24,6 +24,7 @@ class SessionResult:
     applicable: bool
     category: str
     late_bucket: str | None
+    read_agents_md: bool
     first_kb_order: int | None
     first_any_kb_order: int | None
     first_source_order: int | None
@@ -79,6 +80,7 @@ def summarize_sessions(events: list[ToolEvent]) -> list[SessionResult]:
         first_kb = next((event for event in session_events if event.kind == "kb_entry_read"), None)
         first_any_kb = next((event for event in session_events if event.kind in {"kb_entry_read", "kb_read"}), None)
         first_source = next((event for event in session_events if event.kind in {"source_explore", "source_edit"}), None)
+        read_agents_md = any(event.kind == "agents_read" for event in session_events)
         compliant = bool(first_kb and (not first_source or first_kb.order < first_source.order))
         applicable, category, bucket = classify_session(first_kb, first_any_kb, first_source)
         harness = session_events[0].harness if session_events else "unknown"
@@ -90,6 +92,7 @@ def summarize_sessions(events: list[ToolEvent]) -> list[SessionResult]:
                 applicable=applicable,
                 category=category,
                 late_bucket=bucket,
+                read_agents_md=read_agents_md,
                 first_kb_order=first_kb.order if first_kb else None,
                 first_any_kb_order=first_any_kb.order if first_any_kb else None,
                 first_source_order=first_source.order if first_source else None,
@@ -130,8 +133,8 @@ def count_source_path_missing(results: list[SessionResult]) -> int:
     )
 
 
-# Prints the compliance summary and optional per-session details.
-def print_report(results: list[SessionResult], details: bool) -> None:
+# Prints the core compliance metrics for a group of sessions.
+def print_summary_block(label: str, results: list[SessionResult], indent: str = "") -> None:
     total = len(results)
     compliant = sum(1 for result in results if result.compliant)
     hit = sum(1 for result in results if result.first_kb_order is not None)
@@ -144,27 +147,52 @@ def print_report(results: list[SessionResult], details: bool) -> None:
         if result.first_source_order is not None
         and (result.first_kb_order is None or result.first_source_order < result.first_kb_order)
     )
-    print("Compliance summary")
-    print(f"Sessions analyzed: {total}")
-    print(f"KB entry hit rate: {format_rate(hit, total)}")
-    print(f"Any KB hit rate: {format_rate(any_hit, total)}")
-    print(f"Read compliance: {format_rate(compliant, total)}")
-    print(f"Applicable read compliance (auto): {format_rate(applicable_compliant, len(applicable))}")
-    print(f"First source action before KB: {first_source_before_kb}")
-    print("Write-back compliance: deferred (needs heuristic or manual labels)")
-    print()
-    print("Miss taxonomy (automated):")
-    print("  Real behavior:")
-    print(f"  - late KB read: {count_category(results, 'late_kb_read')}")
+    print(f"{indent}{label}")
+    print(f"{indent}Sessions analyzed: {total}")
+    print(f"{indent}KB entry hit rate: {format_rate(hit, total)}")
+    print(f"{indent}Any KB hit rate: {format_rate(any_hit, total)}")
+    print(f"{indent}Read compliance: {format_rate(compliant, total)}")
+    print(f"{indent}Applicable read compliance (auto): {format_rate(applicable_compliant, len(applicable))}")
+    print(f"{indent}First source action before KB: {first_source_before_kb}")
+    print(f"{indent}Miss taxonomy (automated):")
+    print(f"{indent}  Real behavior:")
+    print(f"{indent}  - late KB read: {count_category(results, 'late_kb_read')}")
     for bucket, count in count_late_buckets(results).items():
-        print(f"    - {bucket}: {count}")
-    print(f"  - no KB read: {count_category(results, 'no_kb_read')}")
-    print(f"  - non-entry KB read: {count_category(results, 'non_entry_kb_read')}")
-    print(f"  - KB-first not applicable: {count_category(results, 'kb_first_not_applicable')}")
-    print("  Measurement noise candidates:")
-    print(f"  - source path unavailable: {count_source_path_missing(results)}")
-    print(f"  - outside-root ambiguity: 0")
-    print(f"  - harness parser gap: {count_category(results, 'harness_parser_gap')}")
+        print(f"{indent}    - {bucket}: {count}")
+    print(f"{indent}  - no KB read: {count_category(results, 'no_kb_read')}")
+    print(f"{indent}  - non-entry KB read: {count_category(results, 'non_entry_kb_read')}")
+    print(f"{indent}  - KB-first not applicable: {count_category(results, 'kb_first_not_applicable')}")
+    print(f"{indent}  Measurement noise candidates:")
+    print(f"{indent}  - source path unavailable: {count_source_path_missing(results)}")
+    print(f"{indent}  - outside-root ambiguity: 0")
+    print(f"{indent}  - harness parser gap: {count_category(results, 'harness_parser_gap')}")
+
+
+# Prints harness and Claude AGENTS.md delivery breakdowns.
+def print_breakdowns(results: list[SessionResult]) -> None:
+    print()
+    print("Breakdown by harness:")
+    for harness in ["claude", "codex"]:
+        group = [result for result in results if result.harness == harness]
+        if group:
+            print_summary_block(harness, group, "  ")
+    unknown = [result for result in results if result.harness not in {"claude", "codex"}]
+    if unknown:
+        print_summary_block("unknown", unknown, "  ")
+
+    claude = [result for result in results if result.harness == "claude"]
+    if claude:
+        print()
+        print("Claude AGENTS.md delivery:")
+        print_summary_block("read AGENTS.md", [result for result in claude if result.read_agents_md], "  ")
+        print_summary_block("did not read AGENTS.md", [result for result in claude if not result.read_agents_md], "  ")
+
+
+# Prints the compliance summary and optional per-session details.
+def print_report(results: list[SessionResult], details: bool) -> None:
+    print_summary_block("Compliance summary", results)
+    print("Write-back compliance: deferred (needs heuristic or manual labels)")
+    print_breakdowns(results)
     if details:
         print()
         print("Details:")
@@ -174,7 +202,8 @@ def print_report(results: list[SessionResult], details: bool) -> None:
             print(
                 f"- {result.session} [{result.harness}] {status} "
                 f"category={result.category}{late} first_kb={result.first_kb_order} "
-                f"first_any_kb={result.first_any_kb_order} first_source={result.first_source_order}"
+                f"first_any_kb={result.first_any_kb_order} first_source={result.first_source_order} "
+                f"read_agents_md={result.read_agents_md}"
             )
 
 

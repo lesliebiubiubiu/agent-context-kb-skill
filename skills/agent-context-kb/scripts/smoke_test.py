@@ -334,6 +334,31 @@ def test_upgrade_updates_claude_protocol_owner() -> None:
         require("Use `.agent-kb/` before broad code search" in text, "upgrade should write the current protocol into CLAUDE.md")
 
 
+# Checks that CLAUDE.md receives the protocol while an existing AGENTS.md copy stays synced.
+def test_claude_pointer_takes_protocol_ownership() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        agents = root / "AGENTS.md"
+        claude = root / "CLAUDE.md"
+        agents.write_text(
+            "# Repo Instructions\n\n"
+            "## Project Knowledge Base\n\n"
+            "Old protocol.\n\n"
+            "## Commands\n\n"
+            "Run tests.\n",
+            encoding="utf-8",
+        )
+        claude.write_text("# Claude Instructions\n\nSee AGENTS.md for agent instructions.\n", encoding="utf-8")
+        result = run_cli(root, "init")
+        require(result.returncode == 0, "init should succeed with CLAUDE.md pointing to AGENTS.md", result)
+        require("CLAUDE.md protocol appended." in result.stdout, "init should report CLAUDE.md as the protocol target", result)
+        require("## Project Knowledge Base" in claude.read_text(encoding="utf-8"), "CLAUDE.md should receive the KB protocol")
+        agents_text = agents.read_text(encoding="utf-8")
+        require("Old protocol." not in agents_text, "AGENTS.md should receive the synced current KB protocol")
+        require("Use `.agent-kb/` before broad code search" in agents_text, "AGENTS.md should keep a Codex-visible protocol")
+        require("## Commands" in agents_text, "AGENTS.md should preserve unrelated instructions")
+
+
 # Checks that upgrade replaces the old long runtime protocol with the slim protocol.
 def test_upgrade_replaces_long_runtime_protocol() -> None:
     with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
@@ -824,6 +849,78 @@ def test_compliance_analyzer_synthetic_transcripts() -> None:
             ],
         )
         write_jsonl(
+            claude_dir / fixture_claude_project_name(root) / "session-agents-good.jsonl",
+            [
+                {
+                    "timestamp": "2026-07-05T00:00:00Z",
+                    "cwd": str(root),
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "name": "Read",
+                                "input": {"file_path": str(root / "AGENTS.md")},
+                            }
+                        ]
+                    },
+                },
+                {
+                    "timestamp": "2026-07-05T00:00:01Z",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "name": "Read",
+                                "input": {"file_path": str(root / ".agent-kb" / "start.md")},
+                            }
+                        ]
+                    },
+                },
+                {
+                    "timestamp": "2026-07-05T00:00:02Z",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "name": "Grep",
+                                "input": {"path": str(root), "pattern": "print"},
+                            }
+                        ]
+                    },
+                },
+            ],
+        )
+        write_jsonl(
+            claude_dir / fixture_claude_project_name(root) / "session-agents-miss.jsonl",
+            [
+                {
+                    "timestamp": "2026-07-05T00:00:00Z",
+                    "cwd": str(root),
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "name": "Read",
+                                "input": {"file_path": str(root / "AGENTS.md")},
+                            }
+                        ]
+                    },
+                },
+                {
+                    "timestamp": "2026-07-05T00:00:01Z",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "name": "Grep",
+                                "input": {"path": str(root), "pattern": "print"},
+                            }
+                        ]
+                    },
+                },
+            ],
+        )
+        write_jsonl(
             codex_dir / "2026" / "07" / "05" / "rollout-bad.jsonl",
             [
                 {"timestamp": "2026-07-05T00:00:00Z", "type": "session_meta", "payload": {"cwd": str(root)}},
@@ -1016,27 +1113,33 @@ def test_compliance_analyzer_synthetic_transcripts() -> None:
 
         result = run_compliance(root, claude_dir, codex_dir, "--details")
         require(result.returncode == 0, "compliance analyzer should succeed", result)
-        require("Sessions analyzed: 9" in result.stdout, "analyzer should count all synthetic sessions", result)
-        require("KB entry hit rate: 6/9 (66.7%)" in result.stdout, "analyzer should report entry reads", result)
-        require("Any KB hit rate: 7/9 (77.8%)" in result.stdout, "analyzer should report all KB reads", result)
-        require("Read compliance: 4/9 (44.4%)" in result.stdout, "analyzer should report raw compliant sessions", result)
+        require("Sessions analyzed: 11" in result.stdout, "analyzer should count all synthetic sessions", result)
+        require("KB entry hit rate: 7/11 (63.6%)" in result.stdout, "analyzer should report entry reads", result)
+        require("Any KB hit rate: 8/11 (72.7%)" in result.stdout, "analyzer should report all KB reads", result)
+        require("Read compliance: 5/11 (45.5%)" in result.stdout, "analyzer should report raw compliant sessions", result)
         require(
-            "Applicable read compliance (auto): 1/6 (16.7%)" in result.stdout,
+            "Applicable read compliance (auto): 2/8 (25.0%)" in result.stdout,
             "analyzer should report auto-applicable compliance",
             result,
         )
-        require("First source action before KB: 5" in result.stdout, "analyzer should report pre-KB source actions", result)
+        require("First source action before KB: 6" in result.stdout, "analyzer should report pre-KB source actions", result)
         require("late KB read: 2" in result.stdout, "analyzer should classify late reads", result)
         require("1-3 actions late: 1" in result.stdout, "analyzer should bucket short late reads", result)
         require("20+ actions late: 1" in result.stdout, "analyzer should bucket long late reads", result)
-        require("no KB read: 2" in result.stdout, "analyzer should classify missing KB reads", result)
+        require("no KB read: 3" in result.stdout, "analyzer should classify missing KB reads", result)
         require("non-entry KB read: 1" in result.stdout, "analyzer should classify non-entry KB reads", result)
         require(
             "KB-first not applicable: 3" in result.stdout,
             "analyzer should count sessions without source actions separately",
             result,
         )
+        require("Breakdown by harness:" in result.stdout, "analyzer should print harness breakdown", result)
+        require("  claude\n  Sessions analyzed: 3" in result.stdout, "analyzer should report Claude sessions separately", result)
+        require("Claude AGENTS.md delivery:" in result.stdout, "analyzer should print AGENTS.md delivery split", result)
+        require("  read AGENTS.md\n  Sessions analyzed: 2" in result.stdout, "delivery split should count AGENTS.md readers", result)
+        require("  did not read AGENTS.md\n  Sessions analyzed: 1" in result.stdout, "delivery split should count Claude sessions without AGENTS.md", result)
         require("category=late_kb_read late_bucket=20+ actions late" in result.stdout, "details should include late bucket")
+        require("read_agents_md=True" in result.stdout, "details should expose AGENTS.md read status")
         require(
             "Write-back compliance: deferred" in result.stdout,
             "analyzer should document that write-back compliance is deferred",
@@ -1094,6 +1197,7 @@ def main() -> int:
         test_upgrade_writes_map_from_routes,
         test_init_uses_claude_when_agents_points_to_it,
         test_upgrade_updates_claude_protocol_owner,
+        test_claude_pointer_takes_protocol_ownership,
         test_upgrade_replaces_long_runtime_protocol,
         test_trim_diagnoses_empty_scaffold,
         test_trim_threshold_flag_reports_oversize_topic,

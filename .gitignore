@@ -4,5 +4,7 @@ __pycache__/
 docs/*
 !docs/superpowers/
 docs/superpowers/*
+!docs/superpowers/analysis/
+!docs/superpowers/analysis/*.md
 !docs/superpowers/baselines/
 !docs/superpowers/baselines/*.md

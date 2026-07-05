@@ -11,6 +11,7 @@ import shlex
 
 KB_READ_COMMANDS = {"cat", "head", "tail", "sed", "nl", "less", "more"}
 KB_ENTRY_FILES = {"start.md", "routes.yaml"}
+AGENTS_INSTRUCTION_FILE = "AGENTS.md"
 SOURCE_SEARCH_TOOLS = {"Grep", "Glob", "LS"}
 SOURCE_EDIT_TOOLS = {"Edit", "MultiEdit", "Write", "NotebookEdit"}
 SHELL_SEARCH_COMMANDS = {"rg", "grep", "find", "ls"}
@@ -160,11 +161,13 @@ def kb_relative(relative: Path) -> str | None:
     return str(Path(*relative.parts[1:]))
 
 
-# Classifies a root-relative path as a KB entry read, KB read, or source exploration.
+# Classifies a root-relative read path as KB, AGENTS.md, or source exploration.
 def read_kind_for_relative(relative: Path) -> str:
     kb_path = kb_relative(relative)
     if kb_path is not None:
         return "kb_entry_read" if kb_path in KB_ENTRY_FILES else "kb_read"
+    if str(relative) == AGENTS_INSTRUCTION_FILE:
+        return "agents_read"
     return "source_explore"
 
 
@@ -303,7 +306,7 @@ def codex_kb_read_path(command: str, root: Path, workdir: Path | None) -> Path |
     return None
 
 
-# Classifies a Codex shell command as KB read, source exploration, source edit, or irrelevant.
+# Classifies a Codex shell command as KB read, AGENTS.md read, source action, or irrelevant.
 def classify_codex_command(command: str, root: Path, workdir: Path | None) -> tuple[str | None, str]:
     words = command_words(command)
     if not words:
@@ -314,6 +317,10 @@ def classify_codex_command(command: str, root: Path, workdir: Path | None) -> tu
     if kb_read_path is not None:
         rel = kb_relative(kb_read_path) or ""
         return ("kb_entry_read" if rel in KB_ENTRY_FILES else "kb_read"), str(kb_read_path)
+    if executable in KB_READ_COMMANDS:
+        for path in paths:
+            if str(path) == AGENTS_INSTRUCTION_FILE:
+                return "agents_read", str(path)
     source_paths = [path for path in paths if kb_relative(path) is None]
     if executable in SHELL_SEARCH_COMMANDS:
         if source_paths:

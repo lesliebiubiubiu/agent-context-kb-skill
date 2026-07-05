@@ -86,6 +86,20 @@ compliance: most misses are late reads, not total misses. Half of the late-read
 misses are only 1-3 actions late, which should be analyzed separately from the
 20+ action late reads before changing the runtime protocol.
 
+## Harness Breakdown Follow-Up - 2026-07-05
+
+The analyzer now reports harness-level rates and a Claude split by whether the
+session read `AGENTS.md`. On the expanded local corpus:
+
+- Sessions analyzed: 105
+- Read compliance: 38/105 (36.2%)
+- Claude: 0/5 read compliance
+- Codex: 38/100 read compliance
+- Claude sessions that read `AGENTS.md`: 0/4 read compliance
+
+Interpretation and the P0 placement decision are recorded in
+[Late-Read Analysis - 2026-07-05](../analysis/2026-07-05-late-read-analysis.md).
+
 ## Caveats
 
 - This is a single-repo dogfood baseline, not an absolute utility result.
