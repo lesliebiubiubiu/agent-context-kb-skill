@@ -11,6 +11,7 @@ from pathlib import Path
 
 
 SCRIPT = Path(__file__).with_name("agent_kb.py")
+DEV_COMPLIANCE_SCRIPT = Path(__file__).parent / "dev" / "compliance_analyzer.py"
 
 
 # Runs the KB CLI against a temporary repository and captures output for assertions.
@@ -22,6 +23,38 @@ def run_cli(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+
+
+# Runs the private compliance analyzer against temporary transcript directories.
+def run_compliance(root: Path, claude_dir: Path, codex_dir: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            str(DEV_COMPLIANCE_SCRIPT),
+            "--root",
+            str(root),
+            "--claude-dir",
+            str(claude_dir),
+            "--codex-dir",
+            str(codex_dir),
+            *args,
+        ],
+        check=False,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+# Writes JSONL records for synthetic transcript fixtures.
+def write_jsonl(path: Path, records: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+
+
+# Builds Claude Code's project-directory name for a repo path.
+def claude_project_name(root: Path) -> str:
+    return str(root.resolve()).replace("/", "-")
 
 
 # Fails the smoke test with command output when an expected condition is false.
@@ -571,6 +604,81 @@ def test_stats_reports_cli_usage() -> None:
         require("KB file churn" in result.stdout, "stats should report the churn section", result)
 
 
+# Checks that the private compliance analyzer parses synthetic Claude and Codex transcripts.
+def test_compliance_analyzer_synthetic_transcripts() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        base = Path(tmp)
+        root = base / "repo"
+        root.mkdir()
+        init_root(root)
+        (root / "src.py").write_text("print('hi')\n", encoding="utf-8")
+
+        claude_dir = base / "claude" / "projects"
+        codex_dir = base / "codex" / "sessions"
+        write_jsonl(
+            claude_dir / claude_project_name(root) / "session-good.jsonl",
+            [
+                {
+                    "timestamp": "2026-07-05T00:00:00Z",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "name": "Read",
+                                "input": {"file_path": str(root / ".agent-kb" / "start.md")},
+                            }
+                        ]
+                    },
+                },
+                {
+                    "timestamp": "2026-07-05T00:00:01Z",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "name": "Grep",
+                                "input": {"path": str(root), "pattern": "print"},
+                            }
+                        ]
+                    },
+                },
+            ],
+        )
+        write_jsonl(
+            codex_dir / "2026" / "07" / "05" / "rollout-bad.jsonl",
+            [
+                {"timestamp": "2026-07-05T00:00:00Z", "type": "session_meta", "payload": {"cwd": str(root)}},
+                {
+                    "timestamp": "2026-07-05T00:00:01Z",
+                    "type": "function_call",
+                    "payload": {
+                        "name": "functions.exec_command",
+                        "arguments": json.dumps({"cmd": "rg print src.py", "workdir": str(root)}),
+                    },
+                },
+                {
+                    "timestamp": "2026-07-05T00:00:02Z",
+                    "type": "function_call",
+                    "payload": {
+                        "name": "functions.exec_command",
+                        "arguments": json.dumps({"cmd": "sed -n '1,40p' .agent-kb/start.md", "workdir": str(root)}),
+                    },
+                },
+            ],
+        )
+
+        result = run_compliance(root, claude_dir, codex_dir, "--details")
+        require(result.returncode == 0, "compliance analyzer should succeed", result)
+        require("Sessions analyzed: 2" in result.stdout, "analyzer should count both synthetic sessions", result)
+        require("Read compliance: 1/2 (50.0%)" in result.stdout, "analyzer should report one compliant session", result)
+        require("First source action before KB: 1" in result.stdout, "analyzer should report one pre-KB source action", result)
+        require(
+            "Write-back compliance: deferred" in result.stdout,
+            "analyzer should document that write-back compliance is deferred",
+            result,
+        )
+
+
 # Checks that init sets up the chosen versioning mode (nested default, shared, local).
 def test_init_versioning_modes() -> None:
     with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
@@ -635,6 +743,7 @@ def main() -> int:
         test_validate_metrics_and_health,
         test_note_body_redacted_in_log,
         test_stats_reports_cli_usage,
+        test_compliance_analyzer_synthetic_transcripts,
         test_init_versioning_modes,
     ]
     for test in tests:
