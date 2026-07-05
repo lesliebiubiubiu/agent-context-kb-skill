@@ -25,12 +25,18 @@ PRICING_PATH = SCRIPT_DIR / "pricing.json"
 TRANSCRIPT_SCRIPT_DIR = REPO_DIR / "skills" / "agent-context-kb" / "scripts"
 sys.path.insert(0, str(TRANSCRIPT_SCRIPT_DIR))
 from transcript_reads import (  # noqa: E402
+    KB_READ_COMMANDS,
+    command_paths,
+    command_words,
     codex_command_arg,
     codex_record_tool_payload,
     codex_tool_call,
     iter_jsonl,
+    kb_relative,
     path_is_inside_root,
+    read_kind_for_relative,
     resolve_path,
+    root_relative,
 )
 
 
@@ -829,6 +835,77 @@ def agent_summary(agent_result: dict) -> dict:
     return {key: value for key, value in agent_result.items() if key not in {"final_answer", "tool_calls"}}
 
 
+# Returns a repo-relative path when a direct tool path points inside `.agent-kb/`.
+def direct_kb_tool_path(raw_path: str, root: Path) -> Path | None:
+    if not raw_path:
+        return None
+    relative = root_relative(raw_path, root)
+    if relative is None:
+        relative = Path(raw_path)
+    return relative if kb_relative(relative) is not None else None
+
+
+# Extracts repo-relative KB file reads from one normalized tool call.
+def kb_read_paths_for_tool_call(call: dict, root: Path) -> list[str]:
+    tool_input = call.get("input") if isinstance(call.get("input"), dict) else {}
+    paths: list[Path] = []
+    if call.get("name") == "Read":
+        for key in ("file_path", "path"):
+            path = direct_kb_tool_path(str(tool_input.get(key) or ""), root)
+            if path is not None:
+                paths.append(path)
+    elif call.get("name") in COMMAND_TOOL_NAMES:
+        command = codex_command_arg({"cmd": tool_input.get("cmd") or tool_input.get("command") or ""})
+        words = command_words(command)
+        if words and Path(words[0]).name in KB_READ_COMMANDS:
+            workdir_raw = str(tool_input.get("workdir") or "")
+            workdir = resolve_path(workdir_raw) if workdir_raw else root
+            paths.extend(path for path in command_paths(command, root, workdir) if kb_relative(path) is not None)
+    return [str(path) for path in paths]
+
+
+# Summarizes KB read order from captured tool calls without affecting assertion scoring.
+def kb_access_summary(tool_calls: list[dict], root: Path) -> dict:
+    root = resolve_path(root)
+    reads = []
+    seen = set()
+    first_read_index = None
+    start_index = None
+    routes_index = None
+    first_topic_index = None
+    for index, call in enumerate(tool_calls):
+        call_paths = kb_read_paths_for_tool_call(call, root)
+        if call_paths and first_read_index is None:
+            first_read_index = index
+        for path in call_paths:
+            if path not in seen:
+                seen.add(path)
+                reads.append(path)
+            kind = read_kind_for_relative(Path(path))
+            if path == ".agent-kb/start.md" and start_index is None:
+                start_index = index
+            elif path == ".agent-kb/routes.yaml" and routes_index is None:
+                routes_index = index
+            elif kind == "kb_read" and first_topic_index is None:
+                first_topic_index = index
+    if not reads:
+        access_mode = "none"
+    elif (
+        start_index is not None
+        and routes_index is not None
+        and (first_topic_index is None or (start_index < first_topic_index and routes_index < first_topic_index))
+    ):
+        access_mode = "routed"
+    else:
+        access_mode = "direct"
+    return {
+        "reads": reads,
+        "first_read_index": first_read_index,
+        "access_mode": access_mode,
+        "route_followed": access_mode == "routed",
+    }
+
+
 # Returns true when a tool input references the requested path.
 def input_mentions_path(tool_input, expected_path: str) -> bool:
     if isinstance(tool_input, dict):
@@ -1338,6 +1415,7 @@ def run_bundle(
                     "repetition": repetition,
                     "harness": harness,
                     "agent": agent_summary(agent_result),
+                    "kb_access": kb_access_summary(agent_result["tool_calls"], workspace),
                     "assertions": assertions,
                 }
                 if judge_result is not None:

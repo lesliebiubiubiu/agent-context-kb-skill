@@ -1334,6 +1334,15 @@ def test_eval_runner_dry_run() -> None:
             summary["runs"][0]["assertions"][0]["status"] == "dry_run",
             "eval assertions should be marked dry_run without agent calls",
         )
+        require(
+            summary["runs"][0]["kb_access"] == {
+                "reads": [],
+                "first_read_index": None,
+                "access_mode": "none",
+                "route_followed": False,
+            },
+            "eval summary should record empty KB telemetry for dry-run agent calls",
+        )
         require(not (results / ".raw").exists(), "dry-run should not write raw artifacts")
 
 
@@ -1734,6 +1743,47 @@ def test_eval_runner_behavior_and_judge_parsers() -> None:
         require(rows[0]["status"] == "agent_error", "semantic assertion should record agent_error")
 
 
+# Checks that eval run KB-access telemetry records read order without scoring assertions.
+def test_eval_runner_kb_access_summary() -> None:
+    runner = load_eval_runner_module()
+    root = Path("/tmp/eval-workspace")
+    routed = runner.kb_access_summary(
+        [
+            {"name": "shell", "input": {"cmd": "/bin/zsh -lc \"cat .agent-kb/start.md\"", "workdir": str(root)}},
+            {"name": "Read", "input": {"file_path": str(root / ".agent-kb" / "routes.yaml")}},
+            {"name": "shell", "input": {"cmd": "sed -n '1,40p' .agent-kb/plans/current.md .agent-kb/start.md", "workdir": str(root)}},
+        ],
+        root,
+    )
+    require(
+        routed == {
+            "reads": [".agent-kb/start.md", ".agent-kb/routes.yaml", ".agent-kb/plans/current.md"],
+            "first_read_index": 0,
+            "access_mode": "routed",
+            "route_followed": True,
+        },
+        "KB telemetry should classify start/routes before a topic doc as routed",
+    )
+    direct = runner.kb_access_summary(
+        [
+            {"name": "Read", "input": {"file_path": ".agent-kb/plans/current.md"}},
+            {"name": "Read", "input": {"file_path": ".agent-kb/start.md"}},
+            {"name": "Read", "input": {"file_path": ".agent-kb/routes.yaml"}},
+        ],
+        root,
+    )
+    require(direct["access_mode"] == "direct", "KB telemetry should classify topic-first reads as direct")
+    require(direct["first_read_index"] == 0, "KB telemetry should record the first KB read tool index")
+    none = runner.kb_access_summary(
+        [{"name": "shell", "input": {"cmd": "rg agent evals", "workdir": str(root)}}],
+        root,
+    )
+    require(
+        none == {"reads": [], "first_read_index": None, "access_mode": "none", "route_followed": False},
+        "KB telemetry should classify runs with no KB reads as none",
+    )
+
+
 # Checks that raw-answer calibration rejudges existing summaries and computes agreement.
 def test_eval_runner_calibration_from_raw() -> None:
     runner = load_eval_runner_module()
@@ -1892,6 +1942,7 @@ def main() -> int:
         test_eval_runner_shared_kb_dry_run,
         test_eval_runner_rejects_bad_pin,
         test_eval_runner_behavior_and_judge_parsers,
+        test_eval_runner_kb_access_summary,
         test_eval_runner_calibration_from_raw,
         test_init_versioning_modes,
     ]

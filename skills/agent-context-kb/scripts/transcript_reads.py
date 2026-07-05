@@ -250,7 +250,7 @@ def codex_tool_call(payload: dict) -> tuple[str, dict]:
     return name, parsed
 
 
-# Returns a normalized command string from Codex shell argument shapes.
+# Returns a normalized command string, unwrapping common shell -c wrappers when present.
 def codex_command_arg(args: dict) -> str:
     raw = args.get("cmd") or args.get("command") or ""
     if isinstance(raw, list):
@@ -258,7 +258,11 @@ def codex_command_arg(args: dict) -> str:
         if len(parts) >= 3 and Path(parts[0]).name in {"bash", "sh", "zsh"} and parts[1] in {"-c", "-lc"}:
             return parts[2]
         return " ".join(shlex.quote(part) for part in parts)
-    return str(raw)
+    command = str(raw)
+    words = command_words(command)
+    if len(words) >= 3 and Path(words[0]).name in {"bash", "sh", "zsh"} and words[1] in {"-c", "-lc"}:
+        return words[2]
+    return command
 
 
 # Returns the tool payload for the known Codex transcript record shapes.
