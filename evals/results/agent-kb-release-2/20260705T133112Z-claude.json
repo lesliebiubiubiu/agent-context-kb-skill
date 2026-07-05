@@ -1,0 +1,237 @@
+{
+  "bundle": "agent-kb-release-2",
+  "dry_run": false,
+  "generated_at": "2026-07-05T13:37:08+00:00",
+  "harness": "claude",
+  "judge": "claude",
+  "kb_commit": "c1750990180fe8a2af20a252d0ee539e5b5f48ed",
+  "repo_commit": "cb91b38c632fed144e68b9a6c7f3955f6ce52f16",
+  "repo_path": "/Users/lsl/Desktop/agent-context-kb-skill",
+  "run_id": "20260705T133112Z",
+  "runs": [
+    {
+      "agent": {
+        "cost_usd": 0.3175821,
+        "exit_code": 0,
+        "output_chars": 1662,
+        "provenance": {
+          "actual_model": "claude-sonnet-5",
+          "cli_version": "2.1.201 (Claude Code)",
+          "effort": "medium",
+          "harness": "claude",
+          "max_turns": null,
+          "requested_model": "sonnet"
+        },
+        "raw_artifacts": {
+          "stderr": ".raw/agent-kb-release-2/20260705T133112Z/respect-current-release-focus-r1-agent.stderr.txt",
+          "stdout": ".raw/agent-kb-release-2/20260705T133112Z/respect-current-release-focus-r1-agent.stdout.jsonl"
+        },
+        "status": "ok",
+        "stderr_chars": 0,
+        "tool_call_count": 3,
+        "usage": {
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 27771,
+            "ephemeral_5m_input_tokens": 0
+          },
+          "cache_creation_input_tokens": 27771,
+          "cache_read_input_tokens": 0,
+          "inference_geo": "not_available",
+          "input_tokens": 2,
+          "output_tokens": 2,
+          "service_tier": "standard"
+        }
+      },
+      "assertions": [
+        {
+          "check": "tool_read",
+          "description": "The agent reads the KB planning route before drawing a conclusion.",
+          "id": "reads-planning-route",
+          "passed": true,
+          "reason": "Tool input referenced .agent-kb/plans/current.md.",
+          "status": "scored"
+        },
+        {
+          "check": "no_edit",
+          "description": "The agent does not edit files for this read-only task.",
+          "id": "does-not-edit",
+          "passed": true,
+          "reason": "No edit/write tools were used.",
+          "status": "scored"
+        },
+        {
+          "check": "judge",
+          "confidence": 0.95,
+          "description": "The answer keeps new user-facing features out of scope until validation data exists.",
+          "id": "keeps-feature-freeze",
+          "passed": true,
+          "reason": "The answer identifies the next step as manually sampling late-read compliance misses before touching runtime protocol, and explicitly notes P1 items (hooks, regression eval bundle) are deferred until after this validation step, consistent with the plan's feature-freeze-until-utility-eval mandate. No new user-facing features are proposed or treated as in-scope.",
+          "status": "scored"
+        }
+      ],
+      "harness": "claude",
+      "judge": {
+        "cost_usd": 0.08080230000000001,
+        "exit_code": 0,
+        "provenance": {
+          "actual_model": null,
+          "cli_version": "2.1.201 (Claude Code)",
+          "effort": "medium",
+          "harness": "claude",
+          "max_turns": null,
+          "prompt_template_sha256": "7041fe15d4dd73f252c10d73866979b3635ef8273baeb3b36c69c56289bf9196",
+          "requested_model": "sonnet"
+        },
+        "raw_artifacts": {
+          "stderr": ".raw/agent-kb-release-2/20260705T133112Z/respect-current-release-focus-r1-judge.stderr.txt",
+          "stdout": ".raw/agent-kb-release-2/20260705T133112Z/respect-current-release-focus-r1-judge.stdout.json"
+        },
+        "status": "ok",
+        "usage": {
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 12013,
+            "ephemeral_5m_input_tokens": 0
+          },
+          "cache_creation_input_tokens": 12013,
+          "cache_read_input_tokens": 21061,
+          "inference_geo": "not_available",
+          "input_tokens": 2,
+          "iterations": [
+            {
+              "cache_creation": {
+                "ephemeral_1h_input_tokens": 12013,
+                "ephemeral_5m_input_tokens": 0
+              },
+              "cache_creation_input_tokens": 12013,
+              "cache_read_input_tokens": 21061,
+              "input_tokens": 2,
+              "output_tokens": 160,
+              "type": "message"
+            }
+          ],
+          "output_tokens": 160,
+          "server_tool_use": {
+            "web_fetch_requests": 0,
+            "web_search_requests": 0
+          },
+          "service_tier": "standard",
+          "speed": "standard"
+        }
+      },
+      "repetition": 1,
+      "task_id": "respect-current-release-focus"
+    },
+    {
+      "agent": {
+        "cost_usd": 0.17706750000000002,
+        "exit_code": 0,
+        "output_chars": 1513,
+        "provenance": {
+          "actual_model": "claude-sonnet-5",
+          "cli_version": "2.1.201 (Claude Code)",
+          "effort": "medium",
+          "harness": "claude",
+          "max_turns": null,
+          "requested_model": "sonnet"
+        },
+        "raw_artifacts": {
+          "stderr": ".raw/agent-kb-release-2/20260705T133112Z/respect-trim-control-boundary-r1-agent.stderr.txt",
+          "stdout": ".raw/agent-kb-release-2/20260705T133112Z/respect-trim-control-boundary-r1-agent.stdout.jsonl"
+        },
+        "status": "ok",
+        "stderr_chars": 0,
+        "tool_call_count": 6,
+        "usage": {
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 6708,
+            "ephemeral_5m_input_tokens": 0
+          },
+          "cache_creation_input_tokens": 6708,
+          "cache_read_input_tokens": 21061,
+          "inference_geo": "not_available",
+          "input_tokens": 2,
+          "output_tokens": 2,
+          "service_tier": "standard"
+        }
+      },
+      "assertions": [
+        {
+          "check": "tool_read",
+          "description": "The agent reads the KB decisions route before answering.",
+          "id": "reads-decisions-route",
+          "passed": false,
+          "reason": "No tool input referenced .agent-kb/decisions/active/project-decisions.md.",
+          "status": "scored"
+        },
+        {
+          "check": "no_edit",
+          "description": "The agent does not edit files for this read-only task.",
+          "id": "does-not-edit",
+          "passed": true,
+          "reason": "No edit/write tools were used.",
+          "status": "scored"
+        },
+        {
+          "check": "judge",
+          "confidence": 0.92,
+          "description": "The answer says semantic merges remain agent judgment, while trim --write only performs deterministic reversible cleanup.",
+          "id": "keeps-semantic-work-with-agent",
+          "passed": true,
+          "reason": "The reference decisions doc confirms the exact boundary the answer describes: deterministic/reversible work (deleting empty scaffolds, pruning routes, regenerating map.md) runs in --write, while semantic merges/judgment are left to the agent via the compact prompt. The agent's answer accurately reflects this, citing consistent code locations (SKILL.md:37, command_trim, trim_compact_prompt) and correctly notes husks are only reported, never auto-deleted, matching the reference's 'husk-after-merge is warning-only' point.",
+          "status": "scored"
+        }
+      ],
+      "harness": "claude",
+      "judge": {
+        "cost_usd": 0.0693633,
+        "exit_code": 0,
+        "provenance": {
+          "actual_model": null,
+          "cli_version": "2.1.201 (Claude Code)",
+          "effort": "medium",
+          "harness": "claude",
+          "max_turns": null,
+          "prompt_template_sha256": "7041fe15d4dd73f252c10d73866979b3635ef8273baeb3b36c69c56289bf9196",
+          "requested_model": "sonnet"
+        },
+        "raw_artifacts": {
+          "stderr": ".raw/agent-kb-release-2/20260705T133112Z/respect-trim-control-boundary-r1-judge.stderr.txt",
+          "stdout": ".raw/agent-kb-release-2/20260705T133112Z/respect-trim-control-boundary-r1-judge.stdout.json"
+        },
+        "status": "ok",
+        "usage": {
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 9934,
+            "ephemeral_5m_input_tokens": 0
+          },
+          "cache_creation_input_tokens": 9934,
+          "cache_read_input_tokens": 21061,
+          "inference_geo": "not_available",
+          "input_tokens": 2,
+          "iterations": [
+            {
+              "cache_creation": {
+                "ephemeral_1h_input_tokens": 9934,
+                "ephemeral_5m_input_tokens": 0
+              },
+              "cache_creation_input_tokens": 9934,
+              "cache_read_input_tokens": 21061,
+              "input_tokens": 2,
+              "output_tokens": 229,
+              "type": "message"
+            }
+          ],
+          "output_tokens": 229,
+          "server_tool_use": {
+            "web_fetch_requests": 0,
+            "web_search_requests": 0
+          },
+          "service_tier": "standard",
+          "speed": "standard"
+        }
+      },
+      "repetition": 1,
+      "task_id": "respect-trim-control-boundary"
+    }
+  ]
+}
