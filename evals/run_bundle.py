@@ -124,6 +124,15 @@ def cli_version(command: str) -> str | None:
     return "\n".join(lines) or None
 
 
+# Finds the best model identifier in a CLI event, including Codex session metadata variants.
+def find_model_name(value) -> str | None:
+    for key in ("model", "model_slug", "model_id", "actual_model"):
+        found = find_nested_key(value, key)
+        if found:
+            return str(found)
+    return None
+
+
 # Builds the provenance fields that are known before an agent or judge runs.
 def base_provenance(harness: str, config: dict, role: str, versions: dict[str, str | None]) -> dict:
     return {
@@ -203,6 +212,33 @@ def read_json_yaml(path: Path) -> dict:
     return value
 
 
+# Reads the KB versioning mode from the small .kb-meta.yaml marker.
+def parse_kb_meta_mode(text: str | None) -> str | None:
+    if not text:
+        return None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("mode:"):
+            mode = stripped.split(":", 1)[1].strip()
+            return mode or None
+    return None
+
+
+# Reads a tracked file at a pinned commit, returning None when it is absent.
+def git_show_text(repo: Path, commit: str, path: str) -> str | None:
+    result = subprocess.run(
+        ["git", "show", f"{commit}:{path}"],
+        cwd=repo,
+        check=False,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
 # Hashes a file's bytes so task definitions can be compared across result files.
 def sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -261,6 +297,31 @@ def resolve_kb_repo(repo_root: Path, kb_repo: Path | None) -> Path:
     return resolved
 
 
+# Resolves the KB pin semantics for nested and shared KB versioning modes.
+def resolve_kb_pin(repo_root: Path, bundle: dict, kb_repo: Path | None) -> dict:
+    repo_commit = str(bundle.get("repo_commit") or "")
+    if not repo_commit:
+        raise ValueError("bundle.yaml must define repo_commit")
+    kb_commit = str(bundle.get("kb_commit") or "")
+    mode = str(bundle.get("kb_mode") or "").strip() or None
+    mode = mode or parse_kb_meta_mode(git_show_text(repo_root, repo_commit, ".agent-kb/.kb-meta.yaml"))
+    if mode is None:
+        mode = "nested" if kb_commit else None
+    if mode not in {"nested", "shared", "local"}:
+        raise ValueError("could not determine KB versioning mode; set bundle.yaml kb_mode to nested or shared")
+    if mode == "nested":
+        if not kb_commit:
+            raise ValueError("nested KB bundles must define kb_commit")
+        return {"mode": mode, "kb_commit": kb_commit, "kb_repo": resolve_kb_repo(repo_root, kb_repo)}
+    if mode == "shared":
+        if kb_repo is not None:
+            raise ValueError("--kb-repo is only valid for nested KB bundles")
+        if kb_commit and kb_commit != repo_commit:
+            raise ValueError("shared KB bundles must omit kb_commit or set it equal to repo_commit")
+        return {"mode": mode, "kb_commit": kb_commit or repo_commit, "kb_repo": None}
+    raise ValueError("local KB mode cannot be pinned for eval bundles")
+
+
 # Creates a detached worktree for the pinned repository commit.
 def create_repo_worktree(repo_root: Path, checkout: Path, repo_commit: str) -> None:
     git_run(repo_root, ["worktree", "add", "--detach", str(checkout), repo_commit], stdout=subprocess.DEVNULL)
@@ -289,22 +350,23 @@ def restore_kb_snapshot(kb_repo: Path, checkout: Path, kb_commit: str) -> None:
 
 
 # Verifies the isolated workspace has both the repo checkout and KB entry file.
-def verify_workspace_snapshot(checkout: Path) -> None:
+def verify_workspace_snapshot(checkout: Path, kb_mode: str) -> None:
     if not (checkout / ".git").exists():
         raise ValueError("prepared workspace is missing the repository checkout")
     if not (checkout / ".agent-kb" / "start.md").exists():
-        raise ValueError("prepared workspace is missing .agent-kb/start.md from the KB snapshot")
+        raise ValueError(f"prepared {kb_mode} workspace is missing .agent-kb/start.md")
 
 
 # Prepares and cleans up an isolated pinned workspace for an eval run.
 @contextmanager
-def prepared_workspace(repo_root: Path, kb_repo: Path, repo_commit: str, kb_commit: str):
+def prepared_workspace(repo_root: Path, kb_pin: dict, repo_commit: str):
     with tempfile.TemporaryDirectory(prefix="agent-kb-eval-worktree-") as tmp:
         checkout = Path(tmp) / "repo"
         create_repo_worktree(repo_root, checkout, repo_commit)
         try:
-            restore_kb_snapshot(kb_repo, checkout, kb_commit)
-            verify_workspace_snapshot(checkout)
+            if kb_pin["mode"] == "nested":
+                restore_kb_snapshot(kb_pin["kb_repo"], checkout, kb_pin["kb_commit"])
+            verify_workspace_snapshot(checkout, kb_pin["mode"])
             yield checkout
         finally:
             remove_repo_worktree(repo_root, checkout)
@@ -390,6 +452,22 @@ def find_nested_key(value, key: str):
     return None
 
 
+# Extracts stable warning rows from stderr without changing run success semantics.
+def stderr_warnings(stderr: str) -> list[dict]:
+    lowered = stderr.lower()
+    warnings = []
+    if "websocket" in lowered and "connection reset" in lowered:
+        warnings.append({"code": "websocket_connection_reset", "message": "stderr reported a websocket connection reset that the CLI recovered from"})
+    return warnings
+
+
+# Adds a provenance warning when the CLI output did not expose the actual model.
+def provenance_warnings(provenance: dict) -> list[dict]:
+    if provenance.get("actual_model"):
+        return []
+    return [{"code": "actual_model_missing", "message": "CLI output did not expose the actual model"}]
+
+
 # Parses Claude stream-json output into final text, usage, cost, model, and tool calls.
 def parse_claude_stream(stdout: str) -> dict:
     tool_calls = []
@@ -412,7 +490,7 @@ def parse_claude_stream(stdout: str) -> dict:
             final_result = event["result"]
         usage = usage or find_nested_key(event, "usage")
         cost_usd = cost_usd or find_nested_key(event, "total_cost_usd") or find_nested_key(event, "cost_usd") or find_nested_key(event, "cost")
-        actual_model = actual_model or find_nested_key(event, "model")
+        actual_model = actual_model or find_model_name(event)
     final_answer = final_result or "\n".join(part for part in text_parts if part).strip()
     return {
         "final_answer": final_answer,
@@ -440,7 +518,7 @@ def parse_jsonl_agent_output(stdout: str) -> dict:
         text_parts.extend(extract_text_parts(event))
         usage = usage or find_nested_key(event, "usage")
         cost_usd = cost_usd or find_nested_key(event, "total_cost_usd") or find_nested_key(event, "cost_usd") or find_nested_key(event, "cost")
-        actual_model = actual_model or find_nested_key(event, "model")
+        actual_model = actual_model or find_model_name(event)
     return {
         "final_answer": "\n".join(part for part in text_parts if part).strip(),
         "tool_calls": [],
@@ -650,6 +728,7 @@ def run_claude(
     }
     parsed = parse_claude_stream(result.stdout)
     provenance = {**provenance, "actual_model": parsed["actual_model"]}
+    warnings = [*stderr_warnings(result.stderr), *provenance_warnings(provenance)]
     estimated_cost_usd = estimate_cost_usd(
         parsed["usage"],
         price_table(config, "claude", parsed["actual_model"] or provenance.get("requested_model")),
@@ -659,6 +738,7 @@ def run_claude(
         "exit_code": result.returncode,
         "output_chars": len(parsed["final_answer"]),
         "stderr_chars": len(result.stderr),
+        "warnings": warnings,
         "tool_call_count": len(parsed["tool_calls"]),
         "usage": parsed["usage"],
         "cost_usd": parsed["cost_usd"],
@@ -722,6 +802,7 @@ def run_codex(
         if not parsed["tool_calls"]:
             parsed["tool_calls"] = parse_codex_rollout_tool_calls(rollout)
     provenance = {**provenance, "actual_model": parsed["actual_model"]}
+    warnings = [*stderr_warnings(result.stderr), *provenance_warnings(provenance)]
     estimated_cost_usd = estimate_cost_usd(
         parsed["usage"],
         price_table(config, "codex", parsed["actual_model"] or provenance.get("requested_model")),
@@ -731,6 +812,7 @@ def run_codex(
         "exit_code": result.returncode,
         "output_chars": len(parsed["final_answer"]),
         "stderr_chars": len(result.stderr),
+        "warnings": warnings,
         "tool_call_count": len(parsed["tool_calls"]),
         "usage": parsed["usage"],
         "cost_usd": parsed["cost_usd"],
@@ -873,7 +955,7 @@ def parse_judge_output(stdout: str) -> dict:
     else:
         usage = outer.get("usage")
         cost_usd = outer.get("cost_usd") or outer.get("total_cost_usd") or outer.get("cost")
-        actual_model = find_nested_key(outer, "model")
+        actual_model = find_model_name(outer)
         result_text = outer.get("result") or outer.get("content") or stdout
     payload = extract_json_object(str(result_text))
     assertions = payload.get("assertions")
@@ -943,6 +1025,7 @@ def run_judge(
             "provenance": provenance,
         }
     provenance = {**provenance, "actual_model": parsed["actual_model"]}
+    warnings = [*stderr_warnings(result.stderr), *provenance_warnings(provenance)]
     estimated_cost_usd = estimate_cost_usd(
         parsed["usage"],
         price_table(config, judge_harness, parsed["actual_model"] or provenance.get("requested_model")),
@@ -951,6 +1034,7 @@ def run_judge(
         "status": "ok",
         "exit_code": result.returncode,
         "raw_artifacts": raw_artifacts,
+        "warnings": warnings,
         "assertions": parsed["assertions"],
         "usage": parsed["usage"],
         "cost_usd": parsed["cost_usd"],
@@ -1077,22 +1161,25 @@ def calibrate_summary(
     bundle = read_json_yaml(bundle_dir / "bundle.yaml")
     config = runner_config(bundle)
     repo_root = resolve_repo_root(bundle_dir, bundle, repo_root)
-    kb_repo = resolve_kb_repo(repo_root, kb_repo)
     tasks_path = bundle_dir / str(bundle.get("task_file", "tasks.yaml"))
     tasks_doc = read_json_yaml(tasks_path)
     tasks_by_id = {str(task.get("id")): task for task in tasks_doc.get("tasks", []) if isinstance(task, dict)}
     original = json.loads(summary_path.read_text(encoding="utf-8"))
     repo_commit = str(original.get("repo_commit") or bundle.get("repo_commit") or "")
-    kb_commit = str(original.get("kb_commit") or bundle.get("kb_commit") or "")
-    if not repo_commit or not kb_commit:
-        raise ValueError("calibration needs repo_commit and kb_commit in the summary or bundle")
+    if not repo_commit:
+        raise ValueError("calibration needs repo_commit in the summary or bundle")
+    kb_pin = resolve_kb_pin(
+        repo_root,
+        {**bundle, "repo_commit": repo_commit, "kb_commit": original.get("kb_commit") or bundle.get("kb_commit")},
+        kb_repo,
+    )
     versions = {"claude": cli_version("claude"), "codex": cli_version("codex")}
     judge_provenance = base_provenance(judge_harness, config, "judge", versions)
     raw_root = results_root / ".raw" / str(bundle.get("name", bundle_dir.name)) / run_id
     rows = []
     compared = 0
     agreed = 0
-    with prepared_workspace(repo_root, kb_repo, repo_commit, kb_commit) as workspace:
+    with prepared_workspace(repo_root, kb_pin, repo_commit) as workspace:
         for run in original.get("runs", []):
             task_id = str(run.get("task_id") or "")
             task = tasks_by_id.get(task_id)
@@ -1178,7 +1265,6 @@ def run_bundle(
     config = runner_config(bundle)
     harness = harness or config["default_harness"]
     repo_root = resolve_repo_root(bundle_dir, bundle, repo_root)
-    kb_repo = resolve_kb_repo(repo_root, kb_repo)
     tasks_path = bundle_dir / str(bundle.get("task_file", "tasks.yaml"))
     tasks_doc = read_json_yaml(tasks_path)
     tasks = tasks_doc.get("tasks", [])
@@ -1190,16 +1276,14 @@ def run_bundle(
         raise ValueError("--judge must be claude or codex")
     repetitions = config["repetitions"]
     repo_commit = str(bundle.get("repo_commit") or "")
-    kb_commit = str(bundle.get("kb_commit") or "")
-    if not repo_commit or not kb_commit:
-        raise ValueError("bundle.yaml must define repo_commit and kb_commit")
+    kb_pin = resolve_kb_pin(repo_root, bundle, kb_repo)
     runs = []
     raw_root = results_root / ".raw" / str(bundle.get("name", bundle_dir.name)) / run_id
     versions = {"claude": cli_version("claude"), "codex": cli_version("codex")}
     agent_provenance = base_provenance(harness, config, "agent", versions)
     judge_provenance = base_provenance(judge_harness, config, "judge", versions) if judge_harness else None
     agent_runner = run_claude if harness == "claude" else run_codex
-    with prepared_workspace(repo_root, kb_repo, repo_commit, kb_commit) as workspace:
+    with prepared_workspace(repo_root, kb_pin, repo_commit) as workspace:
         for task in tasks:
             if not isinstance(task, dict):
                 raise ValueError(f"{tasks_path} contains a non-object task")
@@ -1248,7 +1332,8 @@ def run_bundle(
         "bundle": bundle.get("name", bundle_dir.name),
         "repo_path": str(repo_root),
         "repo_commit": repo_commit,
-        "kb_commit": kb_commit,
+        "kb_mode": kb_pin["mode"],
+        "kb_commit": kb_pin["kb_commit"],
         "runner_commit": git_head(REPO_DIR),
         "tasks_file_sha256": sha256_file(tasks_path),
         "harness": harness,

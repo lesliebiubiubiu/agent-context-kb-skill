@@ -1319,11 +1319,62 @@ def test_eval_runner_dry_run() -> None:
             summary["runs"][0]["agent"]["provenance"]["sandbox"] == "read-only",
             "Codex dry-run provenance should record the sandbox",
         )
+        require(summary["kb_mode"] == "nested", "eval summary should record nested KB mode")
+        require(summary["kb_commit"] == kb_commit, "nested eval summary should record the pinned KB commit")
         require(
             summary["runs"][0]["assertions"][0]["status"] == "dry_run",
             "eval assertions should be marked dry_run without agent calls",
         )
         require(not (results / ".raw").exists(), "dry-run should not write raw artifacts")
+
+
+# Checks that shared KB bundles pin the KB through repo_commit instead of a nested KB repo.
+def test_eval_runner_shared_kb_dry_run() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-eval-") as tmp:
+        base = Path(tmp)
+        repo = base / "repo"
+        repo_commit = create_fixture_commit(
+            repo,
+            {
+                "README.md": "# Fixture\n",
+                ".agent-kb/start.md": "# Agent KB Start\n",
+                ".agent-kb/.kb-meta.yaml": "schema_version: 1\nmode: shared\n",
+            },
+        )
+        bundle = base / "bundles" / "demo"
+        results = base / "results"
+        write_json_yaml(
+            bundle / "bundle.yaml",
+            {
+                "name": "demo",
+                "repo_path": str(repo),
+                "repo_commit": repo_commit,
+                "task_file": "tasks.yaml",
+                "runner": {"default_harness": "codex", "repetitions": 1},
+            },
+        )
+        write_json_yaml(bundle / "tasks.yaml", {"tasks": [{"id": "t", "prompt": "Dry run.", "assertions": []}]})
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(EVAL_RUNNER),
+                "--bundle",
+                str(bundle),
+                "--results-dir",
+                str(results),
+                "--dry-run",
+            ],
+            check=False,
+            encoding="utf-8",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        require(result.returncode == 0, "shared eval runner dry-run should succeed without kb_commit", result)
+        output_files = list((results / "demo").glob("*.json"))
+        require(len(output_files) == 1, "shared eval runner should write one summary JSON", result)
+        summary = json.loads(output_files[0].read_text(encoding="utf-8"))
+        require(summary["kb_mode"] == "shared", "shared eval summary should record shared KB mode")
+        require(summary["kb_commit"] == repo_commit, "shared eval summary should use repo_commit as kb_commit provenance")
 
 
 # Checks that the eval runner reports pinned workspace restoration failures clearly.
@@ -1479,6 +1530,22 @@ def test_eval_runner_behavior_and_judge_parsers() -> None:
     require(scored["passed"] is True, "Codex shell reads should satisfy tool_read")
     scored = runner.score_behavior_assertion({"id": "no-edit", "check": "no_edit"}, codex_parsed["tool_calls"])
     require(scored["passed"] is False, "Codex apply_patch should fail no_edit")
+    codex_meta_model_stream = json.dumps({"type": "session_meta", "payload": {"model_slug": "gpt-5-session"}})
+    codex_meta_parsed = runner.parse_codex_stream(codex_meta_model_stream)
+    require(codex_meta_parsed["actual_model"] == "gpt-5-session", "Codex parser should capture model_slug from session metadata")
+    require(
+        runner.stderr_warnings("websocket connection reset by peer") == [
+            {
+                "code": "websocket_connection_reset",
+                "message": "stderr reported a websocket connection reset that the CLI recovered from",
+            }
+        ],
+        "stderr warning parser should flag websocket connection resets",
+    )
+    require(
+        runner.provenance_warnings({"actual_model": None})[0]["code"] == "actual_model_missing",
+        "provenance warning parser should flag missing actual_model",
+    )
     with tempfile.TemporaryDirectory(prefix="agent-kb-rollout-") as rollout_tmp:
         rollout = Path(rollout_tmp) / "rollout.jsonl"
         write_jsonl(
@@ -1813,6 +1880,7 @@ def main() -> int:
         test_stats_backfills_kb_reads,
         test_compliance_analyzer_synthetic_transcripts,
         test_eval_runner_dry_run,
+        test_eval_runner_shared_kb_dry_run,
         test_eval_runner_rejects_bad_pin,
         test_eval_runner_behavior_and_judge_parsers,
         test_eval_runner_calibration_from_raw,
