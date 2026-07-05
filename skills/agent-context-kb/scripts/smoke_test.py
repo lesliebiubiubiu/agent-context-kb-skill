@@ -1459,6 +1459,36 @@ def test_eval_runner_behavior_and_judge_parsers() -> None:
     codex_judged = runner.parse_judge_output(codex_judge_stdout)
     require(codex_judged["assertions"][0]["passed"] is False, "judge parser should parse Codex JSONL output")
     require(codex_judged["actual_model"] == "gpt-5-test", "judge parser should capture Codex model")
+    codex_agent_message_stdout = "\n".join(
+        [
+            json.dumps({"type": "turn.started", "model": "gpt-5-test"}),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "agent_message",
+                        "text": json.dumps(
+                            {
+                                "assertions": [
+                                    {
+                                        "id": "semantic",
+                                        "passed": True,
+                                        "reason": "Matches.",
+                                        "confidence": 0.9,
+                                    }
+                                ]
+                            }
+                        ),
+                    },
+                }
+            ),
+        ]
+    )
+    codex_agent_message_judged = runner.parse_judge_output(codex_agent_message_stdout)
+    require(
+        codex_agent_message_judged["assertions"][0]["passed"] is True,
+        "judge parser should parse Codex agent_message JSONL output",
+    )
     with tempfile.TemporaryDirectory(prefix="agent-kb-eval-") as tmp:
         base = Path(tmp)
         captured = {}

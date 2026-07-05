@@ -242,7 +242,7 @@ def extract_tool_calls(value) -> list[dict]:
 def extract_text_parts(value) -> list[str]:
     parts = []
     if isinstance(value, dict):
-        if value.get("type") in {"text", "output_text"} and isinstance(value.get("text"), str):
+        if value.get("type") in {"text", "output_text", "agent_message"} and isinstance(value.get("text"), str):
             parts.append(value["text"])
         for child in value.values():
             parts.extend(extract_text_parts(child))

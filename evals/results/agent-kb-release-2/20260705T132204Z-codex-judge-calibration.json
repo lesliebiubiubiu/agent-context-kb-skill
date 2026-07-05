@@ -1,0 +1,62 @@
+{
+  "agreement": {
+    "agreed": 0,
+    "compared": 0,
+    "rate": null
+  },
+  "bundle": "agent-kb-release-2",
+  "generated_at": "2026-07-05T13:22:18+00:00",
+  "judge": "codex",
+  "rows": [
+    {
+      "agreement": null,
+      "assertion_id": "keeps-feature-freeze",
+      "judge_provenance": {
+        "actual_model": null,
+        "cli_version": "codex-cli 0.142.5",
+        "effort": "medium",
+        "harness": "codex",
+        "max_turns": null,
+        "prompt_template_sha256": "7041fe15d4dd73f252c10d73866979b3635ef8273baeb3b36c69c56289bf9196",
+        "requested_model": "gpt-5.5"
+      },
+      "judge_raw_artifacts": {
+        "stderr": ".raw/agent-kb-release-2/20260705T132204Z/respect-current-release-focus-r1-judge.stderr.txt",
+        "stdout": ".raw/agent-kb-release-2/20260705T132204Z/respect-current-release-focus-r1-judge.stdout.jsonl"
+      },
+      "judge_status": "error",
+      "new_passed": null,
+      "new_reason": null,
+      "old_passed": false,
+      "old_reason": "The agent_answer is empty, so it makes no statement at all about keeping new user-facing features out of scope until validation/utility-eval data exists. The reference plan explicitly requires a feature freeze until utility eval shows positive signal, but the empty answer neither identifies the next step nor upholds this freeze.",
+      "repetition": 1,
+      "task_id": "respect-current-release-focus"
+    },
+    {
+      "agreement": null,
+      "assertion_id": "keeps-semantic-work-with-agent",
+      "judge_provenance": {
+        "actual_model": null,
+        "cli_version": "codex-cli 0.142.5",
+        "effort": "medium",
+        "harness": "codex",
+        "max_turns": null,
+        "prompt_template_sha256": "7041fe15d4dd73f252c10d73866979b3635ef8273baeb3b36c69c56289bf9196",
+        "requested_model": "gpt-5.5"
+      },
+      "judge_raw_artifacts": {
+        "stderr": ".raw/agent-kb-release-2/20260705T132204Z/respect-trim-control-boundary-r1-judge.stderr.txt",
+        "stdout": ".raw/agent-kb-release-2/20260705T132204Z/respect-trim-control-boundary-r1-judge.stdout.jsonl"
+      },
+      "judge_status": "error",
+      "new_passed": null,
+      "new_reason": null,
+      "old_passed": false,
+      "old_reason": "The agent_answer is empty, so it makes no claim that semantic merges remain agent judgment while trim --write performs only deterministic reversible cleanup. Nothing satisfies the assertion.",
+      "repetition": 1,
+      "task_id": "respect-trim-control-boundary"
+    }
+  ],
+  "run_id": "20260705T132204Z",
+  "source_summary": "/Users/lsl/Desktop/agent-context-kb-skill/evals/results/agent-kb-release-2/20260705T101928Z-claude.json"
+}
