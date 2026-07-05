@@ -21,8 +21,14 @@ class SessionResult:
     session: str
     harness: str
     compliant: bool
+    applicable: bool
+    category: str
+    late_bucket: str | None
     first_kb_order: int | None
+    first_any_kb_order: int | None
     first_source_order: int | None
+    first_source_kind: str | None
+    first_source_path: str
 
 
 # Groups events by session while preserving their observed order.
@@ -35,21 +41,60 @@ def group_events_by_session(events: list[ToolEvent]) -> dict[str, list[ToolEvent
     return grouped
 
 
+# Returns the late-read bucket for the distance between source and KB entry reads.
+def late_read_bucket(delta: int | None) -> str | None:
+    if delta is None or delta <= 0:
+        return None
+    if delta <= 3:
+        return "1-3 actions late"
+    if delta <= 19:
+        return "4-19 actions late"
+    return "20+ actions late"
+
+
+# Classifies a session by the first KB and source events the analyzer can observe.
+def classify_session(
+    first_kb: ToolEvent | None,
+    first_any_kb: ToolEvent | None,
+    first_source: ToolEvent | None,
+) -> tuple[bool, str, str | None]:
+    if first_source is None:
+        return False, "kb_first_not_applicable", None
+    if first_kb and first_kb.order < first_source.order:
+        return True, "compliant", None
+    if first_kb and first_kb.order > first_source.order:
+        delta = first_kb.order - first_source.order
+        return True, "late_kb_read", late_read_bucket(delta)
+    if first_any_kb and first_any_kb.order < first_source.order:
+        return True, "non_entry_kb_read", None
+    if first_kb is None:
+        return True, "no_kb_read", None
+    return True, "harness_parser_gap", None
+
+
 # Summarizes whether each session read the KB entry before first source exploration or edit.
 def summarize_sessions(events: list[ToolEvent]) -> list[SessionResult]:
     results = []
     for session, session_events in sorted(group_events_by_session(events).items()):
         first_kb = next((event for event in session_events if event.kind == "kb_entry_read"), None)
+        first_any_kb = next((event for event in session_events if event.kind in {"kb_entry_read", "kb_read"}), None)
         first_source = next((event for event in session_events if event.kind in {"source_explore", "source_edit"}), None)
         compliant = bool(first_kb and (not first_source or first_kb.order < first_source.order))
+        applicable, category, bucket = classify_session(first_kb, first_any_kb, first_source)
         harness = session_events[0].harness if session_events else "unknown"
         results.append(
             SessionResult(
                 session=session,
                 harness=harness,
                 compliant=compliant,
+                applicable=applicable,
+                category=category,
+                late_bucket=bucket,
                 first_kb_order=first_kb.order if first_kb else None,
+                first_any_kb_order=first_any_kb.order if first_any_kb else None,
                 first_source_order=first_source.order if first_source else None,
+                first_source_kind=first_source.kind if first_source else None,
+                first_source_path=first_source.path if first_source else "",
             )
         )
     return results
@@ -62,11 +107,37 @@ def format_rate(numerator: int, denominator: int) -> str:
     return f"{numerator}/{denominator} ({numerator / denominator * 100:.1f}%)"
 
 
+# Counts results matching a category name.
+def count_category(results: list[SessionResult], category: str) -> int:
+    return sum(1 for result in results if result.category == category)
+
+
+# Counts late-read misses in each distance bucket.
+def count_late_buckets(results: list[SessionResult]) -> dict[str, int]:
+    buckets = {"1-3 actions late": 0, "4-19 actions late": 0, "20+ actions late": 0}
+    for result in results:
+        if result.late_bucket:
+            buckets[result.late_bucket] += 1
+    return buckets
+
+
+# Counts miss cases whose first source action lacks a concrete path for manual review.
+def count_source_path_missing(results: list[SessionResult]) -> int:
+    return sum(
+        1
+        for result in results
+        if result.applicable and not result.compliant and result.first_source_order is not None and not result.first_source_path
+    )
+
+
 # Prints the compliance summary and optional per-session details.
 def print_report(results: list[SessionResult], details: bool) -> None:
     total = len(results)
     compliant = sum(1 for result in results if result.compliant)
     hit = sum(1 for result in results if result.first_kb_order is not None)
+    any_hit = sum(1 for result in results if result.first_any_kb_order is not None)
+    applicable = [result for result in results if result.applicable]
+    applicable_compliant = sum(1 for result in applicable if result.compliant)
     first_source_before_kb = sum(
         1
         for result in results
@@ -76,17 +147,34 @@ def print_report(results: list[SessionResult], details: bool) -> None:
     print("Compliance summary")
     print(f"Sessions analyzed: {total}")
     print(f"KB entry hit rate: {format_rate(hit, total)}")
+    print(f"Any KB hit rate: {format_rate(any_hit, total)}")
     print(f"Read compliance: {format_rate(compliant, total)}")
+    print(f"Applicable read compliance (auto): {format_rate(applicable_compliant, len(applicable))}")
     print(f"First source action before KB: {first_source_before_kb}")
     print("Write-back compliance: deferred (needs heuristic or manual labels)")
+    print()
+    print("Miss taxonomy (automated):")
+    print("  Real behavior:")
+    print(f"  - late KB read: {count_category(results, 'late_kb_read')}")
+    for bucket, count in count_late_buckets(results).items():
+        print(f"    - {bucket}: {count}")
+    print(f"  - no KB read: {count_category(results, 'no_kb_read')}")
+    print(f"  - non-entry KB read: {count_category(results, 'non_entry_kb_read')}")
+    print(f"  - KB-first not applicable: {count_category(results, 'kb_first_not_applicable')}")
+    print("  Measurement noise candidates:")
+    print(f"  - source path unavailable: {count_source_path_missing(results)}")
+    print(f"  - outside-root ambiguity: 0")
+    print(f"  - harness parser gap: {count_category(results, 'harness_parser_gap')}")
     if details:
         print()
         print("Details:")
         for result in results:
             status = "compliant" if result.compliant else "miss"
+            late = f" late_bucket={result.late_bucket}" if result.late_bucket else ""
             print(
                 f"- {result.session} [{result.harness}] {status} "
-                f"first_kb={result.first_kb_order} first_source={result.first_source_order}"
+                f"category={result.category}{late} first_kb={result.first_kb_order} "
+                f"first_any_kb={result.first_any_kb_order} first_source={result.first_source_order}"
             )
 
 

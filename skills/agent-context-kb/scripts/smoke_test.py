@@ -956,12 +956,87 @@ def test_compliance_analyzer_synthetic_transcripts() -> None:
                 },
             ],
         )
+        write_jsonl(
+            codex_dir / "2026" / "07" / "05" / "rollout-non-entry-kb.jsonl",
+            [
+                {"timestamp": "2026-07-05T00:00:00Z", "type": "session_meta", "payload": {"cwd": str(root)}},
+                {
+                    "timestamp": "2026-07-05T00:00:01Z",
+                    "type": "function_call",
+                    "payload": {
+                        "name": "functions.exec_command",
+                        "arguments": json.dumps(
+                            {"cmd": "sed -n '1,40p' .agent-kb/workflows/local-dev.md", "workdir": str(root)}
+                        ),
+                    },
+                },
+                {
+                    "timestamp": "2026-07-05T00:00:02Z",
+                    "type": "function_call",
+                    "payload": {
+                        "name": "functions.exec_command",
+                        "arguments": json.dumps({"cmd": "rg print src.py", "workdir": str(root)}),
+                    },
+                },
+            ],
+        )
+        late_records = [
+            {"timestamp": "2026-07-05T00:00:00Z", "type": "session_meta", "payload": {"cwd": str(root)}},
+            {
+                "timestamp": "2026-07-05T00:00:01Z",
+                "type": "function_call",
+                "payload": {
+                    "name": "functions.exec_command",
+                    "arguments": json.dumps({"cmd": "rg print src.py", "workdir": str(root)}),
+                },
+            },
+        ]
+        late_records.extend(
+            {
+                "timestamp": f"2026-07-05T00:00:{second:02d}Z",
+                "type": "function_call",
+                "payload": {
+                    "name": "functions.exec_command",
+                    "arguments": json.dumps({"cmd": "date", "workdir": str(root)}),
+                },
+            }
+            for second in range(2, 25)
+        )
+        late_records.append(
+            {
+                "timestamp": "2026-07-05T00:00:25Z",
+                "type": "function_call",
+                "payload": {
+                    "name": "functions.exec_command",
+                    "arguments": json.dumps({"cmd": "sed -n '1,40p' .agent-kb/start.md", "workdir": str(root)}),
+                },
+            }
+        )
+        write_jsonl(codex_dir / "2026" / "07" / "05" / "rollout-late-long.jsonl", late_records)
 
         result = run_compliance(root, claude_dir, codex_dir, "--details")
         require(result.returncode == 0, "compliance analyzer should succeed", result)
-        require("Sessions analyzed: 7" in result.stdout, "analyzer should count all synthetic sessions", result)
-        require("Read compliance: 4/7 (57.1%)" in result.stdout, "analyzer should report compliant sessions", result)
-        require("First source action before KB: 3" in result.stdout, "analyzer should report pre-KB source actions", result)
+        require("Sessions analyzed: 9" in result.stdout, "analyzer should count all synthetic sessions", result)
+        require("KB entry hit rate: 6/9 (66.7%)" in result.stdout, "analyzer should report entry reads", result)
+        require("Any KB hit rate: 7/9 (77.8%)" in result.stdout, "analyzer should report all KB reads", result)
+        require("Read compliance: 4/9 (44.4%)" in result.stdout, "analyzer should report raw compliant sessions", result)
+        require(
+            "Applicable read compliance (auto): 1/6 (16.7%)" in result.stdout,
+            "analyzer should report auto-applicable compliance",
+            result,
+        )
+        require("First source action before KB: 5" in result.stdout, "analyzer should report pre-KB source actions", result)
+        require("late KB read: 2" in result.stdout, "analyzer should classify late reads", result)
+        require("1-3 actions late: 1" in result.stdout, "analyzer should bucket short late reads", result)
+        require("20+ actions late: 1" in result.stdout, "analyzer should bucket long late reads", result)
+        require("no KB read: 2" in result.stdout, "analyzer should classify missing KB reads", result)
+        require("non-entry KB read: 1" in result.stdout, "analyzer should classify non-entry KB reads", result)
+        require(
+            "KB-first not applicable: 3" in result.stdout,
+            "analyzer should count sessions without source actions separately",
+            result,
+        )
+        require("category=late_kb_read late_bucket=20+ actions late" in result.stdout, "details should include late bucket")
         require(
             "Write-back compliance: deferred" in result.stdout,
             "analyzer should document that write-back compliance is deferred",

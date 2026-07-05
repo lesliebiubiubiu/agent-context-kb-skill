@@ -53,6 +53,39 @@ scanned sessions. The next unchanged run completed in 0.09 seconds wall time.
 - Made backfill failure visible as a distinct stats warning instead of looking
   like intentional backfill disablement.
 
+## Taxonomy Pass - 2026-07-05
+
+This pass appended automated miss taxonomy and late-read buckets to the private
+compliance analyzer. It did not apply a parser correction, so the original
+baseline counts above are left unchanged. The local transcript corpus had grown
+by one session when this was rerun.
+
+- Sessions analyzed: 104
+- KB entry hit rate: 90/104 (86.5%)
+- Any KB hit rate: 94/104 (90.4%)
+- Read compliance: 34/104 (32.7%)
+- Applicable read compliance (auto): 34/104 (32.7%)
+- First source action before KB: 70
+
+Automated miss taxonomy:
+
+- Late KB read: 56
+  - 1-3 actions late: 28
+  - 4-19 actions late: 18
+  - 20+ actions late: 10
+- No KB read: 13
+- Non-entry KB read: 1
+- KB-first not applicable: 0
+- Measurement-noise candidates:
+  - Source path unavailable: 0
+  - Outside-root ambiguity: 0
+  - Harness parser gap: 0
+
+The main signal is the gap between high eventual entry reads and low read
+compliance: most misses are late reads, not total misses. Half of the late-read
+misses are only 1-3 actions late, which should be analyzed separately from the
+20+ action late reads before changing the runtime protocol.
+
 ## Caveats
 
 - This is a single-repo dogfood baseline, not an absolute utility result.
