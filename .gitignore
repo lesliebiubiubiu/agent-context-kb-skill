@@ -1,4 +1,8 @@
 .DS_Store
 __pycache__/
 .agent-kb/
-docs/
+docs/*
+!docs/superpowers/
+docs/superpowers/*
+!docs/superpowers/baselines/
+!docs/superpowers/baselines/*.md

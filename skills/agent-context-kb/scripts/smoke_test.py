@@ -13,6 +13,8 @@ from pathlib import Path
 
 SCRIPT = Path(__file__).with_name("agent_kb.py")
 DEV_COMPLIANCE_SCRIPT = Path(__file__).parent / "dev" / "compliance_analyzer.py"
+sys.path.insert(0, str(Path(__file__).parent))
+from transcript_reads import claude_project_name  # noqa: E402
 
 
 # Runs the KB CLI against a temporary repository and captures output for assertions.
@@ -56,6 +58,13 @@ def write_jsonl(path: Path, records: list[dict]) -> None:
 # Builds the fixture Claude project directory with the observed dot-to-dash encoding.
 def fixture_claude_project_name(root: Path) -> str:
     return re.sub(r"[^A-Za-z0-9]", "-", str(root.resolve()))
+
+
+# Checks Claude's observed project-directory encoding for punctuation-heavy paths.
+def test_claude_project_name_observed_encoding() -> None:
+    root = Path("/Users/lsl/Desktop/glucose/.claude/worktrees/rustling_jumping_volcano")
+    expected = "-Users-lsl-Desktop-glucose--claude-worktrees-rustling-jumping-volcano"
+    require(claude_project_name(root) == expected, "Claude project encoding should replace non-alphanumerics")
 
 
 # Fails the smoke test with command output when an expected condition is false.
@@ -689,8 +698,55 @@ def test_stats_backfills_kb_reads() -> None:
             [{"timestamp": "2026-07-05T00:00:00Z", "type": "session_meta", "payload": {"cwd": str(root)}}],
         )
         write_jsonl(
+            codex_dir / "2026" / "07" / "05" / "rollout-python-no-read.jsonl",
+            [
+                {"timestamp": "2026-07-05T00:00:00Z", "type": "session_meta", "payload": {"cwd": str(root)}},
+                {
+                    "timestamp": "2026-07-05T00:00:01Z",
+                    "type": "function_call",
+                    "payload": {
+                        "name": "functions.exec_command",
+                        "arguments": json.dumps(
+                            {"cmd": "python3 skills/agent-context-kb/scripts/agent_kb.py validate --root .", "workdir": str(root)}
+                        ),
+                    },
+                },
+            ],
+        )
+        write_jsonl(
+            codex_dir / "2026" / "07" / "05" / "rollout-git-kb-no-read.jsonl",
+            [
+                {"timestamp": "2026-07-05T00:00:00Z", "type": "session_meta", "payload": {"cwd": str(root)}},
+                {
+                    "timestamp": "2026-07-05T00:00:01Z",
+                    "type": "function_call",
+                    "payload": {
+                        "name": "functions.exec_command",
+                        "arguments": json.dumps({"cmd": "git -C .agent-kb commit -m noop", "workdir": str(root)}),
+                    },
+                },
+            ],
+        )
+        write_jsonl(
             codex_dir / "2026" / "07" / "05" / "rollout-subdir-no-read.jsonl",
             [{"timestamp": "2026-07-05T00:00:00Z", "type": "session_meta", "payload": {"cwd": str(subdir)}}],
+        )
+        write_jsonl(
+            codex_dir / "2026" / "07" / "05" / "rollout-response-item-read.jsonl",
+            [
+                {"timestamp": "2026-07-05T00:00:00Z", "type": "session_meta", "payload": {"cwd": str(root)}},
+                {
+                    "timestamp": "2026-07-05T00:00:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "shell",
+                        "arguments": json.dumps(
+                            {"command": ["bash", "-lc", "sed -n '1,40p' .agent-kb/start.md"], "workdir": str(root)}
+                        ),
+                    },
+                },
+            ],
         )
 
         result = run_cli(
@@ -706,8 +762,8 @@ def test_stats_backfills_kb_reads() -> None:
             "10",
         )
         require(result.returncode == 0, "stats with transcript backfill should succeed", result)
-        require("Backfilled KB reads: 2 new event(s)." in result.stdout, "stats should backfill two KB reads", result)
-        require("KB hit rate: 2/4 (50.0%)" in result.stdout, "stats should report hit rate with non-read denominator", result)
+        require("Backfilled KB reads: 3 new event(s)." in result.stdout, "stats should backfill three KB reads", result)
+        require("KB hit rate: 3/7 (42.9%)" in result.stdout, "stats should report hit rate with non-read denominator", result)
         require("start.md" in result.stdout and "routes.yaml" in result.stdout, "stats should show read KB files", result)
         require("Dead knowledge candidates" in result.stdout, "stats should report dead knowledge candidates", result)
 
@@ -723,7 +779,7 @@ def test_stats_backfills_kb_reads() -> None:
         require("Backfilled KB reads: 0 new event(s)." in result.stdout, "stats backfill should be idempotent", result)
         log = (root / ".agent-kb" / ".log" / "events.jsonl").read_text(encoding="utf-8")
         read_events = [json.loads(line) for line in log.splitlines() if '"event": "kb_read"' in line]
-        require(len(read_events) == 2, "event log should contain exactly two deduped kb_read events")
+        require(len(read_events) == 3, "event log should contain exactly three deduped kb_read events")
 
 
 # Checks that the private compliance analyzer parses synthetic Claude and Codex transcripts.
@@ -813,12 +869,99 @@ def test_compliance_analyzer_synthetic_transcripts() -> None:
                 },
             ],
         )
+        write_jsonl(
+            codex_dir / "2026" / "07" / "05" / "rollout-python-then-read.jsonl",
+            [
+                {"timestamp": "2026-07-05T00:00:00Z", "type": "session_meta", "payload": {"cwd": str(root)}},
+                {
+                    "timestamp": "2026-07-05T00:00:01Z",
+                    "type": "function_call",
+                    "payload": {
+                        "name": "functions.exec_command",
+                        "arguments": json.dumps(
+                            {"cmd": "python3 skills/agent-context-kb/scripts/agent_kb.py validate --root .", "workdir": str(root)}
+                        ),
+                    },
+                },
+                {
+                    "timestamp": "2026-07-05T00:00:02Z",
+                    "type": "function_call",
+                    "payload": {
+                        "name": "functions.exec_command",
+                        "arguments": json.dumps({"cmd": "sed -n '1,40p' .agent-kb/start.md", "workdir": str(root)}),
+                    },
+                },
+            ],
+        )
+        write_jsonl(
+            codex_dir / "2026" / "07" / "05" / "rollout-git-kb-then-source.jsonl",
+            [
+                {"timestamp": "2026-07-05T00:00:00Z", "type": "session_meta", "payload": {"cwd": str(root)}},
+                {
+                    "timestamp": "2026-07-05T00:00:01Z",
+                    "type": "function_call",
+                    "payload": {
+                        "name": "functions.exec_command",
+                        "arguments": json.dumps({"cmd": "git -C .agent-kb commit -m noop", "workdir": str(root)}),
+                    },
+                },
+                {
+                    "timestamp": "2026-07-05T00:00:02Z",
+                    "type": "function_call",
+                    "payload": {
+                        "name": "functions.exec_command",
+                        "arguments": json.dumps({"cmd": "rg print src.py", "workdir": str(root)}),
+                    },
+                },
+            ],
+        )
+        outside = base / "outside"
+        outside.mkdir()
+        write_jsonl(
+            codex_dir / "2026" / "07" / "05" / "rollout-outside-then-kb.jsonl",
+            [
+                {"timestamp": "2026-07-05T00:00:00Z", "type": "session_meta", "payload": {"cwd": str(outside)}},
+                {
+                    "timestamp": "2026-07-05T00:00:01Z",
+                    "type": "function_call",
+                    "payload": {
+                        "name": "functions.exec_command",
+                        "arguments": json.dumps({"cmd": "rg print outside.py", "workdir": str(outside)}),
+                    },
+                },
+                {
+                    "timestamp": "2026-07-05T00:00:02Z",
+                    "type": "function_call",
+                    "payload": {
+                        "name": "functions.exec_command",
+                        "arguments": json.dumps({"cmd": "sed -n '1,40p' .agent-kb/start.md", "workdir": str(root)}),
+                    },
+                },
+            ],
+        )
+        write_jsonl(
+            codex_dir / "2026" / "07" / "05" / "rollout-response-item-read.jsonl",
+            [
+                {"timestamp": "2026-07-05T00:00:00Z", "type": "session_meta", "payload": {"cwd": str(root)}},
+                {
+                    "timestamp": "2026-07-05T00:00:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "shell",
+                        "arguments": json.dumps(
+                            {"command": ["bash", "-lc", "sed -n '1,40p' .agent-kb/routes.yaml"], "workdir": str(root)}
+                        ),
+                    },
+                },
+            ],
+        )
 
         result = run_compliance(root, claude_dir, codex_dir, "--details")
         require(result.returncode == 0, "compliance analyzer should succeed", result)
-        require("Sessions analyzed: 3" in result.stdout, "analyzer should count all synthetic sessions", result)
-        require("Read compliance: 1/3 (33.3%)" in result.stdout, "analyzer should report one compliant session", result)
-        require("First source action before KB: 2" in result.stdout, "analyzer should report pre-KB source actions", result)
+        require("Sessions analyzed: 7" in result.stdout, "analyzer should count all synthetic sessions", result)
+        require("Read compliance: 4/7 (57.1%)" in result.stdout, "analyzer should report compliant sessions", result)
+        require("First source action before KB: 3" in result.stdout, "analyzer should report pre-KB source actions", result)
         require(
             "Write-back compliance: deferred" in result.stdout,
             "analyzer should document that write-back compliance is deferred",
@@ -861,6 +1004,7 @@ def test_init_versioning_modes() -> None:
 # Runs all smoke tests and prints a compact success line.
 def main() -> int:
     tests = [
+        test_claude_project_name_observed_encoding,
         test_compile_format,
         test_empty_note_body,
         test_path_traversal_target,

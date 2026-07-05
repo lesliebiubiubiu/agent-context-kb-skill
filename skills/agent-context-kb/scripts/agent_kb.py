@@ -12,7 +12,16 @@ import subprocess
 import sys
 from pathlib import Path
 
-from transcript_reads import KbReadEvent, TranscriptScan, resolve_path as resolve_transcript_path, scan_transcripts
+from transcript_reads import (
+    KbReadEvent,
+    TranscriptScan,
+    claude_transcript_paths,
+    parse_claude_transcript,
+    parse_codex_transcript,
+    resolve_path as resolve_transcript_path,
+    transcript_mentions,
+    transcript_paths,
+)
 
 
 # KB scaffold schema version. Bump only when the on-disk KB layout/templates
@@ -231,6 +240,7 @@ TRIM_MAX_INBOX_NOTES = 5
 # Char overage at or above this fraction is "major" (the file likely carries compactable bulk);
 # anything else — including line-only overage — is "minor", an advisory the agent can stop on.
 TRIM_MAJOR_OVERAGE = 0.10
+TRANSCRIPT_CACHE_VERSION = 2
 
 
 # Returns the repository root from an argparse namespace.
@@ -341,12 +351,109 @@ def append_kb_read_events(kb: Path, reads: list[KbReadEvent]) -> int:
     return len(new_events)
 
 
+# Returns the local transcript backfill cache path inside the gitignored KB log directory.
+def transcript_cache_path(kb: Path) -> Path:
+    return kb / ".log" / "transcript-backfill-cache.json"
+
+
+# Reads the local transcript backfill cache, dropping it when the schema version differs.
+def read_transcript_cache(kb: Path) -> dict:
+    path = transcript_cache_path(kb)
+    if not path.exists():
+        return {"version": TRANSCRIPT_CACHE_VERSION, "files": {}}
+    try:
+        cache = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"version": TRANSCRIPT_CACHE_VERSION, "files": {}}
+    if not isinstance(cache, dict) or cache.get("version") != TRANSCRIPT_CACHE_VERSION:
+        return {"version": TRANSCRIPT_CACHE_VERSION, "files": {}}
+    if not isinstance(cache.get("files"), dict):
+        cache["files"] = {}
+    return cache
+
+
+# Writes the local transcript backfill cache best-effort so stats never fails because of caching.
+def write_transcript_cache(kb: Path, cache: dict) -> None:
+    try:
+        path = transcript_cache_path(kb)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(cache, sort_keys=True) + "\n", encoding="utf-8")
+    except OSError:
+        return
+
+
+# Builds a cheap file signature for deciding whether a transcript needs reparsing.
+def transcript_signature(path: Path) -> dict | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return {"mtime_ns": stat.st_mtime_ns, "size": stat.st_size}
+
+
+# Converts one transcript scan into a cache entry that keeps only denominator-safe session data.
+def transcript_cache_entry(harness: str, signature: dict, scan: TranscriptScan) -> dict:
+    return {
+        "harness": harness,
+        "mtime_ns": signature["mtime_ns"],
+        "size": signature["size"],
+        "sessions": sorted(scan.sessions),
+    }
+
+
+# Scans changed transcript files and reuses cached session ownership for unchanged files.
+def scan_transcripts_incremental(root: Path, kb: Path, claude_dir: Path | None, codex_dir: Path | None) -> TranscriptScan:
+    cache = read_transcript_cache(kb)
+    cached_files = cache.get("files", {})
+    next_files: dict[str, dict] = {}
+    sessions: set[str] = set()
+    reads: list[KbReadEvent] = []
+    codex_needles = {str(root), root.name, ".agent-kb"}
+
+    # Parses one transcript when changed, otherwise restores its cached root-owned sessions.
+    def scan_path(path: Path, harness: str, needs_mention: bool) -> None:
+        signature = transcript_signature(path)
+        if signature is None:
+            return
+        key = str(path)
+        cached = cached_files.get(key) if isinstance(cached_files, dict) else None
+        if (
+            isinstance(cached, dict)
+            and cached.get("harness") == harness
+            and cached.get("mtime_ns") == signature["mtime_ns"]
+            and cached.get("size") == signature["size"]
+        ):
+            sessions.update(str(session) for session in cached.get("sessions", []))
+            next_files[key] = cached
+            return
+        if needs_mention and not transcript_mentions(path, codex_needles):
+            scan = TranscriptScan(set(), [])
+        elif harness == "claude":
+            scan = parse_claude_transcript(path, root)
+        else:
+            scan = parse_codex_transcript(path, root)
+        sessions.update(scan.sessions)
+        reads.extend(scan.reads)
+        next_files[key] = transcript_cache_entry(harness, signature, scan)
+
+    if claude_dir is not None:
+        for path in claude_transcript_paths(claude_dir, root):
+            scan_path(path, "claude", False)
+    if codex_dir is not None:
+        for path in transcript_paths(codex_dir):
+            scan_path(path, "codex", True)
+
+    write_transcript_cache(kb, {"version": TRANSCRIPT_CACHE_VERSION, "files": next_files})
+    return TranscriptScan(sessions, reads)
+
+
 # Scans transcripts for this repo and backfills KB read events into the local event log.
 def backfill_kb_reads(root: Path, args: argparse.Namespace) -> tuple[TranscriptScan, int]:
+    kb = kb_dir(root)
     claude_dir = None if args.no_backfill_claude else resolve_transcript_path(args.claude_dir)
     codex_dir = None if args.no_backfill_codex else resolve_transcript_path(args.codex_dir)
-    scan = scan_transcripts(root, claude_dir, codex_dir)
-    added = append_kb_read_events(kb_dir(root), scan.reads)
+    scan = scan_transcripts_incremental(root, kb, claude_dir, codex_dir)
+    added = append_kb_read_events(kb, scan.reads)
     return scan, added
 
 
@@ -1599,13 +1706,22 @@ def format_rate(numerator: int, denominator: int) -> str:
 
 
 # Prints read-observability metrics from transcript backfill and logged KB read events.
-def print_kb_read_stats(kb: Path, events: list[dict], scan: TranscriptScan | None, top: int, dead_sessions: int) -> None:
+def print_kb_read_stats(
+    kb: Path,
+    events: list[dict],
+    scan: TranscriptScan | None,
+    top: int,
+    dead_sessions: int,
+    backfill_error: str | None = None,
+) -> None:
     read_events = [event for event in events if event.get("event") == "kb_read"]
     print("KB read usage (transcript backfill):")
-    if scan is None:
+    if backfill_error:
+        print(f"  (backfill failed: {backfill_error})")
+    elif scan is None:
         print("  (backfill disabled)")
     else:
-        hit_sessions = {read.session for read in scan.reads}
+        hit_sessions = {str(event.get("session", "")) for event in read_events if str(event.get("session", "")) in scan.sessions}
         print(f"  scanned sessions: {len(scan.sessions)}")
         print(f"  KB hit rate: {format_rate(len(hit_sessions), len(scan.sessions))}")
     if not read_events:
@@ -1648,11 +1764,12 @@ def command_stats(args: argparse.Namespace) -> int:
         return 1
     scan: TranscriptScan | None = None
     added = 0
+    backfill_error = None
     if not args.no_backfill:
         try:
             scan, added = backfill_kb_reads(root, args)
         except Exception as err:
-            print(f"Backfill failed: {err}")
+            backfill_error = str(err)
             scan, added = None, 0
 
     print("CLI command usage (.agent-kb/.log/events.jsonl):")
@@ -1676,7 +1793,7 @@ def command_stats(args: argparse.Namespace) -> int:
     print()
     if scan is not None:
         print(f"Backfilled KB reads: {added} new event(s).")
-    print_kb_read_stats(kb, events, scan, args.top, args.dead_sessions)
+    print_kb_read_stats(kb, events, scan, args.top, args.dead_sessions, backfill_error)
 
     print()
     print("KB file churn (git history):")
