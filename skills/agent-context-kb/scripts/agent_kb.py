@@ -237,6 +237,9 @@ TRIM_MAX_FILE_LINES = 120
 TRIM_MAX_FILE_CHARS = 14000
 TRIM_MAX_TOTAL_CHARS = 20000
 TRIM_MAX_INBOX_NOTES = 5
+TRIM_MAX_LINK_DEPTH = 3
+TRIM_MAX_DOC_FANOUT = 10
+TRIM_MAX_ROUTES = 15
 # Char overage at or above this fraction is "major" (the file likely carries compactable bulk);
 # anything else — including line-only overage — is "minor", an advisory the agent can stop on.
 TRIM_MAJOR_OVERAGE = 0.10
@@ -1419,25 +1422,62 @@ def linked_docs_from(path: Path, kb: Path) -> list[Path]:
     return links
 
 
-# Computes topic documents reachable from map routes and reachable Markdown links.
-def reachable_docs(kb: Path, rows: list[tuple[str, str, str]]) -> set[Path]:
-    reachable: set[Path] = set()
-    queue: deque[Path] = deque()
+# Computes each document's shallowest route-link depth by BFS from route entry paths.
+def reachable_doc_depths(kb: Path, rows: list[tuple[str, str, str]]) -> dict[Path, int]:
+    depths: dict[Path, int] = {}
+    queue: deque[tuple[Path, int]] = deque()
     for _, read_first, also_consider in rows:
         for raw in split_path_cell(read_first) + split_path_cell(also_consider):
             normalized = normalize_kb_path(raw)
             if normalized and (kb / normalized).exists():
-                queue.append(normalized)
+                queue.append((normalized, 0))
 
     while queue:
-        relative = queue.popleft()
-        if relative in reachable:
+        relative, depth = queue.popleft()
+        if relative in depths:
             continue
-        reachable.add(relative)
+        depths[relative] = depth
         path = kb / relative
         if path.exists() and path.suffix == ".md":
-            queue.extend(linked_docs_from(path, kb))
-    return reachable
+            queue.extend((link, depth + 1) for link in linked_docs_from(path, kb))
+    return depths
+
+
+# Computes topic documents reachable from map routes and reachable Markdown links.
+def reachable_docs(kb: Path, rows: list[tuple[str, str, str]]) -> set[Path]:
+    return set(reachable_doc_depths(kb, rows))
+
+
+# Builds trim-only structure advisories from graph depth, per-doc fanout, and route count budgets.
+def trim_structure_report(kb: Path, routes: list[dict[str, object]]) -> dict:
+    rows = rows_from_routes(routes)
+    depths = reachable_doc_depths(kb, rows)
+    stable_relatives = {path.relative_to(kb) for path in stable_topic_docs(kb)}
+    deep_docs = [
+        (relative, depths[relative])
+        for relative in stable_relatives
+        if relative in depths and depths[relative] > TRIM_MAX_LINK_DEPTH
+    ]
+    deep_docs.sort(key=lambda item: (item[1], str(item[0])), reverse=True)
+
+    hubs = []
+    for path in stable_topic_docs(kb):
+        fanout = len(linked_docs_from(path, kb))
+        if fanout > TRIM_MAX_DOC_FANOUT:
+            hubs.append((path.relative_to(kb), fanout))
+    hubs.sort(key=lambda item: (item[1], str(item[0])), reverse=True)
+
+    route_count = len(routes)
+    return {
+        "deep_docs": deep_docs,
+        "max_depth": TRIM_MAX_LINK_DEPTH,
+        "hubs": hubs,
+        "max_fanout": TRIM_MAX_DOC_FANOUT,
+        "route_count": route_count,
+        "max_routes": TRIM_MAX_ROUTES,
+        "routes_over": route_count > TRIM_MAX_ROUTES,
+        "has_signals": bool(deep_docs or hubs or route_count > TRIM_MAX_ROUTES),
+    }
 
 
 # Validates the KB scaffold, routes, links, inbox notes, and topic reachability.
@@ -1457,7 +1497,7 @@ def command_validate(args: argparse.Namespace) -> tuple[int, dict]:
     return 0, metrics
 
 
-# Diagnoses or applies safe deterministic KB trimming.
+# Diagnoses or applies safe deterministic KB trimming, reporting advisory graph signals without making them blockers.
 def command_trim(args: argparse.Namespace) -> int:
     root = repo_root(args)
     kb = kb_dir(root)
@@ -1476,6 +1516,7 @@ def command_trim(args: argparse.Namespace) -> int:
     report = trim_size_report(
         kb, args.max_file_lines, args.max_file_chars, args.max_total_chars, args.max_inbox_notes
     )
+    structure_report = trim_structure_report(kb, routes)
     compact_recommended = report["compact_recommended"]
 
     if not args.write:
@@ -1498,7 +1539,8 @@ def command_trim(args: argparse.Namespace) -> int:
 
         cleanup = bool(candidates or husks)
         minor_only = report["minor_only"]
-        if not (cleanup or compact_recommended or minor_only):
+        structure_advisory = structure_report["has_signals"]
+        if not (cleanup or compact_recommended or minor_only or structure_advisory):
             if report["over_budget"]:
                 print("Trim diagnosis: lean (above soft budget).")
                 print(f"  Structure is clean: no oversize files, husks, or inbox backlog. Total "
@@ -1512,6 +1554,7 @@ def command_trim(args: argparse.Namespace) -> int:
                 "husks": 0,
                 "compact": False,
                 "minor_only": False,
+                "structure_advisory": False,
                 "over_budget": report["over_budget"],
                 "total_chars": report["total_chars"],
             }
@@ -1523,6 +1566,8 @@ def command_trim(args: argparse.Namespace) -> int:
             diagnosis = "cleanup + compact recommended" if cleanup else "compact recommended"
         elif cleanup:
             diagnosis = "cleanup recommended"
+        elif structure_advisory:
+            diagnosis = "structure advisories"
         else:
             diagnosis = "minor — optional"
         print(f"Trim diagnosis: {diagnosis}.")
@@ -1539,10 +1584,20 @@ def command_trim(args: argparse.Namespace) -> int:
             print(f"- compact signal: inbox has {report['inbox_count']} notes (max {report['max_inbox_notes']})")
         if report["over_budget"] and show_full_prompt:
             print(f"- soft signal: stable KB docs total {report['total_chars']} chars (above {report['max_total_chars']} soft budget; not a reason to over-compact)")
+        for relative, depth in structure_report["deep_docs"]:
+            print(f"- depth advisory: {relative} is depth {depth} from routes (budget {structure_report['max_depth']})")
+        for relative, fanout in structure_report["hubs"]:
+            print(f"- hub advisory: {relative} links to {fanout} docs (budget {structure_report['max_fanout']}); consider splitting if it mixes tasks")
+        if structure_report["routes_over"]:
+            print(f"- route-count advisory: routes.yaml has {structure_report['route_count']} routes (budget {structure_report['max_routes']})")
         if candidates:
             print()
             print("Next:")
             print(f"  {trim_write_command(args)}")
+        if structure_advisory:
+            print()
+            print("Structure advisories are soft: adjust routes, split hubs, or lift deep docs only")
+            print("when the structure hides recurring tasks; then rerun trim --recheck.")
         if compact_recommended:
             print()
             # Always-on guardrail so it survives even when the full prompt is suppressed in later loop rounds.
@@ -1562,6 +1617,7 @@ def command_trim(args: argparse.Namespace) -> int:
             "husks": len(husks),
             "compact": compact_recommended,
             "minor_only": minor_only,
+            "structure_advisory": structure_advisory,
             "over_budget": report["over_budget"],
             "total_chars": report["total_chars"],
         }

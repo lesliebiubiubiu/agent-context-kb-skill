@@ -650,6 +650,73 @@ def test_trim_write_keeps_linked_empty_topic() -> None:
         require(boundaries.exists(), "linked empty topic should not be auto-deleted")
 
 
+# Writes a synthetic KB whose graph exceeds only the trim structure advisory budgets.
+def write_structural_advisory_kb(root: Path) -> None:
+    kb = root / ".agent-kb"
+    kb.mkdir(parents=True)
+    (kb / "inbox").mkdir()
+    (kb / "start.md").write_text("# Agent KB Start\n", encoding="utf-8")
+    (kb / "map.md").write_text("# KB Map\n", encoding="utf-8")
+
+    # Writes one KB-relative Markdown doc with enough content to avoid scaffold cleanup signals.
+    def write_doc(relative: str, body: str = "Durable note.") -> None:
+        path = kb / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"# {path.stem.title()}\n\n{body}\n", encoding="utf-8")
+
+    write_doc("docs/doc0.md", "See [doc1](doc1.md).")
+    write_doc("docs/doc1.md", "See [doc2](doc2.md).")
+    write_doc("docs/doc2.md", "See [doc3](doc3.md).")
+    write_doc("docs/doc3.md", "See [doc4](doc4.md).")
+    write_doc("docs/doc4.md", "Deep durable note.")
+    hub_links = "\n".join(f"- [leaf {index}](leaf-{index}.md)" for index in range(12))
+    write_doc("docs/hub.md", hub_links)
+    for index in range(12):
+        write_doc(f"docs/leaf-{index}.md")
+    for index in range(14):
+        write_doc(f"routes/entry-{index}.md")
+
+    route_entries = [
+        ("chain", "Deep chain", "docs/doc0.md"),
+        ("hub", "Hub", "docs/hub.md"),
+    ]
+    route_entries.extend((f"route-{index}", f"Route {index}", f"routes/entry-{index}.md") for index in range(14))
+    lines = ["routes:"]
+    for route_id, task, path in route_entries:
+        lines.extend([
+            f"  - id: {route_id}",
+            f"    task: {task}",
+            "    read_first:",
+            f"      - {path}",
+            "    also_consider:",
+        ])
+    (kb / "routes.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+# Checks that trim reports depth, hub fanout, and route-count structure advisories without failing.
+def test_trim_reports_structure_advisories() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        write_structural_advisory_kb(root)
+        result = run_cli(root, "trim")
+        require(result.returncode == 0, "trim structure advisories should be non-blocking", result)
+        require("Trim diagnosis: structure advisories." in result.stdout, "trim should diagnose advisory-only structure signals", result)
+        require("depth advisory: docs/doc4.md is depth 4 from routes (budget 3)" in result.stdout, "trim should report deep reachable docs", result)
+        require("hub advisory: docs/hub.md links to 12 docs (budget 10)" in result.stdout, "trim should report hub fanout", result)
+        require("route-count advisory: routes.yaml has 16 routes (budget 15)" in result.stdout, "trim should report route count overage", result)
+        require("Structure advisories are soft" in result.stdout, "trim should give a soft next instruction", result)
+
+
+# Checks this repository's KB does not trigger the new structural trim advisories.
+def test_trim_structure_advisories_no_self_false_positive() -> None:
+    repo = Path(__file__).resolve().parents[3]
+    result = run_cli(repo, "trim")
+    require(result.returncode == 0, "repo self trim check should succeed", result)
+    require("depth advisory:" not in result.stdout, "repo KB should not trigger depth advisory", result)
+    require("hub advisory:" not in result.stdout, "repo KB should not trigger hub advisory", result)
+    require("route-count advisory:" not in result.stdout, "repo KB should not trigger route-count advisory", result)
+
+
 # Checks that init writes a KB-local .gitignore and upgrade restores it when missing.
 def test_kb_gitignore_init_and_upgrade() -> None:
     with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
@@ -1932,6 +1999,8 @@ def main() -> int:
         test_trim_write_keeps_non_empty_topic,
         test_trim_write_keeps_malformed_topic,
         test_trim_write_keeps_linked_empty_topic,
+        test_trim_reports_structure_advisories,
+        test_trim_structure_advisories_no_self_false_positive,
         test_kb_gitignore_init_and_upgrade,
         test_validate_metrics_and_health,
         test_note_body_redacted_in_log,
