@@ -12,6 +12,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from transcript_reads import KbReadEvent, TranscriptScan, resolve_path as resolve_transcript_path, scan_transcripts
+
 
 # KB scaffold schema version. Bump only when the on-disk KB layout/templates
 # change, so a future `upgrade` can tell what an existing KB was built with.
@@ -296,6 +298,55 @@ def read_events(path: Path) -> list[dict]:
         except json.JSONDecodeError:
             continue
     return events
+
+
+# Builds a stable dedupe key for transcript-backed KB read events.
+def kb_read_event_key(event: dict) -> tuple[str, str, str]:
+    return (str(event.get("session", "")), str(event.get("file", "")), str(event.get("ts", "")))
+
+
+# Converts a transcript read into the shared events.jsonl record shape.
+def kb_read_log_event(read: KbReadEvent) -> dict:
+    return {
+        "ts": read.timestamp,
+        "event": "kb_read",
+        "kind": "kb_read",
+        "source": "backfill",
+        "harness": read.harness,
+        "session": read.session,
+        "file": read.file,
+        "chars": read.chars,
+    }
+
+
+# Appends new KB read events to events.jsonl while deduping by session/file/timestamp.
+def append_kb_read_events(kb: Path, reads: list[KbReadEvent]) -> int:
+    log_path = kb / ".log" / "events.jsonl"
+    existing = {kb_read_event_key(event) for event in read_events(log_path) if event.get("event") == "kb_read"}
+    new_events = []
+    for read in reads:
+        event = kb_read_log_event(read)
+        key = kb_read_event_key(event)
+        if key in existing:
+            continue
+        existing.add(key)
+        new_events.append(event)
+    if not new_events:
+        return 0
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as handle:
+        for event in new_events:
+            handle.write(json.dumps(event) + "\n")
+    return len(new_events)
+
+
+# Scans transcripts for this repo and backfills KB read events into the local event log.
+def backfill_kb_reads(root: Path, args: argparse.Namespace) -> tuple[TranscriptScan, int]:
+    claude_dir = None if args.no_backfill_claude else resolve_transcript_path(args.claude_dir)
+    codex_dir = None if args.no_backfill_codex else resolve_transcript_path(args.codex_dir)
+    scan = scan_transcripts(root, claude_dir, codex_dir)
+    added = append_kb_read_events(kb_dir(root), scan.reads)
+    return scan, added
 
 
 # Treats a logged event as part of the current session if its timestamp falls within the recency window.
@@ -1539,6 +1590,54 @@ def print_bar_chart(rows: list[tuple[str, int, str]], indent: str = "  ", width:
         print(f"{indent}{label:<{label_width}}  {bar:<{width}}  {suffix}")
 
 
+# Formats a numerator and denominator as both count and percentage.
+def format_rate(numerator: int, denominator: int) -> str:
+    if denominator == 0:
+        return "0/0 (n/a)"
+    return f"{numerator}/{denominator} ({numerator / denominator * 100:.1f}%)"
+
+
+# Prints read-observability metrics from transcript backfill and logged KB read events.
+def print_kb_read_stats(kb: Path, events: list[dict], scan: TranscriptScan | None, top: int, dead_sessions: int) -> None:
+    read_events = [event for event in events if event.get("event") == "kb_read"]
+    print("KB read usage (transcript backfill):")
+    if scan is None:
+        print("  (backfill disabled)")
+    else:
+        hit_sessions = {read.session for read in scan.reads}
+        print(f"  scanned sessions: {len(scan.sessions)}")
+        print(f"  KB hit rate: {format_rate(len(hit_sessions), len(scan.sessions))}")
+    if not read_events:
+        print("  (no KB reads logged yet)")
+        return
+
+    chars_by_session: dict[str, int] = {}
+    reads_by_file: dict[str, int] = {}
+    for event in read_events:
+        session = str(event.get("session", ""))
+        file = str(event.get("file", ""))
+        chars = int(event.get("chars") or 0)
+        chars_by_session[session] = chars_by_session.get(session, 0) + chars
+        reads_by_file[file] = reads_by_file.get(file, 0) + 1
+    session_count = max(1, len(chars_by_session))
+    print(f"  estimated KB chars/session: {sum(chars_by_session.values()) // session_count}")
+    rows = [(file, count, str(count)) for file, count in sorted(reads_by_file.items(), key=lambda kv: (-kv[1], kv[0]))]
+    print("  Most-read KB files:")
+    print_bar_chart(rows[:top], indent="    ")
+
+    candidate_pool = scan.sessions if scan is not None else set(chars_by_session)
+    if len(candidate_pool) >= dead_sessions:
+        read_files = set(reads_by_file)
+        dead = [str(path.relative_to(kb)) for path in stable_topic_docs(kb) if str(path.relative_to(kb)) not in read_files]
+        print(f"  Dead knowledge candidates (unread across {len(candidate_pool)} scanned/logged sessions):")
+        for file in dead[:top]:
+            print(f"    - {file}")
+        if not dead:
+            print("    (none)")
+    else:
+        print(f"  Dead knowledge candidates: need at least {dead_sessions} scanned/logged sessions")
+
+
 # Summarizes CLI usage from the event log and KB file churn from git history, drawn as bar charts.
 def command_stats(args: argparse.Namespace) -> int:
     root = repo_root(args)
@@ -1546,14 +1645,22 @@ def command_stats(args: argparse.Namespace) -> int:
     if not kb.exists():
         print("ERROR: missing .agent-kb/")
         return 1
+    scan: TranscriptScan | None = None
+    added = 0
+    if not args.no_backfill:
+        try:
+            scan, added = backfill_kb_reads(root, args)
+        except Exception:
+            scan, added = None, 0
 
     print("CLI command usage (.agent-kb/.log/events.jsonl):")
     events = read_events(kb / ".log" / "events.jsonl")
-    if not events:
+    cli_events = [event for event in events if event.get("event", "cli") == "cli"]
+    if not cli_events:
         print("  (no events logged yet)")
     else:
         counts: dict[str, list[int]] = {}
-        for event in events:
+        for event in cli_events:
             command = str(event.get("command", "?"))
             failed = 1 if event.get("exit", 0) != 0 else 0
             total, fails = counts.get(command, [0, 0])
@@ -1563,6 +1670,11 @@ def command_stats(args: argparse.Namespace) -> int:
             suffix = f"{total}" + (f"  ({fails} failed)" if fails else "")
             rows.append((command, total, suffix))
         print_bar_chart(rows[: args.top])
+
+    print()
+    if scan is not None:
+        print(f"Backfilled KB reads: {added} new event(s).")
+    print_kb_read_stats(kb, events, scan, args.top, args.dead_sessions)
 
     print()
     print("KB file churn (git history):")
@@ -1588,7 +1700,7 @@ def command_stats(args: argparse.Namespace) -> int:
     print()
     print("Latest outcomes (per command):")
     latest_by_command: dict[str, dict] = {}
-    for event in events:
+    for event in cli_events:
         if "metrics" in event:
             latest_by_command[str(event.get("command", "?"))] = event
     if not latest_by_command:
@@ -1648,9 +1760,15 @@ def build_parser() -> argparse.ArgumentParser:
     trim_parser.add_argument("--verbose", action="store_true", help="Always print the full agent compact prompt and soft-budget note (default prints them only on first detection in a loop).")
     trim_parser.set_defaults(func=command_trim)
 
-    stats_parser = subparsers.add_parser("stats", help="Summarize CLI usage and KB file churn.")
+    stats_parser = subparsers.add_parser("stats", help="Summarize CLI usage, KB reads, and KB file churn.")
     stats_parser.add_argument("--root", default=".", help="Repository root to manage.")
     stats_parser.add_argument("--top", type=int, default=5, help="Show at most this many rows per section (default 5).")
+    stats_parser.add_argument("--no-backfill", action="store_true", help="Do not scan local transcripts before rendering stats.")
+    stats_parser.add_argument("--claude-dir", default="~/.claude/projects", help="Claude Code projects transcript directory.")
+    stats_parser.add_argument("--codex-dir", default="~/.codex/sessions", help="Codex sessions transcript directory.")
+    stats_parser.add_argument("--no-backfill-claude", action="store_true", help="Skip Claude Code transcript backfill.")
+    stats_parser.add_argument("--no-backfill-codex", action="store_true", help="Skip Codex transcript backfill.")
+    stats_parser.add_argument("--dead-sessions", type=int, default=20, help="Minimum scanned/logged sessions before listing unread stable docs (default 20).")
     stats_parser.set_defaults(func=command_stats)
     return parser
 

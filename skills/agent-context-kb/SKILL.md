@@ -35,8 +35,8 @@ python3 scripts/agent_kb.py stats --root /path/to/repo
 - `trim`: run it and follow its output. Size is a proxy; compact redundant or
   stale information, and stop when the remaining content is genuinely
   non-redundant. Use `trim --write` only for deterministic cleanup.
-- `stats`: paste its full output verbatim in a fenced code block; the ASCII
-  charts are the deliverable.
+- `stats`: backfills local transcript reads when available. Paste its full
+  output verbatim in a fenced code block; the ASCII charts are the deliverable.
 
 ## Knowledge Rules
 

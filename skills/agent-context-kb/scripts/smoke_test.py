@@ -603,7 +603,7 @@ def test_validate_metrics_and_health() -> None:
         last = validate_events[-1]
         require("args" in last, "event should record redacted args")
         require("metrics" in last and last["metrics"]["warnings"] >= 1, "validate should log a warning-count metric", result)
-        result = run_cli(root, "stats")
+        result = run_cli(root, "stats", "--no-backfill")
         require("Latest outcomes (per command)" in result.stdout, "stats should show the per-command outcomes section", result)
         require("warnings=" in result.stdout, "stats outcomes should show the validate warning count", result)
 
@@ -629,11 +629,89 @@ def test_stats_reports_cli_usage() -> None:
         run_cli(root, "validate")
         log = root / ".agent-kb" / ".log" / "events.jsonl"
         require(log.exists(), "CLI runs should append to the event log")
-        result = run_cli(root, "stats")
+        result = run_cli(root, "stats", "--no-backfill")
         require(result.returncode == 0, "stats should succeed", result)
         require("CLI command usage" in result.stdout, "stats should report command usage", result)
         require("init" in result.stdout and "validate" in result.stdout, "stats should list run commands", result)
         require("KB file churn" in result.stdout, "stats should report the churn section", result)
+
+
+# Checks that stats backfills KB read events from local transcripts and dedupes repeated scans.
+def test_stats_backfills_kb_reads() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        base = Path(tmp)
+        root = base / "repo"
+        root.mkdir()
+        init_root(root)
+        claude_dir = base / "claude" / "projects"
+        codex_dir = base / "codex" / "sessions"
+        write_jsonl(
+            claude_dir / claude_project_name(root) / "session-read.jsonl",
+            [
+                {
+                    "timestamp": "2026-07-05T00:00:00Z",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "name": "Read",
+                                "input": {"file_path": str(root / ".agent-kb" / "start.md")},
+                            }
+                        ]
+                    },
+                }
+            ],
+        )
+        write_jsonl(
+            codex_dir / "2026" / "07" / "05" / "rollout-read.jsonl",
+            [
+                {"timestamp": "2026-07-05T00:00:00Z", "type": "session_meta", "payload": {"cwd": str(root)}},
+                {
+                    "timestamp": "2026-07-05T00:00:01Z",
+                    "type": "function_call",
+                    "payload": {
+                        "name": "functions.exec_command",
+                        "arguments": json.dumps({"cmd": "sed -n '1,40p' .agent-kb/routes.yaml", "workdir": str(root)}),
+                    },
+                },
+            ],
+        )
+        write_jsonl(
+            codex_dir / "2026" / "07" / "05" / "rollout-no-read.jsonl",
+            [{"timestamp": "2026-07-05T00:00:00Z", "type": "session_meta", "payload": {"cwd": str(root)}}],
+        )
+
+        result = run_cli(
+            root,
+            "stats",
+            "--claude-dir",
+            str(claude_dir),
+            "--codex-dir",
+            str(codex_dir),
+            "--dead-sessions",
+            "1",
+            "--top",
+            "10",
+        )
+        require(result.returncode == 0, "stats with transcript backfill should succeed", result)
+        require("Backfilled KB reads: 2 new event(s)." in result.stdout, "stats should backfill two KB reads", result)
+        require("KB hit rate: 2/3 (66.7%)" in result.stdout, "stats should report hit rate with non-read denominator", result)
+        require("start.md" in result.stdout and "routes.yaml" in result.stdout, "stats should show read KB files", result)
+        require("Dead knowledge candidates" in result.stdout, "stats should report dead knowledge candidates", result)
+
+        result = run_cli(
+            root,
+            "stats",
+            "--claude-dir",
+            str(claude_dir),
+            "--codex-dir",
+            str(codex_dir),
+        )
+        require(result.returncode == 0, "second stats backfill should succeed", result)
+        require("Backfilled KB reads: 0 new event(s)." in result.stdout, "stats backfill should be idempotent", result)
+        log = (root / ".agent-kb" / ".log" / "events.jsonl").read_text(encoding="utf-8")
+        read_events = [json.loads(line) for line in log.splitlines() if '"event": "kb_read"' in line]
+        require(len(read_events) == 2, "event log should contain exactly two deduped kb_read events")
 
 
 # Checks that the private compliance analyzer parses synthetic Claude and Codex transcripts.
@@ -776,6 +854,7 @@ def main() -> int:
         test_validate_metrics_and_health,
         test_note_body_redacted_in_log,
         test_stats_reports_cli_usage,
+        test_stats_backfills_kb_reads,
         test_compliance_analyzer_synthetic_transcripts,
         test_init_versioning_modes,
     ]
