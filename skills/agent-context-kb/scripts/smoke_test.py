@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import re
 import subprocess
 import sys
@@ -60,6 +61,15 @@ def write_jsonl(path: Path, records: list[dict]) -> None:
 def write_json_yaml(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+
+
+# Loads the eval runner module so smoke checks can exercise pure parser helpers.
+def load_eval_runner_module():
+    spec = importlib.util.spec_from_file_location("eval_run_bundle", EVAL_RUNNER)
+    require(spec is not None and spec.loader is not None, "eval runner module should be loadable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 # Runs git in a fixture repository and returns stripped stdout.
@@ -1238,6 +1248,7 @@ def test_eval_runner_dry_run() -> None:
             bundle / "bundle.yaml",
             {
                 "name": "demo",
+                "repo_path": str(repo),
                 "repo_commit": repo_commit,
                 "kb_commit": kb_commit,
                 "task_file": "tasks.yaml",
@@ -1251,7 +1262,15 @@ def test_eval_runner_dry_run() -> None:
                     {
                         "id": "dry-run-task",
                         "prompt": "Say this is a dry run.",
-                        "assertions": [{"id": "placeholder", "description": "A judge can score this later."}],
+                        "assertions": [
+                            {
+                                "id": "read-start",
+                                "check": "tool_read",
+                                "path": ".agent-kb/start.md",
+                                "description": "The agent reads the KB start file.",
+                            },
+                            {"id": "placeholder", "check": "judge", "description": "A judge can score this later."},
+                        ],
                     }
                 ]
             },
@@ -1262,8 +1281,6 @@ def test_eval_runner_dry_run() -> None:
                 str(EVAL_RUNNER),
                 "--bundle",
                 str(bundle),
-                "--repo-root",
-                str(repo),
                 "--kb-repo",
                 str(kb_repo),
                 "--results-dir",
@@ -1280,11 +1297,144 @@ def test_eval_runner_dry_run() -> None:
         require(len(output_files) == 1, "eval runner should write one summary JSON", result)
         summary = json.loads(output_files[0].read_text(encoding="utf-8"))
         require(summary["dry_run"] is True, "eval summary should record dry-run mode")
+        require(summary["repo_path"] == str(repo.resolve()), "eval summary should record bundle repo_path")
         require(summary["runs"][0]["agent"]["status"] == "dry_run", "eval summary should avoid agent calls")
         require(
-            summary["runs"][0]["assertions"][0]["status"] == "pending_judge",
-            "eval assertions should be marked for the future judge step",
+            summary["runs"][0]["assertions"][0]["status"] == "dry_run",
+            "eval assertions should be marked dry_run without agent calls",
         )
+        require(not (results / ".raw").exists(), "dry-run should not write raw artifacts")
+
+
+# Checks that the eval runner reports pinned workspace restoration failures clearly.
+def test_eval_runner_rejects_bad_pin() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-eval-") as tmp:
+        base = Path(tmp)
+        repo = base / "repo"
+        kb_repo = base / "kb"
+        repo_commit = create_fixture_commit(repo, {"README.md": "# Fixture\n"})
+        create_fixture_commit(kb_repo, {"start.md": "# Agent KB Start\n"})
+        bundle = base / "bundles" / "demo"
+        results = base / "results"
+        write_json_yaml(
+            bundle / "bundle.yaml",
+            {
+                "name": "demo",
+                "repo_path": str(repo),
+                "repo_commit": repo_commit,
+                "kb_commit": "not-a-real-commit",
+                "task_file": "tasks.yaml",
+                "runner": {"repetitions": 1},
+            },
+        )
+        write_json_yaml(bundle / "tasks.yaml", {"tasks": [{"id": "t", "prompt": "Dry run.", "assertions": []}]})
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(EVAL_RUNNER),
+                "--bundle",
+                str(bundle),
+                "--kb-repo",
+                str(kb_repo),
+                "--results-dir",
+                str(results),
+                "--dry-run",
+            ],
+            check=False,
+            encoding="utf-8",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        require(result.returncode == 1, "eval runner should reject a bad kb_commit", result)
+        require("git archive --format=tar not-a-real-commit failed" in result.stderr, "bad pin failure should name git archive", result)
+
+
+# Checks deterministic eval assertion helpers without invoking Claude.
+def test_eval_runner_behavior_and_judge_parsers() -> None:
+    runner = load_eval_runner_module()
+    stream = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {"type": "tool_use", "name": "Read", "input": {"file_path": ".agent-kb/start.md"}},
+                            {"type": "text", "text": "I checked the KB."},
+                        ]
+                    },
+                }
+            ),
+            json.dumps({"type": "result", "result": "Final answer.", "total_cost_usd": 0.01}),
+        ]
+    )
+    parsed = runner.parse_claude_stream(stream)
+    require(parsed["final_answer"] == "Final answer.", "stream parser should prefer the final result text")
+    require(parsed["cost_usd"] == 0.01, "stream parser should capture cost")
+    scored = runner.score_behavior_assertion(
+        {"id": "read-start", "check": "tool_read", "path": ".agent-kb/start.md"},
+        parsed["tool_calls"],
+    )
+    require(scored["passed"] is True, "tool_read assertion should pass when the path was read")
+    scored = runner.score_behavior_assertion(
+        {"id": "read-start", "check": "tool_read", "path": ".agent-kb/start.md"},
+        [{"name": "Bash", "input": {"command": "cd .agent-kb && cat start.md"}}],
+    )
+    require(scored["passed"] is True, "tool_read assertion should pass for shell reads of the same path")
+    scored = runner.score_behavior_assertion(
+        {"id": "access-kb", "check": "kb_access", "path": ".agent-kb"},
+        [{"name": "Bash", "input": {"command": "grep -r partition .agent-kb"}}],
+    )
+    require(scored["passed"] is True, "kb_access assertion should pass for shell searches under the KB")
+    scored = runner.score_behavior_assertion({"id": "no-edit", "check": "no_edit"}, parsed["tool_calls"])
+    require(scored["passed"] is True, "no_edit assertion should pass without edit tools")
+    judge_stdout = json.dumps(
+        {
+            "result": json.dumps(
+                {
+                    "assertions": [
+                        {"id": "semantic", "passed": True, "reason": "Matches reference.", "confidence": 0.9}
+                    ]
+                }
+            ),
+            "usage": {"input_tokens": 1},
+            "cost_usd": 0.02,
+        }
+    )
+    judged = runner.parse_judge_output(judge_stdout)
+    require(judged["assertions"][0]["id"] == "semantic", "judge parser should parse assertion rows")
+    require(judged["cost_usd"] == 0.02, "judge parser should capture cost")
+    with tempfile.TemporaryDirectory(prefix="agent-kb-eval-") as tmp:
+        base = Path(tmp)
+        captured = {}
+        original_run = runner.subprocess.run
+
+        def fake_run(args, **kwargs):
+            captured["args"] = args
+            return subprocess.CompletedProcess(args, 0, stdout=stream, stderr="")
+
+        try:
+            runner.subprocess.run = fake_run
+            agent_result = runner.run_claude("Prompt.", base, False, base / "results", base / "results" / ".raw", "task", 1)
+        finally:
+            runner.subprocess.run = original_run
+        require("--output-format" in captured["args"], "Claude agent command should set output format")
+        require("stream-json" in captured["args"], "Claude agent command should request stream-json output")
+        require("--verbose" in captured["args"], "Claude stream-json command should include --verbose")
+        require(agent_result["status"] == "ok", "fake Claude run should parse as ok")
+        rows, judge_result = runner.assertion_rows(
+            {"assertions": [{"id": "semantic", "check": "judge", "description": "Semantic assertion."}]},
+            {"status": "error", "tool_calls": [], "final_answer": ""},
+            base,
+            True,
+            False,
+            base / "results",
+            base / "results" / ".raw",
+            "task",
+            1,
+        )
+        require(judge_result is None, "failed agent run should not invoke judge")
+        require(rows[0]["status"] == "agent_error", "semantic assertion should record agent_error")
 
 
 # Checks that init sets up the chosen versioning mode (nested default, shared, local).
@@ -1357,6 +1507,8 @@ def main() -> int:
         test_stats_backfills_kb_reads,
         test_compliance_analyzer_synthetic_transcripts,
         test_eval_runner_dry_run,
+        test_eval_runner_rejects_bad_pin,
+        test_eval_runner_behavior_and_judge_parsers,
         test_init_versioning_modes,
     ]
     for test in tests:

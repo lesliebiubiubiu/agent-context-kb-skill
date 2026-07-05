@@ -7,12 +7,19 @@ import argparse
 import datetime as dt
 import io
 import json
+import re
 import subprocess
 import sys
 import tarfile
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
+
+
+EDIT_TOOL_NAMES = {"Edit", "MultiEdit", "Write", "NotebookEdit"}
+COMMAND_TOOL_NAMES = {"Bash", "Shell", "functions.exec_command"}
+REFERENCE_FILE_CHAR_LIMIT = 6000
+REFERENCE_TOTAL_CHAR_LIMIT = 20000
 
 
 # Reads a JSON-compatible YAML file using the standard library.
@@ -44,6 +51,31 @@ def git_run(repo: Path, args: list[str], stdout: int | None = subprocess.PIPE) -
 # Returns a stable UTC timestamp for naming result files.
 def result_timestamp() -> str:
     return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+# Resolves a path from bundle metadata against the bundle directory.
+def resolve_bundle_path(bundle_dir: Path, value: str) -> Path:
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+    return (bundle_dir / path).resolve()
+
+
+# Selects the target repository from bundle repo_path or the CLI fallback.
+def resolve_repo_root(bundle_dir: Path, bundle: dict, repo_root: Path) -> Path:
+    repo_path = bundle.get("repo_path")
+    resolved = resolve_bundle_path(bundle_dir, str(repo_path)) if repo_path else repo_root.resolve()
+    if not (resolved / ".git").exists():
+        raise ValueError(f"repository path is not a git checkout: {resolved}")
+    return resolved
+
+
+# Selects the nested KB repository for the target repo unless explicitly overridden.
+def resolve_kb_repo(repo_root: Path, kb_repo: Path | None) -> Path:
+    resolved = kb_repo.resolve() if kb_repo else (repo_root / ".agent-kb").resolve()
+    if not (resolved / ".git").exists():
+        raise ValueError(f"KB path is not a git repository: {resolved}")
+    return resolved
 
 
 # Creates a detached worktree for the pinned repository commit.
@@ -103,71 +135,365 @@ def task_prompt(task: dict) -> str:
     return prompt
 
 
-# Runs Claude once in the pinned workspace and returns a compact non-transcript summary.
-def run_claude(prompt: str, workspace: Path, dry_run: bool) -> dict:
+# Converts a task id into a safe filename fragment.
+def safe_name(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-") or "task"
+
+
+# Writes a raw local artifact and returns its path relative to the results root.
+def write_raw_artifact(results_root: Path, raw_root: Path, name: str, text: str) -> str:
+    raw_root.mkdir(parents=True, exist_ok=True)
+    path = raw_root / name
+    path.write_text(text, encoding="utf-8")
+    try:
+        return str(path.relative_to(results_root))
+    except ValueError:
+        return str(path)
+
+
+# Finds Claude tool_use records anywhere inside a stream-json event.
+def extract_tool_calls(value) -> list[dict]:
+    calls = []
+    if isinstance(value, dict):
+        if value.get("type") == "tool_use" and value.get("name"):
+            calls.append({"name": value.get("name"), "input": value.get("input", {})})
+        for child in value.values():
+            calls.extend(extract_tool_calls(child))
+    elif isinstance(value, list):
+        for child in value:
+            calls.extend(extract_tool_calls(child))
+    return calls
+
+
+# Finds assistant text content anywhere inside a stream-json event.
+def extract_text_parts(value) -> list[str]:
+    parts = []
+    if isinstance(value, dict):
+        if value.get("type") == "text" and isinstance(value.get("text"), str):
+            parts.append(value["text"])
+        for child in value.values():
+            parts.extend(extract_text_parts(child))
+    elif isinstance(value, list):
+        for child in value:
+            parts.extend(extract_text_parts(child))
+    return parts
+
+
+# Finds the first nested value for a key in parsed Claude output.
+def find_nested_key(value, key: str):
+    if isinstance(value, dict):
+        if key in value:
+            return value[key]
+        for child in value.values():
+            found = find_nested_key(child, key)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = find_nested_key(child, key)
+            if found is not None:
+                return found
+    return None
+
+
+# Parses Claude stream-json output into final text, usage, cost, and tool calls.
+def parse_claude_stream(stdout: str) -> dict:
+    tool_calls = []
+    text_parts = []
+    final_result = ""
+    usage = None
+    cost_usd = None
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            text_parts.append(line)
+            continue
+        tool_calls.extend(extract_tool_calls(event))
+        text_parts.extend(extract_text_parts(event))
+        if isinstance(event, dict) and event.get("type") == "result" and isinstance(event.get("result"), str):
+            final_result = event["result"]
+        usage = usage or find_nested_key(event, "usage")
+        cost_usd = cost_usd or find_nested_key(event, "total_cost_usd") or find_nested_key(event, "cost_usd") or find_nested_key(event, "cost")
+    final_answer = final_result or "\n".join(part for part in text_parts if part).strip()
+    return {"final_answer": final_answer, "tool_calls": tool_calls, "usage": usage, "cost_usd": cost_usd}
+
+
+# Runs Claude once in the pinned workspace and stores raw stream output locally.
+def run_claude(prompt: str, workspace: Path, dry_run: bool, results_root: Path, raw_root: Path, task_id: str, repetition: int) -> dict:
     if dry_run:
         return {
             "status": "dry_run",
             "exit_code": 0,
             "output_chars": 0,
+            "tool_call_count": 0,
             "usage": None,
             "cost_usd": None,
+            "raw_artifacts": {},
+            "final_answer": "",
+            "tool_calls": [],
         }
     result = subprocess.run(
-        ["claude", "-p", "--output-format", "json", prompt],
+        ["claude", "-p", "--output-format", "stream-json", "--verbose", prompt],
         cwd=workspace,
         check=False,
         encoding="utf-8",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    parsed = None
-    try:
-        parsed = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        pass
-    output_text = ""
-    usage = None
-    cost_usd = None
-    if isinstance(parsed, dict):
-        output_text = str(parsed.get("result") or parsed.get("content") or "")
-        usage = parsed.get("usage")
-        cost_usd = parsed.get("cost_usd") or parsed.get("total_cost_usd") or parsed.get("cost")
-    if not output_text:
-        output_text = result.stdout
+    prefix = f"{safe_name(task_id)}-r{repetition}-agent"
+    raw_artifacts = {
+        "stdout": write_raw_artifact(results_root, raw_root, f"{prefix}.stdout.jsonl", result.stdout),
+        "stderr": write_raw_artifact(results_root, raw_root, f"{prefix}.stderr.txt", result.stderr),
+    }
+    parsed = parse_claude_stream(result.stdout)
     return {
         "status": "ok" if result.returncode == 0 else "error",
         "exit_code": result.returncode,
-        "output_chars": len(output_text),
+        "output_chars": len(parsed["final_answer"]),
         "stderr_chars": len(result.stderr),
-        "usage": usage,
-        "cost_usd": cost_usd,
+        "tool_call_count": len(parsed["tool_calls"]),
+        "usage": parsed["usage"],
+        "cost_usd": parsed["cost_usd"],
+        "raw_artifacts": raw_artifacts,
+        "final_answer": parsed["final_answer"],
+        "tool_calls": parsed["tool_calls"],
     }
 
 
-# Builds placeholder assertion rows until the judge step is implemented.
-def assertion_rows(task: dict) -> list[dict]:
+# Removes transient fields that should not be written into the summary JSON.
+def agent_summary(agent_result: dict) -> dict:
+    return {key: value for key, value in agent_result.items() if key not in {"final_answer", "tool_calls"}}
+
+
+# Returns true when a tool input references the requested path.
+def input_mentions_path(tool_input, expected_path: str) -> bool:
+    if isinstance(tool_input, dict):
+        return any(input_mentions_path(value, expected_path) for value in tool_input.values())
+    if isinstance(tool_input, list):
+        return any(input_mentions_path(value, expected_path) for value in tool_input)
+    if isinstance(tool_input, str):
+        return expected_path in tool_input
+    return False
+
+
+# Returns path spellings commonly used by tools from different working dirs.
+def path_variants(expected_path: str) -> list[str]:
+    variants = [expected_path]
+    trimmed = expected_path.removeprefix("./")
+    if trimmed not in variants:
+        variants.append(trimmed)
+    if trimmed.startswith(".agent-kb/"):
+        variants.append(trimmed.removeprefix(".agent-kb/"))
+    return variants
+
+
+# Returns true when a tool input references any spelling of the requested path.
+def input_mentions_any_path(tool_input, expected_path: str) -> bool:
+    return any(input_mentions_path(tool_input, variant) for variant in path_variants(expected_path))
+
+
+# Scores a deterministic assertion from captured tool calls.
+def score_behavior_assertion(assertion: dict, tool_calls: list[dict]) -> dict:
+    check = assertion.get("check")
+    if check == "tool_read":
+        expected_path = str(assertion.get("path") or "")
+        passed = any(input_mentions_any_path(call.get("input"), expected_path) for call in tool_calls)
+        reason = f"Tool input referenced {expected_path}." if passed else f"No tool input referenced {expected_path}."
+    elif check == "kb_access":
+        expected_path = str(assertion.get("path") or ".agent-kb")
+        passed = any(input_mentions_any_path(call.get("input"), expected_path) for call in tool_calls)
+        reason = f"Tool input referenced {expected_path}." if passed else f"No tool input referenced {expected_path}."
+    elif check == "no_edit":
+        edit_calls = [str(call.get("name")) for call in tool_calls if call.get("name") in EDIT_TOOL_NAMES]
+        passed = not edit_calls
+        reason = "No edit/write tools were used." if passed else f"Edit/write tools used: {', '.join(edit_calls)}."
+    elif check == "no_command":
+        blocked = str(assertion.get("command_contains") or "")
+        command_calls = [
+            call
+            for call in tool_calls
+            if call.get("name") in COMMAND_TOOL_NAMES and input_mentions_path(call.get("input"), blocked)
+        ]
+        passed = not command_calls
+        reason = f"No command contained {blocked}." if passed else f"{len(command_calls)} command call(s) contained {blocked}."
+    else:
+        raise ValueError(f"unsupported behavior assertion check: {check}")
+    return {"status": "scored", "passed": passed, "reason": reason}
+
+
+# Reads bounded reference context files from the pinned workspace.
+def load_reference_context(workspace: Path, task: dict) -> list[dict]:
+    references = []
+    remaining = REFERENCE_TOTAL_CHAR_LIMIT
+    for raw_path in task.get("reference_files", []):
+        relative = Path(str(raw_path))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"reference file must be a safe relative path: {raw_path}")
+        path = (workspace / relative).resolve()
+        try:
+            path.relative_to(workspace.resolve())
+        except ValueError as error:
+            raise ValueError(f"reference file escapes workspace: {raw_path}") from error
+        if not path.exists():
+            raise ValueError(f"reference file does not exist in pinned workspace: {raw_path}")
+        text = path.read_text(encoding="utf-8", errors="replace")
+        take = min(len(text), REFERENCE_FILE_CHAR_LIMIT, remaining)
+        references.append({"path": str(raw_path), "text": text[:take], "truncated": take < len(text)})
+        remaining -= take
+        if remaining <= 0:
+            break
+    return references
+
+
+# Builds a strict JSON prompt for semantic assertion judging.
+def judge_prompt(task: dict, final_answer: str, semantic_assertions: list[dict], references: list[dict]) -> str:
+    payload = {
+        "task_prompt": task_prompt(task),
+        "agent_answer": final_answer,
+        "reference_files": references,
+        "assertions": [
+            {"id": assertion.get("id"), "description": assertion.get("description")}
+            for assertion in semantic_assertions
+        ],
+    }
+    return (
+        "Judge the agent answer against the assertions using the reference files as ground truth. "
+        "Return only JSON with this schema: "
+        '{"assertions":[{"id":"...","passed":true,"reason":"...","confidence":0.0}]}. '
+        "Do not include markdown.\n\n"
+        + json.dumps(payload, indent=2, sort_keys=True)
+    )
+
+
+# Extracts the first JSON object from Claude judge text.
+def extract_json_object(text: str) -> dict:
+    stripped = text.strip()
+    try:
+        value = json.loads(stripped)
+    except json.JSONDecodeError:
+        start = stripped.find("{")
+        end = stripped.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise ValueError("judge did not return a JSON object")
+        value = json.loads(stripped[start : end + 1])
+    if not isinstance(value, dict):
+        raise ValueError("judge JSON must be an object")
+    return value
+
+
+# Parses Claude json output and returns the judge payload plus usage and cost.
+def parse_judge_output(stdout: str) -> dict:
+    outer = extract_json_object(stdout)
+    usage = outer.get("usage")
+    cost_usd = outer.get("cost_usd") or outer.get("total_cost_usd") or outer.get("cost")
+    result_text = outer.get("result") or outer.get("content") or stdout
+    payload = extract_json_object(str(result_text))
+    assertions = payload.get("assertions")
+    if not isinstance(assertions, list):
+        raise ValueError("judge JSON must contain an assertions list")
+    return {"assertions": assertions, "usage": usage, "cost_usd": cost_usd}
+
+
+# Runs Claude as the semantic judge and stores raw judge output locally.
+def run_judge(task: dict, agent_result: dict, workspace: Path, results_root: Path, raw_root: Path, task_id: str, repetition: int, semantic_assertions: list[dict]) -> dict:
+    references = load_reference_context(workspace, task)
+    result = subprocess.run(
+        ["claude", "-p", "--output-format", "json", judge_prompt(task, agent_result["final_answer"], semantic_assertions, references)],
+        cwd=workspace,
+        check=False,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    prefix = f"{safe_name(task_id)}-r{repetition}-judge"
+    raw_artifacts = {
+        "stdout": write_raw_artifact(results_root, raw_root, f"{prefix}.stdout.json", result.stdout),
+        "stderr": write_raw_artifact(results_root, raw_root, f"{prefix}.stderr.txt", result.stderr),
+    }
+    if result.returncode != 0:
+        return {"status": "error", "exit_code": result.returncode, "raw_artifacts": raw_artifacts, "assertions": []}
+    try:
+        parsed = parse_judge_output(result.stdout)
+    except ValueError as error:
+        return {
+            "status": "error",
+            "exit_code": result.returncode,
+            "raw_artifacts": raw_artifacts,
+            "assertions": [],
+            "error": str(error),
+        }
+    return {
+        "status": "ok",
+        "exit_code": result.returncode,
+        "raw_artifacts": raw_artifacts,
+        "assertions": parsed["assertions"],
+        "usage": parsed["usage"],
+        "cost_usd": parsed["cost_usd"],
+    }
+
+
+# Builds assertion rows by mixing deterministic checks with optional judge output.
+def assertion_rows(task: dict, agent_result: dict, workspace: Path, judge: bool, dry_run: bool, results_root: Path, raw_root: Path, task_id: str, repetition: int) -> tuple[list[dict], dict | None]:
     assertions = task.get("assertions", [])
     if not isinstance(assertions, list):
         raise ValueError(f"task {task.get('id', '<missing>')} assertions must be a list")
     rows = []
+    semantic_assertions = []
     for assertion in assertions:
         if not isinstance(assertion, dict):
             raise ValueError(f"task {task.get('id', '<missing>')} has a non-object assertion")
-        rows.append(
-            {
-                "id": assertion.get("id"),
-                "description": assertion.get("description"),
-                "status": "pending_judge",
-                "passed": None,
-            }
-        )
-    return rows
+        check = str(assertion.get("check") or "judge")
+        row = {"id": assertion.get("id"), "description": assertion.get("description"), "check": check}
+        if dry_run:
+            row.update({"status": "dry_run", "passed": None})
+        elif check == "judge":
+            row.update({"status": "pending_judge", "passed": None})
+            semantic_assertions.append(assertion)
+        elif check in {"tool_read", "kb_access", "no_edit", "no_command"}:
+            row.update(score_behavior_assertion(assertion, agent_result["tool_calls"]))
+        else:
+            raise ValueError(f"assertion {assertion.get('id', '<missing>')} has unsupported check: {check}")
+        rows.append(row)
+    judge_result = None
+    if judge and semantic_assertions and not dry_run:
+        if agent_result["status"] != "ok":
+            for row in rows:
+                if row["check"] == "judge":
+                    row.update({"status": "agent_error", "passed": None, "reason": "Agent run failed before judging."})
+            return rows, None
+        judge_result = run_judge(task, agent_result, workspace, results_root, raw_root, task_id, repetition, semantic_assertions)
+        if judge_result.get("status") != "ok":
+            for row in rows:
+                if row["check"] == "judge":
+                    row.update({"status": "judge_error", "passed": None, "reason": judge_result.get("error") or "Judge run failed."})
+            return rows, judge_result
+        judged_by_id = {item.get("id"): item for item in judge_result.get("assertions", []) if isinstance(item, dict)}
+        for row in rows:
+            if row["check"] != "judge":
+                continue
+            judged = judged_by_id.get(row["id"])
+            if not judged:
+                row.update({"status": "judge_missing", "passed": None})
+                continue
+            row.update(
+                {
+                    "status": "scored",
+                    "passed": bool(judged.get("passed")),
+                    "reason": judged.get("reason"),
+                    "confidence": judged.get("confidence"),
+                }
+            )
+    return rows, judge_result
 
 
 # Runs every task in a pinned workspace and returns the JSON-serializable summary.
-def run_bundle(bundle_dir: Path, repo_root: Path, kb_repo: Path, harness: str, dry_run: bool) -> dict:
+def run_bundle(bundle_dir: Path, repo_root: Path, kb_repo: Path | None, harness: str, dry_run: bool, judge: bool, results_root: Path, run_id: str) -> dict:
     bundle = read_json_yaml(bundle_dir / "bundle.yaml")
+    repo_root = resolve_repo_root(bundle_dir, bundle, repo_root)
+    kb_repo = resolve_kb_repo(repo_root, kb_repo)
     tasks_path = bundle_dir / str(bundle.get("task_file", "tasks.yaml"))
     tasks_doc = read_json_yaml(tasks_path)
     tasks = tasks_doc.get("tasks", [])
@@ -181,6 +507,7 @@ def run_bundle(bundle_dir: Path, repo_root: Path, kb_repo: Path, harness: str, d
     if not repo_commit or not kb_commit:
         raise ValueError("bundle.yaml must define repo_commit and kb_commit")
     runs = []
+    raw_root = results_root / ".raw" / str(bundle.get("name", bundle_dir.name)) / run_id
     with prepared_workspace(repo_root, kb_repo, repo_commit, kb_commit) as workspace:
         for task in tasks:
             if not isinstance(task, dict):
@@ -190,22 +517,29 @@ def run_bundle(bundle_dir: Path, repo_root: Path, kb_repo: Path, harness: str, d
                 raise ValueError(f"{tasks_path} contains a task without id")
             prompt = task_prompt(task)
             for repetition in range(1, repetitions + 1):
-                agent_result = run_claude(prompt, workspace, dry_run)
+                agent_result = run_claude(prompt, workspace, dry_run, results_root, raw_root, task_id, repetition)
+                assertions, judge_result = assertion_rows(task, agent_result, workspace, judge, dry_run, results_root, raw_root, task_id, repetition)
+                run = {
+                    "task_id": task_id,
+                    "repetition": repetition,
+                    "harness": harness,
+                    "agent": agent_summary(agent_result),
+                    "assertions": assertions,
+                }
+                if judge_result is not None:
+                    run["judge"] = {key: value for key, value in judge_result.items() if key != "assertions"}
                 runs.append(
-                    {
-                        "task_id": task_id,
-                        "repetition": repetition,
-                        "harness": harness,
-                        "agent": agent_result,
-                        "assertions": assertion_rows(task),
-                    }
+                    run
                 )
     return {
         "bundle": bundle.get("name", bundle_dir.name),
+        "repo_path": str(repo_root),
         "repo_commit": repo_commit,
         "kb_commit": kb_commit,
         "harness": harness,
         "dry_run": dry_run,
+        "judge": judge,
+        "run_id": run_id,
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "runs": runs,
     }
@@ -215,11 +549,12 @@ def run_bundle(bundle_dir: Path, repo_root: Path, kb_repo: Path, harness: str, d
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run an agent-kb C1 eval bundle.")
     parser.add_argument("--bundle", required=True, help="Bundle directory containing bundle.yaml and tasks.yaml.")
-    parser.add_argument("--repo-root", default=".", help="Git repository used for repo_commit worktrees.")
-    parser.add_argument("--kb-repo", default=".agent-kb", help="Nested KB git repository used for kb_commit archives.")
+    parser.add_argument("--repo-root", default=".", help="Fallback git repository when bundle.yaml omits repo_path.")
+    parser.add_argument("--kb-repo", default=None, help="Override nested KB git repository used for kb_commit archives.")
     parser.add_argument("--harness", default="claude", help="Harness runner to use; v1 supports claude.")
     parser.add_argument("--results-dir", default="evals/results", help="Directory for summary result JSON files.")
     parser.add_argument("--dry-run", action="store_true", help="Validate the bundle without invoking the agent.")
+    parser.add_argument("--judge", action="store_true", help="Run semantic assertions through the Claude judge.")
     return parser
 
 
@@ -228,17 +563,18 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     bundle_dir = Path(args.bundle).expanduser().resolve()
     repo_root = Path(args.repo_root).expanduser().resolve()
-    kb_repo = Path(args.kb_repo).expanduser().resolve()
+    kb_repo = Path(args.kb_repo).expanduser().resolve() if args.kb_repo else None
     results_root = Path(args.results_dir).expanduser().resolve()
+    run_id = result_timestamp()
     try:
-        summary = run_bundle(bundle_dir, repo_root, kb_repo, args.harness, args.dry_run)
+        summary = run_bundle(bundle_dir, repo_root, kb_repo, args.harness, args.dry_run, args.judge, results_root, run_id)
     except (OSError, ValueError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
     bundle_results = results_root / str(summary["bundle"])
     bundle_results.mkdir(parents=True, exist_ok=True)
     suffix = "dry-run" if args.dry_run else args.harness
-    output_path = bundle_results / f"{result_timestamp()}-{suffix}.json"
+    output_path = bundle_results / f"{run_id}-{suffix}.json"
     output_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"Wrote {output_path}")
     return 0

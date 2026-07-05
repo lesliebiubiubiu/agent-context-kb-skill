@@ -3,18 +3,51 @@
     {
       "id": "respect-current-release-focus",
       "prompt": "In this repository, identify the next Release 2 development step and state which project knowledge files justify it. Do not edit files.",
+      "reference_files": [
+        ".agent-kb/plans/current.md",
+        ".agent-kb/decisions/active/project-decisions.md"
+      ],
       "assertions": [
         {
           "id": "reads-planning-route",
-          "description": "The agent uses the KB planning route before drawing a conclusion."
+          "check": "tool_read",
+          "path": ".agent-kb/plans/current.md",
+          "description": "The agent reads the KB planning route before drawing a conclusion."
+        },
+        {
+          "id": "does-not-edit",
+          "check": "no_edit",
+          "description": "The agent does not edit files for this read-only task."
         },
         {
           "id": "keeps-feature-freeze",
+          "check": "judge",
           "description": "The answer keeps new user-facing features out of scope until validation data exists."
+        }
+      ]
+    },
+    {
+      "id": "respect-trim-control-boundary",
+      "prompt": "In this repository, explain whether trim --write should perform semantic KB merges automatically. Do not edit files.",
+      "reference_files": [
+        ".agent-kb/decisions/active/project-decisions.md"
+      ],
+      "assertions": [
+        {
+          "id": "reads-decisions-route",
+          "check": "tool_read",
+          "path": ".agent-kb/decisions/active/project-decisions.md",
+          "description": "The agent reads the KB decisions route before answering."
         },
         {
-          "id": "mentions-compliance-before-utility",
-          "description": "The answer treats compliance measurement as the gate before utility claims."
+          "id": "does-not-edit",
+          "check": "no_edit",
+          "description": "The agent does not edit files for this read-only task."
+        },
+        {
+          "id": "keeps-semantic-work-with-agent",
+          "check": "judge",
+          "description": "The answer says semantic merges remain agent judgment, while trim --write only performs deterministic reversible cleanup."
         }
       ]
     }
