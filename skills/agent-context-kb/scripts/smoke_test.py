@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -52,9 +53,9 @@ def write_jsonl(path: Path, records: list[dict]) -> None:
     path.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
 
 
-# Builds Claude Code's project-directory name for a repo path.
-def claude_project_name(root: Path) -> str:
-    return str(root.resolve()).replace("/", "-")
+# Builds the fixture Claude project directory with the observed dot-to-dash encoding.
+def fixture_claude_project_name(root: Path) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "-", str(root.resolve()))
 
 
 # Fails the smoke test with command output when an expected condition is false.
@@ -640,16 +641,23 @@ def test_stats_reports_cli_usage() -> None:
 def test_stats_backfills_kb_reads() -> None:
     with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
         base = Path(tmp)
-        root = base / "repo"
+        root = base / "repo.dot"
         root.mkdir()
+        subdir = root / "src"
+        subdir.mkdir()
         init_root(root)
+        require(
+            fixture_claude_project_name(root) != str(root.resolve()).replace("/", "-"),
+            "Claude fixture should encode dots differently from the old slash-only helper",
+        )
         claude_dir = base / "claude" / "projects"
         codex_dir = base / "codex" / "sessions"
         write_jsonl(
-            claude_dir / claude_project_name(root) / "session-read.jsonl",
+            claude_dir / fixture_claude_project_name(root) / "session-read.jsonl",
             [
                 {
                     "timestamp": "2026-07-05T00:00:00Z",
+                    "cwd": str(root),
                     "message": {
                         "content": [
                             {
@@ -680,6 +688,10 @@ def test_stats_backfills_kb_reads() -> None:
             codex_dir / "2026" / "07" / "05" / "rollout-no-read.jsonl",
             [{"timestamp": "2026-07-05T00:00:00Z", "type": "session_meta", "payload": {"cwd": str(root)}}],
         )
+        write_jsonl(
+            codex_dir / "2026" / "07" / "05" / "rollout-subdir-no-read.jsonl",
+            [{"timestamp": "2026-07-05T00:00:00Z", "type": "session_meta", "payload": {"cwd": str(subdir)}}],
+        )
 
         result = run_cli(
             root,
@@ -695,7 +707,7 @@ def test_stats_backfills_kb_reads() -> None:
         )
         require(result.returncode == 0, "stats with transcript backfill should succeed", result)
         require("Backfilled KB reads: 2 new event(s)." in result.stdout, "stats should backfill two KB reads", result)
-        require("KB hit rate: 2/3 (66.7%)" in result.stdout, "stats should report hit rate with non-read denominator", result)
+        require("KB hit rate: 2/4 (50.0%)" in result.stdout, "stats should report hit rate with non-read denominator", result)
         require("start.md" in result.stdout and "routes.yaml" in result.stdout, "stats should show read KB files", result)
         require("Dead knowledge candidates" in result.stdout, "stats should report dead knowledge candidates", result)
 
@@ -718,7 +730,7 @@ def test_stats_backfills_kb_reads() -> None:
 def test_compliance_analyzer_synthetic_transcripts() -> None:
     with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
         base = Path(tmp)
-        root = base / "repo"
+        root = base / "repo.dot"
         root.mkdir()
         init_root(root)
         (root / "src.py").write_text("print('hi')\n", encoding="utf-8")
@@ -726,10 +738,11 @@ def test_compliance_analyzer_synthetic_transcripts() -> None:
         claude_dir = base / "claude" / "projects"
         codex_dir = base / "codex" / "sessions"
         write_jsonl(
-            claude_dir / claude_project_name(root) / "session-good.jsonl",
+            claude_dir / fixture_claude_project_name(root) / "session-good.jsonl",
             [
                 {
                     "timestamp": "2026-07-05T00:00:00Z",
+                    "cwd": str(root),
                     "message": {
                         "content": [
                             {
@@ -776,12 +789,36 @@ def test_compliance_analyzer_synthetic_transcripts() -> None:
                 },
             ],
         )
+        write_jsonl(
+            codex_dir / "2026" / "07" / "05" / "rollout-kb-write.jsonl",
+            [
+                {"timestamp": "2026-07-05T00:00:00Z", "type": "session_meta", "payload": {"cwd": str(root)}},
+                {
+                    "timestamp": "2026-07-05T00:00:01Z",
+                    "type": "function_call",
+                    "payload": {
+                        "name": "functions.exec_command",
+                        "arguments": json.dumps(
+                            {"cmd": "echo Later >> .agent-kb/start.md", "workdir": str(root)}
+                        ),
+                    },
+                },
+                {
+                    "timestamp": "2026-07-05T00:00:02Z",
+                    "type": "function_call",
+                    "payload": {
+                        "name": "functions.exec_command",
+                        "arguments": json.dumps({"cmd": "rg print src.py", "workdir": str(root)}),
+                    },
+                },
+            ],
+        )
 
         result = run_compliance(root, claude_dir, codex_dir, "--details")
         require(result.returncode == 0, "compliance analyzer should succeed", result)
-        require("Sessions analyzed: 2" in result.stdout, "analyzer should count both synthetic sessions", result)
-        require("Read compliance: 1/2 (50.0%)" in result.stdout, "analyzer should report one compliant session", result)
-        require("First source action before KB: 1" in result.stdout, "analyzer should report one pre-KB source action", result)
+        require("Sessions analyzed: 3" in result.stdout, "analyzer should count all synthetic sessions", result)
+        require("Read compliance: 1/3 (33.3%)" in result.stdout, "analyzer should report one compliant session", result)
+        require("First source action before KB: 2" in result.stdout, "analyzer should report pre-KB source actions", result)
         require(
             "Write-back compliance: deferred" in result.stdout,
             "analyzer should document that write-back compliance is deferred",

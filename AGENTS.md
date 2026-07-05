@@ -12,22 +12,13 @@ Current layout:
 
 ## Project Knowledge Base
 
-`.agent-kb/` is the project knowledge base for coding agents — a distilled index
-of architecture, decisions, conventions, and pitfalls.
-
-When you need to understand how this codebase works — to plan, build, debug,
-review, or answer a question about it — start here, before opening a broad code
-search:
-
+Use `.agent-kb/` before broad code search when planning, building, debugging, or reviewing.
 1. Read `.agent-kb/start.md`.
-2. Read `.agent-kb/routes.yaml` (the source of truth; `.agent-kb/map.md` is a
-   readable view) and pick only the routes relevant to your task.
-3. Read the KB documents those routes point to. Use open-ended code search for
-   what the KB does not cover.
+2. Read `.agent-kb/routes.yaml`; pick only relevant routes.
+3. Read those KB docs, then search code for gaps.
 
-After the task, only when it created or changed reusable project knowledge:
-- Update the relevant topic file (use `.agent-kb/inbox/` if the target is unclear).
-- Do not write progress logs or one-off chat summaries into the KB.
+After work, update a topic or `.agent-kb/inbox/` only for reusable project knowledge.
+Do not store progress logs, chat summaries, secrets, or obvious code facts.
 
 ## Build, Test, and Development Commands
 

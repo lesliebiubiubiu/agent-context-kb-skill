@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import re
 import shlex
 
 
@@ -31,25 +32,60 @@ def resolve_path(path: str | Path) -> Path:
     return Path(path).expanduser().resolve()
 
 
-# Reads JSONL records from a transcript, skipping blank or malformed lines.
+# Reads JSONL records from a transcript one line at a time, skipping blank or malformed lines.
 def read_jsonl(path: Path) -> list[dict]:
     records = []
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
-            records.append(value)
+    try:
+        handle = path.open(encoding="utf-8", errors="replace")
+    except OSError:
+        return records
+    with handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                records.append(value)
     return records
 
 
-# Builds Claude's project-directory encoding for a repo path.
+# Yields JSONL records from a transcript one line at a time, skipping malformed lines.
+def iter_jsonl(path: Path):
+    try:
+        handle = path.open(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    with handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                yield value
+
+
+# Builds Claude's project-directory encoding for a repo path using non-alphanumeric separators.
 def claude_project_name(root: Path) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "-", str(root))
+
+
+# Builds the older slash-only Claude project-directory encoding used by early fixtures.
+def legacy_claude_project_name(root: Path) -> str:
     return str(root).replace("/", "-")
+
+
+# Returns likely Claude project directories for root without making them authoritative.
+def claude_project_dirs(base: Path, root: Path) -> list[Path]:
+    names = {claude_project_name(root), legacy_claude_project_name(root)}
+    return sorted(path for path in (base / name for name in names) if path.exists() and path.is_dir())
 
 
 # Returns whether a path is inside root and, if so, its relative path.
@@ -61,6 +97,36 @@ def root_relative(path_value: str, root: Path) -> Path | None:
         return candidate.relative_to(root)
     except (OSError, ValueError):
         return None
+
+
+# Returns whether candidate points at root or any path below it.
+def path_is_inside_root(candidate: Path | None, root: Path) -> bool:
+    if candidate is None:
+        return False
+    try:
+        candidate.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+# Extracts a cwd/workdir value from common transcript record shapes.
+def record_cwd(record: dict) -> Path | None:
+    values = [
+        record.get("cwd"),
+        record.get("workdir"),
+        record.get("currentWorkingDirectory"),
+        record.get("project_dir"),
+    ]
+    message = record.get("message") if isinstance(record.get("message"), dict) else {}
+    values.extend([message.get("cwd"), message.get("workdir")])
+    for value in values:
+        if value:
+            try:
+                return resolve_path(str(value))
+            except OSError:
+                return None
+    return None
 
 
 # Returns a current-size char estimate for a KB file read.
@@ -92,11 +158,13 @@ def claude_tool_uses(record: dict) -> list[dict]:
 
 # Extracts KB read events and root-owned session membership from one Claude Code transcript.
 def parse_claude_transcript(path: Path, root: Path) -> TranscriptScan:
-    records = read_jsonl(path)
     session = f"claude:{path.stem}"
-    sessions = {session} if path.parent.name == claude_project_name(root) else set()
+    sessions: set[str] = set()
     reads: list[KbReadEvent] = []
-    for index, record in enumerate(records):
+    for index, record in enumerate(iter_jsonl(path)):
+        cwd = record_cwd(record)
+        if path_is_inside_root(cwd, root):
+            sessions.add(session)
         timestamp = str(record.get("timestamp") or f"{path.name}:{index}")
         for tool_use in claude_tool_uses(record):
             if tool_use.get("name") != "Read":
@@ -165,18 +233,17 @@ def codex_kb_read_path(command: str, root: Path, workdir: Path | None) -> Path |
 
 # Extracts KB read events and root-owned session membership from one Codex transcript.
 def parse_codex_transcript(path: Path, root: Path) -> TranscriptScan:
-    records = read_jsonl(path)
     session = f"codex:{path.stem}"
     sessions: set[str] = set()
     reads: list[KbReadEvent] = []
     current_workdir: Path | None = None
-    for index, record in enumerate(records):
+    for index, record in enumerate(iter_jsonl(path)):
         payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
         timestamp = str(record.get("timestamp") or f"{path.name}:{index}")
         if record.get("type") == "session_meta":
             cwd = str(payload.get("cwd") or payload.get("workdir") or "")
             cwd_path = resolve_path(cwd) if cwd else None
-            if cwd_path == root:
+            if path_is_inside_root(cwd_path, root):
                 sessions.add(session)
                 current_workdir = cwd_path
             continue
@@ -186,7 +253,7 @@ def parse_codex_transcript(path: Path, root: Path) -> TranscriptScan:
         command = str(args.get("cmd") or args.get("command") or "")
         workdir_raw = str(args.get("workdir") or "")
         workdir = resolve_path(workdir_raw) if workdir_raw else current_workdir
-        if workdir == root:
+        if path_is_inside_root(workdir, root):
             sessions.add(session)
         relative = codex_kb_read_path(command, root, workdir)
         kb_path = kb_relative(relative) if relative is not None else None
@@ -203,6 +270,33 @@ def transcript_paths(base: Path) -> list[Path]:
     return sorted(path for path in base.rglob("*.jsonl") if path.is_file())
 
 
+# Returns whether a transcript's raw text mentions any needle before JSON parsing.
+def transcript_mentions(path: Path, needles: set[str]) -> bool:
+    try:
+        handle = path.open(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    with handle:
+        for line in handle:
+            if any(needle in line for needle in needles):
+                return True
+    return False
+
+
+# Collects Claude transcript paths from likely project directories for this root.
+def claude_transcript_paths(base: Path, root: Path) -> list[Path]:
+    paths: list[Path] = []
+    for project_dir in claude_project_dirs(base, root):
+        paths.extend(transcript_paths(project_dir))
+    return sorted(paths)
+
+
+# Collects Codex transcript paths that cheaply mention this root or KB paths.
+def codex_transcript_paths(base: Path, root: Path) -> list[Path]:
+    needles = {str(root), root.name, ".agent-kb"}
+    return [path for path in transcript_paths(base) if transcript_mentions(path, needles)]
+
+
 # Merges multiple transcript scan results into one result.
 def merge_scans(scans: list[TranscriptScan]) -> TranscriptScan:
     sessions: set[str] = set()
@@ -217,7 +311,7 @@ def merge_scans(scans: list[TranscriptScan]) -> TranscriptScan:
 def scan_transcripts(root: Path, claude_dir: Path | None, codex_dir: Path | None) -> TranscriptScan:
     scans: list[TranscriptScan] = []
     if claude_dir is not None:
-        scans.extend(parse_claude_transcript(path, root) for path in transcript_paths(claude_dir))
+        scans.extend(parse_claude_transcript(path, root) for path in claude_transcript_paths(claude_dir, root))
     if codex_dir is not None:
-        scans.extend(parse_codex_transcript(path, root) for path in transcript_paths(codex_dir))
+        scans.extend(parse_codex_transcript(path, root) for path in codex_transcript_paths(codex_dir, root))
     return merge_scans(scans)

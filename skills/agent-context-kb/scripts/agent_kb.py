@@ -27,6 +27,7 @@ Use `.agent-kb/` before broad code search when planning, building, debugging, or
 1. Read `.agent-kb/start.md`.
 2. Read `.agent-kb/routes.yaml`; pick only relevant routes.
 3. Read those KB docs, then search code for gaps.
+
 After work, update a topic or `.agent-kb/inbox/` only for reusable project knowledge.
 Do not store progress logs, chat summaries, secrets, or obvious code facts.
 """
@@ -1650,7 +1651,8 @@ def command_stats(args: argparse.Namespace) -> int:
     if not args.no_backfill:
         try:
             scan, added = backfill_kb_reads(root, args)
-        except Exception:
+        except Exception as err:
+            print(f"Backfill failed: {err}")
             scan, added = None, 0
 
     print("CLI command usage (.agent-kb/.log/events.jsonl):")
