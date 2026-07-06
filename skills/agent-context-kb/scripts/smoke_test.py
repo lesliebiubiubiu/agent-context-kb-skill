@@ -278,6 +278,16 @@ def test_init_creates_current_plan_route() -> None:
         require("plans/current.md" in routes, "routes.yaml should include the current plan route")
 
 
+# Checks that init gives a warm-start hint when the KB contains only starter topic scaffolds.
+def test_init_empty_scaffold_warm_start_prompt() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        result = run_cli(root, "init")
+        require(result.returncode == 0, "init should succeed", result)
+        require("This KB is an empty scaffold." in result.stdout, "init should name the empty scaffold state", result)
+        require("not code summaries or obvious code facts" in result.stdout, "init should guard against bad distillation", result)
+
+
 # Checks that upgrade creates the current plan when older KBs do not have it.
 def test_upgrade_creates_missing_current_plan() -> None:
     with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
@@ -1985,6 +1995,7 @@ def main() -> int:
         test_placeholder_warning,
         test_validate_uses_routes_yaml,
         test_init_creates_current_plan_route,
+        test_init_empty_scaffold_warm_start_prompt,
         test_upgrade_creates_missing_current_plan,
         test_upgrade_preserves_custom_scaffold_by_default,
         test_upgrade_can_write_start_template,

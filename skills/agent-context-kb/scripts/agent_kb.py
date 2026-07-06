@@ -846,7 +846,7 @@ def init_nested_repo(kb: Path) -> str:
     return "created"
 
 
-# Initializes the KB scaffold, runtime protocol, and the chosen versioning mode (nested by default).
+# Initializes the KB scaffold, runtime protocol, versioning mode, and any just-in-time next-step hints.
 def command_init(args: argparse.Namespace) -> int:
     root = repo_root(args)
     kb = kb_dir(root)
@@ -917,6 +917,13 @@ def command_init(args: argparse.Namespace) -> int:
         print("KB will travel with the parent repo; commit .agent-kb/ alongside your code.")
     elif mode == "local":
         print("KB is local-only and git-ignored; it has no version history.")
+    if kb_is_empty_scaffold(kb):
+        print(
+            "This KB is an empty scaffold. To warm-start it, ask the agent to distill the repo: "
+            "survey README/docs/git history, then fill topic files with durable facts only "
+            "(decisions, boundaries, pitfalls, doc-vs-reality gaps, and why from git history), "
+            "not code summaries or obvious code facts."
+        )
     return 0, {"created": len(created), "mode": mode}
 
 
@@ -1168,6 +1175,15 @@ def is_empty_scaffold_topic(path: Path, kb: Path) -> bool:
     if not is_content_empty_topic(path, kb):
         return False
     return is_initial_changelog_only(markdown_section_body(path.read_text(encoding="utf-8"), "Change Log"))
+
+
+# Checks whether the KB still has only starter topic scaffolds, using the same empty-topic test as trim.
+def kb_is_empty_scaffold(kb: Path) -> bool:
+    docs = stable_topic_docs(kb)
+    topic_docs = [path for path in docs if path.relative_to(kb).parts[0] != "plans"]
+    if not topic_docs:
+        return False
+    return all(is_empty_scaffold_topic(path, kb) for path in topic_docs)
 
 
 # Checks whether a stable topic is an emptied husk: content gone, but its Change Log shows it once held knowledge.
