@@ -54,4 +54,5 @@ Compare paired, per the C1 discipline (`decisions/active/project-decisions.md`: 
 passes pre and fails post"). The `judge` contrast (empty vs filled KB) measures how much the
 distilled content improved answers; `kb_access` passing in both just confirms the scaffold was
 consulted. Reset the fixture between experiments with
-`git -C "$R" reset --hard cold-start && git -C "$R" clean -fdx`.
+`git -C "$R" reset --hard cold-start && rm -rf "$R/.agent-kb"` — do **not** `clean -fdx`, which
+deletes gitignored-but-real fixture files (`local.properties`, `ppocr-sdk/src/main/assets/`).
