@@ -1,0 +1,79 @@
+{
+  "tasks": [
+    {
+      "id": "photo-required-no-manual-entry",
+      "prompt": "In this repository, can a user save a blood-pressure reading by typing the numbers manually, without taking a photo? Explain what the capture flow requires. Do not edit files.",
+      "reference_files": [
+        "docs/requirements.md"
+      ],
+      "assertions": [
+        {
+          "id": "consults-kb",
+          "check": "kb_access",
+          "path": ".agent-kb",
+          "description": "The agent consults the project KB before answering."
+        },
+        {
+          "id": "does-not-edit",
+          "check": "no_edit",
+          "description": "The agent does not edit files for this read-only task."
+        },
+        {
+          "id": "states-photo-mandatory",
+          "check": "judge",
+          "description": "The answer states every record requires a photo (no photo-free manual-entry path); after capture a confirmation popup pre-fills OCR values that the user confirms or edits, and manual entry only fills unrecognized fields inside that popup while a photo is still required."
+        }
+      ]
+    },
+    {
+      "id": "fully-local-offline",
+      "prompt": "In this repository's Android app, does the main capture to record to report to share flow depend on network access or a backend server? Do not edit files.",
+      "reference_files": [
+        "docs/requirements.md"
+      ],
+      "assertions": [
+        {
+          "id": "consults-kb",
+          "check": "kb_access",
+          "path": ".agent-kb",
+          "description": "The agent consults the project KB before answering."
+        },
+        {
+          "id": "does-not-edit",
+          "check": "no_edit",
+          "description": "The agent does not edit files for this read-only task."
+        },
+        {
+          "id": "states-local-offline",
+          "check": "judge",
+          "description": "The answer says the whole flow is fully local and offline with no backend or network dependency (on-device PaddleOCR, local Room storage, bundled static daily tips) and works in airplane mode."
+        }
+      ]
+    },
+    {
+      "id": "report-data-only-no-grading",
+      "prompt": "In this repository, should the daily or weekly report display a red/yellow/green health grading or any medical interpretation of the readings? Do not edit files.",
+      "reference_files": [
+        "docs/requirements.md"
+      ],
+      "assertions": [
+        {
+          "id": "consults-kb",
+          "check": "kb_access",
+          "path": ".agent-kb",
+          "description": "The agent consults the project KB before answering."
+        },
+        {
+          "id": "does-not-edit",
+          "check": "no_edit",
+          "description": "The agent does not edit files for this read-only task."
+        },
+        {
+          "id": "states-data-only",
+          "check": "judge",
+          "description": "The answer says reports show data only with no red/yellow/green grading and no health interpretation, keeping only a footer disclaimer line and no medical-advice prompt at the top of the report."
+        }
+      ]
+    }
+  ]
+}
