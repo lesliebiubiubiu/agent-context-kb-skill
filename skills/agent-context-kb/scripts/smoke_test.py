@@ -1604,10 +1604,15 @@ def test_eval_runner_behavior_and_judge_parsers() -> None:
     prices = runner.price_table({"pricing": runner.default_pricing()}, "codex", "gpt-5.5")
     require(prices is not None and prices["input_per_million"] == 5.0, "runner should load shared Codex pricing")
     estimated = runner.estimate_cost_usd(
-        {"input_tokens": 1000, "cached_input_tokens": 1000, "output_tokens": 1000, "reasoning_output_tokens": 1000},
-        prices,
+        {"input_tokens": 100_000, "cached_input_tokens": 60_000, "output_tokens": 10_000, "reasoning_output_tokens": 4_000},
+        {
+            "input_per_million": 5.0,
+            "cached_input_per_million": 0.5,
+            "output_per_million": 10.0,
+            "reasoning_output_per_million": 2.0,
+        },
     )
-    require(abs(estimated - 0.0655) < 0.000001, "runner should estimate Codex cost from shared pricing")
+    require(abs(estimated - 0.298) < 0.000001, "runner should estimate subset token costs without double-counting")
     scored = runner.score_behavior_assertion(
         {"id": "read-start", "check": "tool_read", "path": ".agent-kb/start.md"},
         codex_parsed["tool_calls"],

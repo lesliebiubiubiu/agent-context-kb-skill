@@ -180,30 +180,54 @@ def price_table(config: dict, harness: str, model: str | None) -> dict | None:
     return None
 
 
-# Estimates USD cost from token usage and a per-million pricing table.
+# Estimates USD cost from token usage, treating OpenAI cached/reasoning fields as subsets.
 def estimate_cost_usd(usage, prices: dict | None) -> float | None:
     if not isinstance(usage, dict) or not isinstance(prices, dict):
         return None
-    fields = {
-        "input_tokens": "input_per_million",
-        "cached_input_tokens": "cached_input_per_million",
-        "cache_read_input_tokens": "cached_input_per_million",
-        "output_tokens": "output_per_million",
-        "reasoning_output_tokens": "reasoning_output_per_million",
-    }
     total = 0.0
     used = False
-    for token_field, price_field in fields.items():
-        tokens = usage.get(token_field)
-        price = prices.get(price_field)
-        if tokens is None:
-            continue
-        if price is None and token_field == "reasoning_output_tokens":
-            price = prices.get("output_per_million")
-        if price is None:
+
+    input_tokens = usage.get("input_tokens")
+    cached_input_tokens = usage.get("cached_input_tokens")
+    cache_read_input_tokens = usage.get("cache_read_input_tokens")
+    if input_tokens is not None:
+        input_price = prices.get("input_per_million")
+        if input_price is None:
             return None
-        total += float(tokens) * float(price) / 1_000_000
+        cached_subset = float(cached_input_tokens or 0)
+        total += max(float(input_tokens) - cached_subset, 0) * float(input_price) / 1_000_000
         used = True
+    if cached_input_tokens is not None:
+        cached_price = prices.get("cached_input_per_million")
+        if cached_price is None:
+            return None
+        total += float(cached_input_tokens) * float(cached_price) / 1_000_000
+        used = True
+    if cache_read_input_tokens is not None:
+        cached_price = prices.get("cached_input_per_million")
+        if cached_price is None:
+            return None
+        total += float(cache_read_input_tokens) * float(cached_price) / 1_000_000
+        used = True
+
+    output_tokens = usage.get("output_tokens")
+    reasoning_output_tokens = usage.get("reasoning_output_tokens")
+    if output_tokens is not None:
+        output_price = prices.get("output_per_million")
+        if output_price is None:
+            return None
+        reasoning_subset = float(reasoning_output_tokens or 0)
+        total += max(float(output_tokens) - reasoning_subset, 0) * float(output_price) / 1_000_000
+        used = True
+    if reasoning_output_tokens is not None:
+        reasoning_price = prices.get("reasoning_output_per_million")
+        if reasoning_price is None:
+            reasoning_price = prices.get("output_per_million")
+        if reasoning_price is None:
+            return None
+        total += float(reasoning_output_tokens) * float(reasoning_price) / 1_000_000
+        used = True
+
     return total if used else None
 
 
