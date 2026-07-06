@@ -35,6 +35,36 @@ and writes what it learns back.
   project's memory compounds over time instead of evaporating when a session
   ends.
 
+## Does it actually work?
+
+Most KB tools are designed to help and never checked. This one is evaluated.
+
+- **Agents really read it.** In our own dogfooding, agents opened the KB
+  before starting work in about 70% of recent sessions — up from under 40%
+  when we first started measuring.
+- **Cleanups don't lose knowledge.** Every time the KB is compacted, we
+  re-check that answers which were correct before are still correct after —
+  so tidying never silently drops something.
+- **The checks catch real problems.** Our own eval once flagged a project
+  question the KB was answering wrong; we fixed the KB and the same check
+  went green. The safety net isn't decorative.
+
+## How we measure it
+
+Each eval pins an exact repo commit *and* KB commit, so a run is
+reproducible rather than "it worked when I tried it." Tasks are read-only
+project-knowledge questions with two kinds of checks:
+
+- **Deterministic behavior checks**, read straight from the agent's
+  tool-call trace — did it open the right KB file, did it avoid editing
+  anything.
+- **Semantic checks** for the answer itself, scored by an LLM judge that's
+  calibrated against deliberately broken answers, so a rubber-stamp judge
+  fails the negative control.
+
+Runs are tracked per harness rather than pooled, and the whole bundle —
+tasks, pins, and runner — lives in [`evals/`](evals/).
+
 ## Quickstart
 
 Install the skill into your agent with the [`skills`](https://github.com/vercel-labs/skills)
