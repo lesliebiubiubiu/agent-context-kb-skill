@@ -278,14 +278,36 @@ def test_init_creates_current_plan_route() -> None:
         require("plans/current.md" in routes, "routes.yaml should include the current plan route")
 
 
-# Checks that init gives a warm-start hint when the KB contains only starter topic scaffolds.
+# Checks that init directs the agent to offer distillation and records it as the plan's next step.
 def test_init_empty_scaffold_warm_start_prompt() -> None:
     with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
         root = Path(tmp)
         result = run_cli(root, "init")
         require(result.returncode == 0, "init should succeed", result)
-        require("This KB is an empty scaffold." in result.stdout, "init should name the empty scaffold state", result)
+        require("NEXT STEP - REQUIRED BEFORE YOU CLOSE OUT" in result.stdout, "init should make the distillation offer mandatory", result)
+        require("offer to run it now" in result.stdout, "init should tell the agent to offer distillation", result)
+        require("Only run it if the user confirms" in result.stdout, "init should keep distillation prompt-only", result)
         require("not code summaries or obvious code facts" in result.stdout, "init should guard against bad distillation", result)
+        plan = (root / ".agent-kb" / "plans" / "current.md").read_text(encoding="utf-8")
+        require("one-time distillation pass" in plan, "init should record the pending distillation in the current plan")
+
+
+# Checks that validate flags a still-empty scaffold with an advisory and stays silent once topics have content.
+def test_validate_empty_scaffold_advisory() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        init_root(root)
+        result = run_cli(root, "validate")
+        require(result.returncode == 0, "validate should pass on a fresh scaffold", result)
+        require("ADVISORY: this KB is an empty scaffold" in result.stdout, "validate should flag the empty scaffold", result)
+        overview = root / ".agent-kb" / "architecture" / "overview.md"
+        overview.write_text(
+            overview.read_text(encoding="utf-8") + "\nDurable fact: module boundaries follow the plugin split.\n",
+            encoding="utf-8",
+        )
+        result = run_cli(root, "validate")
+        require(result.returncode == 0, "validate should pass once a topic has content", result)
+        require("ADVISORY: this KB is an empty scaffold" not in result.stdout, "advisory should stop once the KB has content", result)
 
 
 # Checks that upgrade creates the current plan when older KBs do not have it.
@@ -1996,6 +2018,7 @@ def main() -> int:
         test_validate_uses_routes_yaml,
         test_init_creates_current_plan_route,
         test_init_empty_scaffold_warm_start_prompt,
+        test_validate_empty_scaffold_advisory,
         test_upgrade_creates_missing_current_plan,
         test_upgrade_preserves_custom_scaffold_by_default,
         test_upgrade_can_write_start_template,

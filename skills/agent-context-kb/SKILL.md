@@ -28,8 +28,10 @@ python3 scripts/agent_kb.py stats --root /path/to/repo
 
 - `init`: create the scaffold and runtime protocol. Default versioning is a
   personal nested `.agent-kb/.git`; use `--shared` or `--local` when requested.
-  For existing projects, follow init with a one-time distillation pass; the init
-  output describes it.
+  When init reports an empty scaffold, initialization is NOT complete until you
+  have offered the user the one-time distillation pass described in the init
+  output (and run it if they accept). Do not summarize and close out without
+  doing this; if the user declines, leave the scaffold as-is.
 - `upgrade`: refresh generated protocol/scaffold files conservatively.
 - `validate`: run after KB edits; fix errors before finishing.
 - `note`: capture durable knowledge when the stable target is unclear.

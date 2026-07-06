@@ -209,7 +209,7 @@ None yet.
 
 ## Next
 
-None yet.
+{next}
 
 ## Open Questions
 
@@ -223,6 +223,12 @@ None yet.
 
 - {today} - Created initial lightweight plan.
 """
+
+# Pending next step init records in plans/current.md so the distillation survives the init session.
+DISTILLATION_NEXT_STEP = (
+    "Run the one-time distillation pass to warm-start this KB: survey README/docs/git "
+    "history, fill topic files with durable facts only, then remove this entry."
+)
 
 LINK_RE = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
 PLACEHOLDER_TEXTS = (
@@ -550,9 +556,11 @@ None yet.
 """
 
 
-# Builds the lightweight current plan document with today's creation date.
-def render_current_plan() -> str:
-    return PLAN_CURRENT_MD.format(today=dt.date.today().isoformat())
+# Builds the lightweight current plan document with today's date and an optional pending next step.
+def render_current_plan(next_step: str | None = None) -> str:
+    return PLAN_CURRENT_MD.format(
+        today=dt.date.today().isoformat(), next=next_step or "None yet."
+    )
 
 
 # Builds the KB meta marker: a small versioned record so future tooling can tell
@@ -869,7 +877,7 @@ def command_init(args: argparse.Namespace) -> int:
         "start.md": START_MD,
         "routes.yaml": ROUTES_YAML,
         "map.md": MAP_MD,
-        "plans/current.md": render_current_plan(),
+        "plans/current.md": render_current_plan(DISTILLATION_NEXT_STEP),
         ".gitignore": KB_GITIGNORE,
         ".kb-meta.yaml": render_kb_meta(mode),
     }.items():
@@ -919,10 +927,12 @@ def command_init(args: argparse.Namespace) -> int:
         print("KB is local-only and git-ignored; it has no version history.")
     if kb_is_empty_scaffold(kb):
         print(
-            "This KB is an empty scaffold. To warm-start it, ask the agent to distill the repo: "
-            "survey README/docs/git history, then fill topic files with durable facts only "
-            "(decisions, boundaries, pitfalls, doc-vs-reality gaps, and why from git history), "
-            "not code summaries or obvious code facts."
+            "NEXT STEP - REQUIRED BEFORE YOU CLOSE OUT: this KB is an empty scaffold with no "
+            "project knowledge yet. Tell the user it needs a one-time distillation pass to be "
+            "useful, and offer to run it now: survey README/docs/git history, then fill topic "
+            "files with durable facts only (decisions, boundaries, pitfalls, doc-vs-reality "
+            "gaps, and why from git history), not code summaries or obvious code facts. "
+            "Only run it if the user confirms; if they decline, leave the scaffold as-is."
         )
     return 0, {"created": len(created), "mode": mode}
 
@@ -1496,7 +1506,7 @@ def trim_structure_report(kb: Path, routes: list[dict[str, object]]) -> dict:
     }
 
 
-# Validates the KB scaffold, routes, links, inbox notes, and topic reachability.
+# Validates the KB scaffold, routes, links, inbox notes, and topic reachability; flags a still-empty scaffold.
 def command_validate(args: argparse.Namespace) -> tuple[int, dict]:
     root = repo_root(args)
     kb = kb_dir(root)
@@ -1510,6 +1520,12 @@ def command_validate(args: argparse.Namespace) -> tuple[int, dict]:
     if errors:
         return 1, metrics
     print(f"OK: validated {kb}")
+    if kb_is_empty_scaffold(kb):
+        print(
+            "ADVISORY: this KB is an empty scaffold (no distilled knowledge yet). "
+            "If you just initialized it, offer the user the one-time distillation pass "
+            "before closing out."
+        )
     return 0, metrics
 
 
