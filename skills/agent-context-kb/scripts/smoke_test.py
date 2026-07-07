@@ -287,7 +287,9 @@ def test_init_empty_scaffold_warm_start_prompt() -> None:
         require("NEXT STEP - REQUIRED BEFORE YOU CLOSE OUT" in result.stdout, "init should make the distillation offer mandatory", result)
         require("offer to run it now" in result.stdout, "init should tell the agent to offer distillation", result)
         require("Only run it if the user confirms" in result.stdout, "init should keep distillation prompt-only", result)
-        require("not code summaries or obvious code facts" in result.stdout, "init should guard against bad distillation", result)
+        require("Not code summaries or obvious code facts" in result.stdout, "init should guard against bad distillation", result)
+        require("git log -p" in result.stdout, "distillation prompt should demand patch-level history mining", result)
+        require("anomal" in result.stdout, "distillation prompt should name anomalies as the mining target", result)
         plan = (root / ".agent-kb" / "plans" / "current.md").read_text(encoding="utf-8")
         require("one-time distillation pass" in plan, "init should record the pending distillation in the current plan")
 

@@ -960,7 +960,10 @@ def command_init(args: argparse.Namespace) -> int:
             "project knowledge yet. Tell the user it needs a one-time distillation pass to be "
             "useful, and offer to run it now: survey README/docs/git history, then fill topic "
             "files with durable facts only (decisions, boundaries, pitfalls, doc-vs-reality "
-            "gaps, and why from git history), not code summaries or obvious code facts. "
+            "gaps), and mine git history for anomalies - silent dependency downgrades, version "
+            "pins, reverts, fix commits - with `git log -p`, not just subjects; record each "
+            "anomaly as a suspected workaround even when the reason is unrecorded. Not code "
+            "summaries or obvious code facts. "
             "Only run it if the user confirms; if they decline, leave the scaffold as-is."
         )
     return 0, {"created": len(created), "mode": mode}
