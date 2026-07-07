@@ -1101,7 +1101,8 @@ def command_upgrade(args: argparse.Namespace) -> int:
     routes, route_errors = parse_routes_yaml(kb / "routes.yaml")
     map_content = render_map(routes) if not route_errors else MAP_MD
     map_action = upgrade_scaffold_file(kb / "map.md", map_content, args.write_map)
-    custom_routes_preserved = routes_action == "needs review" and args.write_map and not args.write_routes and not route_errors
+    custom_routes_preserved = routes_action == "needs review" and not args.write_routes and not route_errors
+    custom_plan_preserved = plan_action == "needs review" and not args.write_plan
 
     print(f"Upgraded KB at {kb}")
     print(f".agent-kb/{KB_META_FILE} {meta_action}.")
@@ -1116,23 +1117,25 @@ def command_upgrade(args: argparse.Namespace) -> int:
         print(".agent-kb/routes.yaml custom routes preserved.")
     else:
         print(f".agent-kb/routes.yaml {routes_action}.")
-    print(f".agent-kb/plans/current.md {plan_action}.")
+    if custom_plan_preserved:
+        print(".agent-kb/plans/current.md custom preserved.")
+    else:
+        print(f".agent-kb/plans/current.md {plan_action}.")
     print(f".agent-kb/map.md {map_action}.")
     if start_action == "needs review":
         print("Review .agent-kb/start.md manually or rerun with --write-start to replace it.")
     if custom_routes_preserved:
-        print("custom routes preserved; map generated from routes.yaml")
+        if args.write_map:
+            print("custom routes preserved; map generated from routes.yaml")
     elif routes_action == "needs review":
         print("Review .agent-kb/routes.yaml manually; use --write-routes only if you want the default routes.")
-    if plan_action == "needs review":
-        print("Review .agent-kb/plans/current.md manually; use --write-plan only if you want the default empty plan.")
     if map_action == "needs review":
         print("Review .agent-kb/map.md manually; use --write-map only if you want the default routing table.")
     # Name the files awaiting review (routes are excluded when intentionally preserved) so stats/output need no second run.
     named_actions = [
         ("start.md", start_action),
         ("routes.yaml", "current" if custom_routes_preserved else routes_action),
-        ("plans/current.md", plan_action),
+        ("plans/current.md", "current" if custom_plan_preserved else plan_action),
         ("map.md", map_action),
     ]
     review_files = [name for name, action in named_actions if action == "needs review"]

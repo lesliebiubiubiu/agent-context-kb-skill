@@ -382,6 +382,45 @@ def test_upgrade_writes_map_from_routes() -> None:
         require("| Documentation | workflows/local-dev.md | conventions/comments.md |" in text, "write-map should render current routes")
 
 
+# Checks that upgrade reports normal project-owned plan content as preserved, not as a review item.
+def test_upgrade_preserves_custom_plan_without_review() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        init_root(root)
+        plan = root / ".agent-kb" / "plans" / "current.md"
+        before = plan.read_text(encoding="utf-8")
+        result = run_cli(root, "upgrade")
+        require(result.returncode == 0, "upgrade should succeed with custom current plan content", result)
+        require(".agent-kb/plans/current.md custom preserved." in result.stdout, "custom plan content should be reported as preserved", result)
+        require("needs review: plans/current.md" not in result.stdout, "custom plan content should not enter review files", result)
+        require(plan.read_text(encoding="utf-8") == before, "upgrade should not rewrite custom plan content")
+
+
+# Checks that parseable custom routes are preserved without being counted as review work.
+def test_upgrade_preserves_custom_routes_without_review() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        init_root(root)
+        routes = root / ".agent-kb" / "routes.yaml"
+        routes.write_text(
+            """routes:
+  - id: docs
+    task: Documentation
+    read_first:
+      - workflows/local-dev.md
+    also_consider:
+      - conventions/comments.md
+""",
+            encoding="utf-8",
+        )
+        before = routes.read_text(encoding="utf-8")
+        result = run_cli(root, "upgrade")
+        require(result.returncode == 0, "upgrade should succeed with custom routes", result)
+        require(".agent-kb/routes.yaml custom routes preserved." in result.stdout, "custom routes should be reported as preserved", result)
+        require("needs review: routes.yaml" not in result.stdout, "custom routes should not enter review files", result)
+        require(routes.read_text(encoding="utf-8") == before, "upgrade should not rewrite custom routes")
+
+
 # Checks that upgrade backfills metadata for older KBs and nudges nested-mode verification.
 def test_upgrade_backfills_missing_meta() -> None:
     with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
@@ -2158,6 +2197,8 @@ def main() -> int:
         test_upgrade_preserves_custom_scaffold_by_default,
         test_upgrade_can_write_start_template,
         test_upgrade_writes_map_from_routes,
+        test_upgrade_preserves_custom_plan_without_review,
+        test_upgrade_preserves_custom_routes_without_review,
         test_upgrade_backfills_missing_meta,
         test_upgrade_refreshes_meta_schema,
         test_validate_warns_schema_drift,
