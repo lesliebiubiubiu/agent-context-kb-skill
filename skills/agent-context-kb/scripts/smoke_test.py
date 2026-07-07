@@ -108,8 +108,8 @@ def fixture_claude_project_name(root: Path) -> str:
 
 # Checks Claude's observed project-directory encoding for punctuation-heavy paths.
 def test_claude_project_name_observed_encoding() -> None:
-    root = Path("/Users/lsl/Desktop/glucose/.claude/worktrees/rustling_jumping_volcano")
-    expected = "-Users-lsl-Desktop-glucose--claude-worktrees-rustling-jumping-volcano"
+    root = Path("/Users/dev/Desktop/glucose/.claude/worktrees/rustling_jumping_volcano")
+    expected = "-Users-dev-Desktop-glucose--claude-worktrees-rustling-jumping-volcano"
     require(claude_project_name(root) == expected, "Claude project encoding should replace non-alphanumerics")
 
 
@@ -174,6 +174,20 @@ def test_path_traversal_target() -> None:
         require("Unresolved: 1" in result.stdout, "unsafe target should remain unresolved", result)
         inbox_files = list((root / ".agent-kb" / "inbox").glob("*.md"))
         require(len(inbox_files) == 1, "unsafe target note should stay in inbox")
+
+
+# Checks that compile keeps notes whose target is a directory instead of crashing.
+def test_directory_target() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        init_root(root)
+        result = run_cli(root, "note", "--title", "Dir target", "--target", "inbox", "--body", "Nope.")
+        require(result.returncode == 0, "note with directory target should still be recorded", result)
+        result = run_cli(root, "compile")
+        require(result.returncode == 0, "compile should keep directory target notes unresolved", result)
+        require("Unresolved: 1" in result.stdout, "directory target should remain unresolved", result)
+        inbox_files = list((root / ".agent-kb" / "inbox").glob("*.md"))
+        require(len(inbox_files) == 1, "directory target note should stay in inbox")
 
 
 # Checks that validate reports document-relative broken links that normalize inside the KB.
@@ -2186,6 +2200,7 @@ def main() -> int:
         test_compile_format,
         test_empty_note_body,
         test_path_traversal_target,
+        test_directory_target,
         test_relative_broken_link,
         test_unreachable_topic_warning,
         test_placeholder_warning,

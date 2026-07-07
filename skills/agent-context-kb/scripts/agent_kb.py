@@ -1938,8 +1938,8 @@ def command_compile(args: argparse.Namespace) -> int:
             kept.append((path.name, "target is unsure or invalid"))
             continue
         target = kb / target_rel
-        if not target.exists():
-            kept.append((path.name, f"target does not exist: {target_raw}"))
+        if not target.is_file():
+            kept.append((path.name, f"target is not an existing file: {target_raw}"))
             continue
         append_note_to_target(target, note, path.name)
         path.unlink()
