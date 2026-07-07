@@ -382,6 +382,86 @@ def test_upgrade_writes_map_from_routes() -> None:
         require("| Documentation | workflows/local-dev.md | conventions/comments.md |" in text, "write-map should render current routes")
 
 
+# Checks that upgrade backfills metadata for older KBs and nudges nested-mode verification.
+def test_upgrade_backfills_missing_meta() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        init_root(root)
+        meta = root / ".agent-kb" / ".kb-meta.yaml"
+        meta.unlink()
+        result = run_cli(root, "upgrade")
+        require(result.returncode == 0, "upgrade should succeed when metadata is missing", result)
+        require(".agent-kb/.kb-meta.yaml created." in result.stdout, "upgrade should report metadata creation", result)
+        require("Metadata mode inferred as nested." in result.stdout, "upgrade should report the inferred mode", result)
+        require("git -C .agent-kb status" in result.stdout, "nested upgrade should show the nested verification hint", result)
+        text = meta.read_text(encoding="utf-8")
+        require("schema_version: 1" in text, "backfilled metadata should stamp the current schema")
+        require("mode: nested" in text, "backfilled metadata should preserve the inferred nested mode")
+
+
+# Checks that upgrade refreshes stale metadata while preserving mode and created fields.
+def test_upgrade_refreshes_meta_schema() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        init_root(root)
+        meta = root / ".agent-kb" / ".kb-meta.yaml"
+        meta.write_text("schema_version: 0\nmode: shared\ncreated: 2026-01-02\n", encoding="utf-8")
+        result = run_cli(root, "upgrade")
+        require(result.returncode == 0, "upgrade should succeed with stale metadata", result)
+        require(".agent-kb/.kb-meta.yaml updated." in result.stdout, "upgrade should report metadata update", result)
+        text = meta.read_text(encoding="utf-8")
+        require("schema_version: 1" in text, "upgrade should refresh the schema stamp")
+        require("mode: shared" in text, "upgrade should preserve the recorded mode")
+        require("created: 2026-01-02" in text, "upgrade should preserve the created date")
+
+
+# Checks that validate warns about missing or stale metadata without failing.
+def test_validate_warns_schema_drift() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        init_root(root)
+        meta = root / ".agent-kb" / ".kb-meta.yaml"
+        meta.unlink()
+        result = run_cli(root, "validate")
+        require(result.returncode == 0, "missing metadata should warn without failing", result)
+        require("WARN: KB scaffold has no .agent-kb/.kb-meta.yaml" in result.stdout, "validate should warn about missing metadata", result)
+        meta.write_text("schema_version: 0\nmode: nested\ncreated: 2026-01-02\n", encoding="utf-8")
+        result = run_cli(root, "validate")
+        require(result.returncode == 0, "stale metadata should warn without failing", result)
+        require("WARN: KB scaffold is schema 0; this skill writes schema 1 - run upgrade" in result.stdout, "validate should warn about schema drift", result)
+        meta.write_text("schema_version: 2\nmode: nested\ncreated: 2026-01-02\n", encoding="utf-8")
+        result = run_cli(root, "validate")
+        require(result.returncode == 0, "newer metadata should warn without failing", result)
+        require(
+            "WARN: KB scaffold is schema 2; this skill writes schema 1 - update this skill before modifying the KB" in result.stdout,
+            "validate should tell users to update the skill for newer KB schemas",
+            result,
+        )
+
+
+# Checks that upgrade does not downgrade metadata written by a newer skill.
+def test_upgrade_preserves_newer_meta_schema() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        init_root(root)
+        meta = root / ".agent-kb" / ".kb-meta.yaml"
+        meta.write_text("schema_version: 2\nmode: nested\ncreated: 2026-01-02\n", encoding="utf-8")
+        result = run_cli(root, "upgrade")
+        require(result.returncode == 0, "upgrade should succeed when metadata is newer", result)
+        require("schema 2 is newer than this skill; update the skill before upgrading" in result.stdout, "upgrade should explain the newer schema", result)
+        require("schema_version: 2" in meta.read_text(encoding="utf-8"), "upgrade should not downgrade a newer schema stamp")
+
+
+# Checks that a no-op protocol upgrade reports current instead of updated.
+def test_upgrade_reports_protocol_current_on_noop() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp)
+        init_root(root)
+        result = run_cli(root, "upgrade")
+        require(result.returncode == 0, "upgrade should succeed on a current protocol", result)
+        require("AGENTS.md protocol current." in result.stdout, "no-op protocol rewrite should be reported as current", result)
+
+
 # Checks that init respects a CLAUDE.md-primary repo when AGENTS.md is only a pointer.
 def test_init_uses_claude_when_agents_points_to_it() -> None:
     with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
@@ -2078,6 +2158,11 @@ def main() -> int:
         test_upgrade_preserves_custom_scaffold_by_default,
         test_upgrade_can_write_start_template,
         test_upgrade_writes_map_from_routes,
+        test_upgrade_backfills_missing_meta,
+        test_upgrade_refreshes_meta_schema,
+        test_validate_warns_schema_drift,
+        test_upgrade_preserves_newer_meta_schema,
+        test_upgrade_reports_protocol_current_on_noop,
         test_init_uses_claude_when_agents_points_to_it,
         test_upgrade_updates_claude_protocol_owner,
         test_agents_owner_when_claude_points_to_it,

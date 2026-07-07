@@ -28,6 +28,8 @@ from transcript_reads import (
 # change, so a future `upgrade` can tell what an existing KB was built with.
 # Decoupled from any general skill release version.
 SCHEMA_VERSION = 1
+KB_META_FILE = ".kb-meta.yaml"
+KB_MODES = {"nested", "shared", "local"}
 
 
 RUNTIME_PROTOCOL = """## Project Knowledge Base
@@ -571,15 +573,111 @@ def render_current_plan(next_step: str | None = None) -> str:
     )
 
 
-# Builds the KB meta marker: a small versioned record so future tooling can tell
-# what schema and versioning mode this KB was built with. Not a topic file
-# (non-.md), so KB scans skip it.
+# Builds the KB meta marker so tooling can read schema and mode without scanning topic files.
 def render_kb_meta(mode: str) -> str:
+    return render_kb_meta_record(SCHEMA_VERSION, mode, dt.date.today().isoformat())
+
+
+# Builds a KB meta marker from explicit fields, preserving mode/created during upgrade rewrites.
+def render_kb_meta_record(schema_version: int, mode: str, created: str) -> str:
     return (
-        f"schema_version: {SCHEMA_VERSION}\n"
+        f"schema_version: {schema_version}\n"
         f"mode: {mode}\n"
-        f"created: {dt.date.today().isoformat()}\n"
+        f"created: {created}\n"
     )
+
+
+# Parses the tiny .kb-meta.yaml subset into string fields and format warnings.
+def read_kb_meta(kb: Path) -> tuple[dict[str, str] | None, list[str]]:
+    path = kb / KB_META_FILE
+    if not path.exists():
+        return None, []
+    meta: dict[str, str] = {}
+    warnings = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if ":" not in stripped:
+            warnings.append(f".agent-kb/{KB_META_FILE} line {line_number}: expected key: value")
+            continue
+        key, value = [part.strip() for part in stripped.split(":", 1)]
+        meta[key] = value
+    return meta, warnings
+
+
+# Parses a schema_version field into a non-negative integer when it is well-formed.
+def parse_schema_version(value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    return parsed if parsed >= 0 else None
+
+
+# Checks whether the parent .gitignore already excludes .agent-kb/.
+def parent_gitignores_kb(root: Path) -> bool:
+    path = root / ".gitignore"
+    if not path.exists():
+        return False
+    entries = {line.strip().rstrip("/") for line in path.read_text(encoding="utf-8").splitlines()}
+    return ".agent-kb" in entries
+
+
+# Infers the KB versioning mode from current files when older KBs lack metadata.
+def infer_kb_mode(root: Path, kb: Path) -> str:
+    if (kb / ".git").exists():
+        return "nested"
+    if parent_gitignores_kb(root):
+        return "local"
+    return "shared"
+
+
+# Creates or refreshes .kb-meta.yaml while preserving existing mode and created fields when valid.
+def upgrade_kb_meta(root: Path, kb: Path) -> tuple[str, dict[str, str], str | None]:
+    meta, warnings = read_kb_meta(kb)
+    inferred_note = None
+    if meta is None:
+        mode = infer_kb_mode(root, kb)
+        created = dt.date.today().isoformat()
+        (kb / KB_META_FILE).write_text(render_kb_meta_record(SCHEMA_VERSION, mode, created), encoding="utf-8")
+        return "created", {"schema_version": str(SCHEMA_VERSION), "mode": mode, "created": created}, f"mode inferred as {mode}"
+
+    schema_number = parse_schema_version(meta.get("schema_version"))
+    if schema_number is not None and schema_number > SCHEMA_VERSION:
+        return "current", meta, f"schema {schema_number} is newer than this skill; update the skill before upgrading"
+
+    mode = meta.get("mode", "")
+    if mode not in KB_MODES:
+        mode = infer_kb_mode(root, kb)
+        inferred_note = f"mode inferred as {mode}"
+    created = meta.get("created") or dt.date.today().isoformat()
+    desired = render_kb_meta_record(SCHEMA_VERSION, mode, created)
+    path = kb / KB_META_FILE
+    if path.read_text(encoding="utf-8") == desired and not warnings:
+        return "current", {"schema_version": str(SCHEMA_VERSION), "mode": mode, "created": created}, None
+    path.write_text(desired, encoding="utf-8")
+    return "updated", {"schema_version": str(SCHEMA_VERSION), "mode": mode, "created": created}, inferred_note
+
+
+# Warns when KB metadata is missing or stamped with a different scaffold schema.
+def schema_drift_warnings(kb: Path) -> list[str]:
+    meta, meta_warnings = read_kb_meta(kb)
+    if meta is None:
+        return [f"KB scaffold has no .agent-kb/{KB_META_FILE}; run upgrade to backfill schema metadata"]
+    warnings = [f"{warning}; run upgrade to refresh schema metadata" for warning in meta_warnings]
+    schema = meta.get("schema_version")
+    schema_number = parse_schema_version(schema)
+    if schema_number is None:
+        warnings.append(f"KB scaffold schema is {schema or 'unknown'}; run upgrade to refresh schema metadata")
+    elif schema_number < SCHEMA_VERSION:
+        found = schema or "unknown"
+        warnings.append(f"KB scaffold is schema {found}; this skill writes schema {SCHEMA_VERSION} - run upgrade")
+    elif schema_number > SCHEMA_VERSION:
+        warnings.append(f"KB scaffold is schema {schema_number}; this skill writes schema {SCHEMA_VERSION} - update this skill before modifying the KB")
+    return warnings
 
 
 # Formats a list of route paths for the Markdown routing table.
@@ -797,9 +895,7 @@ def protocol_insert_index(text: str) -> int:
     return pos
 
 
-# Adds or replaces the Project Knowledge Base section in the selected agent instruction file.
-# New sections land high (under the title/intro, before the first `## `); existing sections
-# are swapped in place to avoid churning the user's chosen placement.
+# Adds or replaces the Project Knowledge Base section while preserving the user's surrounding instructions.
 def upsert_runtime_protocol(root: Path) -> tuple[Path, str, str | None]:
     protocol_path = protocol_target_path(root)
     if not protocol_path.exists():
@@ -809,6 +905,8 @@ def upsert_runtime_protocol(root: Path) -> tuple[Path, str, str | None]:
     text = protocol_path.read_text(encoding="utf-8")
     if PROTOCOL_SECTION_RE.search(text):
         updated = PROTOCOL_SECTION_RE.sub(RUNTIME_PROTOCOL.rstrip() + "\n\n", text).rstrip() + "\n"
+        if updated == text:
+            return protocol_path, "current", ensure_counterpart_reach(root, protocol_path)
         protocol_path.write_text(updated, encoding="utf-8")
         return protocol_path, "updated", ensure_counterpart_reach(root, protocol_path)
 
@@ -994,6 +1092,7 @@ def command_upgrade(args: argparse.Namespace) -> int:
     if not (kb / "inbox").exists():
         (kb / "inbox").mkdir(parents=True)
 
+    meta_action, meta, meta_note = upgrade_kb_meta(root, kb)
     protocol_path, protocol_action, counterpart_action = upsert_runtime_protocol(root)
     gitignore_action = upgrade_scaffold_file(kb / ".gitignore", KB_GITIGNORE, False)
     start_action = upgrade_scaffold_file(kb / "start.md", START_MD, args.write_start)
@@ -1005,6 +1104,9 @@ def command_upgrade(args: argparse.Namespace) -> int:
     custom_routes_preserved = routes_action == "needs review" and args.write_map and not args.write_routes and not route_errors
 
     print(f"Upgraded KB at {kb}")
+    print(f".agent-kb/{KB_META_FILE} {meta_action}.")
+    if meta_note:
+        print(f"Metadata {meta_note}.")
     print(f"{protocol_path.name} protocol {protocol_action}.")
     if counterpart_action:
         print(f"{counterpart_action}.")
@@ -1036,6 +1138,8 @@ def command_upgrade(args: argparse.Namespace) -> int:
     review_files = [name for name, action in named_actions if action == "needs review"]
     if review_files:
         print(f"needs review: {', '.join(review_files)}")
+    if meta.get("mode") == "nested":
+        print("Nested KB mode: verify with `git -C .agent-kb status` and `git -C .agent-kb diff`; commit KB changes when done.")
     return 0, {"needs_review": len(review_files), "review_files": review_files}
 
 
@@ -1425,6 +1529,7 @@ def validate_kb(kb: Path) -> tuple[list[str], list[str]]:
 
     if not kb.exists():
         return ["missing .agent-kb/"], warnings
+    warnings.extend(schema_drift_warnings(kb))
     for relative in ["start.md", "routes.yaml", "map.md"]:
         if not (kb / relative).exists():
             errors.append(f"missing .agent-kb/{relative}")
@@ -1556,6 +1661,7 @@ def protocol_reach_warnings(root: Path) -> list[str]:
     return []
 
 
+# Prints scaffold validation results, adding runtime-protocol warnings that need the repo root.
 def command_validate(args: argparse.Namespace) -> tuple[int, dict]:
     root = repo_root(args)
     kb = kb_dir(root)
@@ -1918,6 +2024,11 @@ def command_stats(args: argparse.Namespace) -> int:
     if not kb.exists():
         print("ERROR: missing .agent-kb/")
         return 1
+    drift_warnings = schema_drift_warnings(kb)
+    for warning in drift_warnings:
+        print(f"WARN: {warning}")
+    if drift_warnings:
+        print()
     scan: TranscriptScan | None = None
     added = 0
     backfill_error = None
