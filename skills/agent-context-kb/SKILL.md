@@ -1,6 +1,6 @@
 ---
 name: agent-context-kb
-description: Initialize, upgrade, maintain, validate, and compile a lightweight `.agent-kb/` project knowledge base for coding agents. Use when an agent needs to create the KB scaffold, refresh the runtime protocol in the main agent instruction file, record durable project knowledge, check KB links/routes, or merge inbox notes into stable topic documents.
+description: Manage a repository's `.agent-kb/` knowledge base (KB) for coding agents. Use when the user mentions the KB or asks to set up project memory, record durable knowledge, refresh the KB runtime protocol, validate routes/links, compile inbox notes into topics, or trim stale content.
 ---
 
 # Agent KB
@@ -28,10 +28,10 @@ python3 scripts/agent_kb.py stats --root /path/to/repo
 
 - `init`: create the scaffold and runtime protocol. Default versioning is a
   personal nested `.agent-kb/.git`; use `--shared` or `--local` when requested.
-  When init reports an empty scaffold, initialization is NOT complete until you
+  When init reports an empty scaffold, initialization completes only after you
   have offered the user the one-time distillation pass described in the init
-  output (and run it if they accept). Do not summarize and close out without
-  doing this; if the user declines, leave the scaffold as-is.
+  output — then run it if they accept, or leave the scaffold as-is if they
+  decline.
 - `upgrade`: refresh generated protocol/scaffold files conservatively.
 - `validate`: run after KB edits; fix errors before finishing.
 - `note`: capture durable knowledge when the stable target is unclear.
@@ -44,17 +44,13 @@ python3 scripts/agent_kb.py stats --root /path/to/repo
 
 ## Knowledge Rules
 
-Record durable knowledge only: architecture decisions, module boundaries,
-debugging conclusions, workflows, conventions, constraints, and pitfalls. Do not
-record progress logs, chat summaries, secrets, local credentials, or details
-obvious from code. Summarize or link human docs; do not move their full contents
-into the KB.
+Record durable knowledge only; the full do/don't canon lives in the generated
+`.agent-kb/start.md`. Summarize or link human docs rather than copying them in.
 
 ## Lightweight Plans
 
 Use `.agent-kb/plans/current.md` for durable continuity: current focus, major
-done milestones, next moves, and open questions. Keep it short; it is not an
-issue tracker, commit log, or progress log.
+done milestones, next moves, and open questions. Keep it short.
 
 ## Route Format
 
