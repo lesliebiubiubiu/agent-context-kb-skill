@@ -5,6 +5,10 @@ shared memory of your project. They read *before* working and
 update *after*, so context survives across sessions and across
 different agents.
 
+<!-- demo: record with asciinema + agg, save as .github/demo.gif, then:
+![An agent routing through the KB to answer a project question](.github/demo.gif)
+-->
+
 ## The Problem
 
 A coding agent starts cold. Each new session — and each different agent — opens
@@ -37,7 +41,8 @@ and writes what it learns back.
 
 ## Does it actually work?
 
-Most KB tools are designed to help and never checked. This one is evaluated.
+Most KB tools are designed to help and never checked. This one is evaluated —
+the full methodology and numbers are in [`evals/REPORT.md`](evals/REPORT.md).
 
 - **Agents really read it.** In our own dogfooding, agents opened the KB
   before starting work in about 70% of recent sessions — up from under 40%
@@ -78,15 +83,25 @@ Then, in any repo, ask your agent to set it up — for example:
 
 > "Initialize an agent-kb knowledge base in this repo."
 
-That triggers the skill, which scaffolds `.agent-kb/` with `start.md`,
-`routes.yaml`, starter topic files, and a short runtime protocol in the main
-agent instruction file telling agents how to use it.
+That triggers the skill, which scaffolds `.agent-kb/` and adds a short runtime
+protocol to the main agent instruction file telling agents how to use it:
 
-You can also run the bundled CLI directly from the installed skill directory:
-
-```bash
-python3 scripts/agent_kb.py init --root /path/to/repo
 ```
+.agent-kb/
+├── start.md         # entry point — agents read this first
+├── routes.yaml      # task type → which docs to read
+├── map.md           # one-page overview of every topic
+├── plans/           # current focus — new sessions resume, not restart
+├── inbox/           # quick notes, later compiled into topics
+├── architecture/    # how the system is shaped, and why
+├── decisions/       # what's settled, what was ruled out
+├── debugging/       # bugs already chased down
+├── workflows/       # how to build, test, deploy
+└── conventions/     # code style and project idioms
+```
+
+The agent then offers a one-time distillation pass — mining your README, docs,
+and git history for the durable facts that seed the topic files.
 
 ## Using the skill
 
@@ -115,12 +130,21 @@ place), and `upgrade` (refresh the protocol) — so you rarely call them yoursel
 
 Durable knowledge only: architecture decisions, module boundaries, debugging
 conclusions, conventions, integration constraints, and pitfalls future agents
-should avoid. **Not** progress logs, chat summaries, secrets, or anything obvious
-from reading the code.
+should avoid.
+
+> [!NOTE]
+> Not progress logs, chat summaries, secrets, or anything obvious from reading
+> the code — the KB stays useful precisely because it stays small.
 
 For the full protocol — route format, the compaction loop, and the versioning &
 privacy modes — see
 [`skills/agent-context-kb/SKILL.md`](skills/agent-context-kb/SKILL.md).
+
+## Changelog
+
+Versioned via git tags — see
+[GitHub Releases](https://github.com/lesliebiubiubiu/agent-context-kb-skill/releases)
+for what changed in each release.
 
 ## License
 

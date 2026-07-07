@@ -35,7 +35,7 @@ Use the runnable interpretation of the slice: **empty scaffold (PRE) vs distille
 both committed shared so both pin cleanly. This isolates the distillation's *content* value.
 
 ```bash
-cd /Users/lsl/Desktop/agent-context-kb-skill/evals
+cd path/to/agent-context-kb-skill/evals
 R=~/Desktop/pressure-fixture/repo
 
 # PRE — commit an empty scaffold, tag it, run:
