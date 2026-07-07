@@ -1,6 +1,6 @@
 ---
 name: agent-context-kb
-description: Manage a repository's `.agent-kb/` knowledge base (KB) for coding agents. Use when the user mentions the KB or asks to set up project memory, record durable knowledge, refresh the KB runtime protocol, validate routes/links, compile inbox notes into topics, or trim stale content.
+description: Manage and explain a repository's `.agent-kb/` knowledge base (KB) for coding agents. Use when the user works with the KB — asks how the KB or its commands behave, sets up project memory, records durable knowledge, refreshes the KB runtime protocol, validates routes/links, compiles inbox notes into topics, or trims stale content.
 ---
 
 # Agent KB
