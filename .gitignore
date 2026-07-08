@@ -1,13 +1,9 @@
 .DS_Store
 __pycache__/
+# README binaries live as GitHub release assets (tag: readme-assets), not in git history
+.github/demo.gif
 .agent-kb/
 docs/*
-!docs/superpowers/
-docs/superpowers/*
-!docs/superpowers/analysis/
-!docs/superpowers/analysis/*.md
-!docs/superpowers/baselines/
-!docs/superpowers/baselines/*.md
 evals/results/.raw/
 evals/results/**/*.jsonl
 evals/results/**/*.raw.json
