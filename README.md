@@ -1,5 +1,7 @@
 # Agent Context KB
 
+**English** | [中文](README.zh-CN.md)
+
 A lightweight, agent-facing, routed knowledge base that gives coding agents a
 durable, shared memory of your project. They read *before* working and
 update *after*, so context survives across sessions and across
