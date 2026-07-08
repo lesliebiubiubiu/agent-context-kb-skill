@@ -119,7 +119,7 @@ and git history for the durable facts that seed the topic files.
 
 ## Using the skill
 
-![An agent routing through the KB to finish tasks](https://github.com/lesliebiubiubiu/agent-context-kb-skill/releases/download/readme-assets/demo.gif)
+<img src="https://github.com/lesliebiubiubiu/agent-context-kb-skill/releases/download/readme-assets/demo.gif" alt="An agent routing through the KB to finish tasks" width="720">
 
 You mostly drive this in plain language — your agent picks the right command. A few typical prompts:
 
