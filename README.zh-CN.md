@@ -106,7 +106,7 @@ npx skills add lesliebiubiubiu/agent-context-kb-skill
 
 ## 使用这个 skill
 
-![Agent 通过知识库路由完成任务](https://github.com/lesliebiubiubiu/agent-context-kb-skill/releases/download/readme-assets/demo.gif)
+<img src="https://github.com/lesliebiubiubiu/agent-context-kb-skill/releases/download/readme-assets/demo.gif" alt="Agent 通过知识库路由完成任务" width="720">
 
 大部分时候你用自然语言驱动它——你的 agent 会挑对命令。几个典型的说法：
 
