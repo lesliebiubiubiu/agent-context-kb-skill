@@ -1,7 +1,7 @@
 # Agent Context KB
 
-A lightweight, agent-facing knowledge base that gives coding agents a durable,
-shared memory of your project. They read *before* working and
+A lightweight, agent-facing, routed knowledge base that gives coding agents a
+durable, shared memory of your project. They read *before* working and
 update *after*, so context survives across sessions and across
 different agents.
 
@@ -12,7 +12,7 @@ your project knowing nothing about it: how the system is shaped and why, what's
 been decided, what's been ruled out, what's already been painfully debugged.
 
 The usual fixes all collapse as a project grows. Stuff everything into
-`CLAUDE.md`, and the whole file gets injected into every session — it can only
+`AGENTS.md`/`CLAUDE.md`, and the whole file gets injected into every session — it can only
 grow until the signal drowns and agents start ignoring it. Write design docs,
 and the agent doesn't know which of thirty files answers today's question — and
 half of them are stale. Paste context by hand, and *you* are the memory,
@@ -108,12 +108,12 @@ The agent then offers a one-time distillation pass — mining your README, docs,
 and git history for the durable facts that seed the topic files.
 
 > [!TIP]
-By default the KB keeps itself out of your project's git history: it lives in
-its own nested repo (`.agent-kb/.git`) and `.agent-kb/` is gitignored, so your
-project stays clean and the memory stays yours. If you'd rather check the KB
-into the project so it travels with the repo, ask for a shared setup instead
-(`init --shared`) — the modes are detailed in
-[`SKILL.md`](skills/agent-context-kb/SKILL.md).
+> By default the KB keeps itself out of your project's git history: it lives in
+> its own nested repo (`.agent-kb/.git`) and `.agent-kb/` is gitignored, so your
+> project stays clean and the memory stays yours. If you'd rather check the KB
+> into the project so it travels with the repo, ask for a shared setup instead
+> (`init --shared`) — the modes are detailed in
+> [`SKILL.md`](skills/agent-context-kb/SKILL.md).
 
 ## Using the skill
 
