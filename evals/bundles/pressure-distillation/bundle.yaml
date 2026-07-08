@@ -1,0 +1,25 @@
+{
+  "name": "pressure-distillation",
+  "repo_path": "../../../../pressure-fixture/repo",
+  "repo_commit": "8cd49c8a7d383adb1d3ddbeecd74cb1d8c2fb445",
+  "kb_commit": "8cd49c8a7d383adb1d3ddbeecd74cb1d8c2fb445",
+  "task_file": "tasks.yaml",
+  "runner": {
+    "default_harness": "claude",
+    "agent_model": "opus",
+    "agent_models": {
+      "claude": "opus",
+      "codex": "gpt-5.5"
+    },
+    "agent_effort": "medium",
+    "judge_models": {
+      "claude": "opus",
+      "codex": "gpt-5.5"
+    },
+    "judge_efforts": {
+      "claude": "medium",
+      "codex": "medium"
+    },
+    "repetitions": 1
+  }
+}

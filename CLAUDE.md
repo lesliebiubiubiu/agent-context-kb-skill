@@ -1,4 +1,5 @@
 # CLAUDE.md
 
-See [AGENTS.md](AGENTS.md) for repository structure, commands, conventions, and
-the `.agent-kb/` project knowledge base protocol.
+See [AGENTS.md](AGENTS.md) for repository structure, commands, and conventions.
+The `.agent-kb/` project knowledge base protocol is in
+[AGENTS.md](AGENTS.md#project-knowledge-base) — follow it in every session.

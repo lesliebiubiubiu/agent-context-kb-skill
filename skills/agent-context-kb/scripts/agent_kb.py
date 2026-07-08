@@ -12,33 +12,46 @@ import subprocess
 import sys
 from pathlib import Path
 
+from transcript_reads import (
+    KbReadEvent,
+    TranscriptScan,
+    claude_transcript_paths,
+    parse_claude_transcript,
+    parse_codex_transcript,
+    resolve_path as resolve_transcript_path,
+    transcript_mentions,
+    transcript_paths,
+)
+
 
 # KB scaffold schema version. Bump only when the on-disk KB layout/templates
 # change, so a future `upgrade` can tell what an existing KB was built with.
 # Decoupled from any general skill release version.
 SCHEMA_VERSION = 1
+KB_META_FILE = ".kb-meta.yaml"
+KB_MODES = {"nested", "shared", "local"}
 
 
 RUNTIME_PROTOCOL = """## Project Knowledge Base
 
-Use `.agent-kb/` as the project knowledge base.
-Treat it as an agent-facing index and distilled knowledge layer; do not replace
-human docs with KB entries.
-
-Before non-trivial coding:
+Use `.agent-kb/` before broad code search when planning, building, debugging, or reviewing.
 1. Read `.agent-kb/start.md`.
-2. Read `.agent-kb/routes.yaml` as the source of truth; use `.agent-kb/map.md`
-   only as a readable view if helpful.
-3. Read only KB documents relevant to the current task.
+2. Read `.agent-kb/routes.yaml`; pick only relevant routes.
+3. Read those KB docs, then search code for gaps.
 
-After coding:
-- Update `.agent-kb/` only when the work creates or changes reusable project knowledge.
-- Prefer the relevant topic file.
-- Use `.agent-kb/inbox/` when the right location is unclear.
-- Do not write ordinary progress logs or one-off chat summaries into KB.
+After work, update a topic or `.agent-kb/inbox/` only for reusable project knowledge.
+Do not store progress logs, chat summaries, secrets, or obvious code facts.
 """
 
 PROTOCOL_SECTION_RE = re.compile(r"^## Project Knowledge Base\n.*?(?=^## |\Z)", re.M | re.S)
+
+PROTOCOL_BODY_MARKER = "Use `.agent-kb/` before broad code search"
+
+POINTER_FILE_TMPL = (
+    "See [{owner}]({owner}) for repository instructions and the `.agent-kb/` knowledge base protocol.\n"
+)
+
+POINTER_SECTION_TMPL = "## Project Knowledge Base\n\nSee [{owner}]({owner}) for the `.agent-kb/` protocol.\n"
 
 START_MD = """# Agent KB Start
 
@@ -206,7 +219,7 @@ None yet.
 
 ## Next
 
-None yet.
+{next}
 
 ## Open Questions
 
@@ -221,6 +234,12 @@ None yet.
 - {today} - Created initial lightweight plan.
 """
 
+# Pending next step init records in plans/current.md so the distillation survives the init session.
+DISTILLATION_NEXT_STEP = (
+    "Run the one-time distillation pass to warm-start this KB: survey README/docs/git "
+    "history, fill topic files with durable facts only, then remove this entry."
+)
+
 LINK_RE = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
 PLACEHOLDER_TEXTS = (
     "No durable knowledge recorded yet.",
@@ -234,9 +253,13 @@ TRIM_MAX_FILE_LINES = 120
 TRIM_MAX_FILE_CHARS = 14000
 TRIM_MAX_TOTAL_CHARS = 20000
 TRIM_MAX_INBOX_NOTES = 5
+TRIM_MAX_LINK_DEPTH = 3
+TRIM_MAX_DOC_FANOUT = 10
+TRIM_MAX_ROUTES = 15
 # Char overage at or above this fraction is "major" (the file likely carries compactable bulk);
 # anything else — including line-only overage — is "minor", an advisory the agent can stop on.
 TRIM_MAJOR_OVERAGE = 0.10
+TRANSCRIPT_CACHE_VERSION = 2
 
 
 # Returns the repository root from an argparse namespace.
@@ -305,6 +328,152 @@ def read_events(path: Path) -> list[dict]:
         except json.JSONDecodeError:
             continue
     return events
+
+
+# Builds a stable dedupe key for transcript-backed KB read events.
+def kb_read_event_key(event: dict) -> tuple[str, str, str]:
+    return (str(event.get("session", "")), str(event.get("file", "")), str(event.get("ts", "")))
+
+
+# Converts a transcript read into the shared events.jsonl record shape.
+def kb_read_log_event(read: KbReadEvent) -> dict:
+    return {
+        "ts": read.timestamp,
+        "event": "kb_read",
+        "kind": "kb_read",
+        "source": "backfill",
+        "harness": read.harness,
+        "session": read.session,
+        "file": read.file,
+        "chars": read.chars,
+    }
+
+
+# Appends new KB read events to events.jsonl while deduping by session/file/timestamp.
+def append_kb_read_events(kb: Path, reads: list[KbReadEvent]) -> int:
+    log_path = kb / ".log" / "events.jsonl"
+    existing = {kb_read_event_key(event) for event in read_events(log_path) if event.get("event") == "kb_read"}
+    new_events = []
+    for read in reads:
+        event = kb_read_log_event(read)
+        key = kb_read_event_key(event)
+        if key in existing:
+            continue
+        existing.add(key)
+        new_events.append(event)
+    if not new_events:
+        return 0
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as handle:
+        for event in new_events:
+            handle.write(json.dumps(event) + "\n")
+    return len(new_events)
+
+
+# Returns the local transcript backfill cache path inside the gitignored KB log directory.
+def transcript_cache_path(kb: Path) -> Path:
+    return kb / ".log" / "transcript-backfill-cache.json"
+
+
+# Reads the local transcript backfill cache, dropping it when the schema version differs.
+def read_transcript_cache(kb: Path) -> dict:
+    path = transcript_cache_path(kb)
+    if not path.exists():
+        return {"version": TRANSCRIPT_CACHE_VERSION, "files": {}}
+    try:
+        cache = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"version": TRANSCRIPT_CACHE_VERSION, "files": {}}
+    if not isinstance(cache, dict) or cache.get("version") != TRANSCRIPT_CACHE_VERSION:
+        return {"version": TRANSCRIPT_CACHE_VERSION, "files": {}}
+    if not isinstance(cache.get("files"), dict):
+        cache["files"] = {}
+    return cache
+
+
+# Writes the local transcript backfill cache best-effort so stats never fails because of caching.
+def write_transcript_cache(kb: Path, cache: dict) -> None:
+    try:
+        path = transcript_cache_path(kb)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(cache, sort_keys=True) + "\n", encoding="utf-8")
+    except OSError:
+        return
+
+
+# Builds a cheap file signature for deciding whether a transcript needs reparsing.
+def transcript_signature(path: Path) -> dict | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return {"mtime_ns": stat.st_mtime_ns, "size": stat.st_size}
+
+
+# Converts one transcript scan into a cache entry that keeps only denominator-safe session data.
+def transcript_cache_entry(harness: str, signature: dict, scan: TranscriptScan) -> dict:
+    return {
+        "harness": harness,
+        "mtime_ns": signature["mtime_ns"],
+        "size": signature["size"],
+        "sessions": sorted(scan.sessions),
+    }
+
+
+# Scans changed transcript files and reuses cached session ownership for unchanged files.
+def scan_transcripts_incremental(root: Path, kb: Path, claude_dir: Path | None, codex_dir: Path | None) -> TranscriptScan:
+    cache = read_transcript_cache(kb)
+    cached_files = cache.get("files", {})
+    next_files: dict[str, dict] = {}
+    sessions: set[str] = set()
+    reads: list[KbReadEvent] = []
+    codex_needles = {str(root), root.name, ".agent-kb"}
+
+    # Parses one transcript when changed, otherwise restores its cached root-owned sessions.
+    def scan_path(path: Path, harness: str, needs_mention: bool) -> None:
+        signature = transcript_signature(path)
+        if signature is None:
+            return
+        key = str(path)
+        cached = cached_files.get(key) if isinstance(cached_files, dict) else None
+        if (
+            isinstance(cached, dict)
+            and cached.get("harness") == harness
+            and cached.get("mtime_ns") == signature["mtime_ns"]
+            and cached.get("size") == signature["size"]
+        ):
+            sessions.update(str(session) for session in cached.get("sessions", []))
+            next_files[key] = cached
+            return
+        if needs_mention and not transcript_mentions(path, codex_needles):
+            scan = TranscriptScan(set(), [])
+        elif harness == "claude":
+            scan = parse_claude_transcript(path, root)
+        else:
+            scan = parse_codex_transcript(path, root)
+        sessions.update(scan.sessions)
+        reads.extend(scan.reads)
+        next_files[key] = transcript_cache_entry(harness, signature, scan)
+
+    if claude_dir is not None:
+        for path in claude_transcript_paths(claude_dir, root):
+            scan_path(path, "claude", False)
+    if codex_dir is not None:
+        for path in transcript_paths(codex_dir):
+            scan_path(path, "codex", True)
+
+    write_transcript_cache(kb, {"version": TRANSCRIPT_CACHE_VERSION, "files": next_files})
+    return TranscriptScan(sessions, reads)
+
+
+# Scans transcripts for this repo and backfills KB read events into the local event log.
+def backfill_kb_reads(root: Path, args: argparse.Namespace) -> tuple[TranscriptScan, int]:
+    kb = kb_dir(root)
+    claude_dir = None if args.no_backfill_claude else resolve_transcript_path(args.claude_dir)
+    codex_dir = None if args.no_backfill_codex else resolve_transcript_path(args.codex_dir)
+    scan = scan_transcripts_incremental(root, kb, claude_dir, codex_dir)
+    added = append_kb_read_events(kb, scan.reads)
+    return scan, added
 
 
 # Treats a logged event as part of the current session if its timestamp falls within the recency window.
@@ -397,20 +566,118 @@ None yet.
 """
 
 
-# Builds the lightweight current plan document with today's creation date.
-def render_current_plan() -> str:
-    return PLAN_CURRENT_MD.format(today=dt.date.today().isoformat())
-
-
-# Builds the KB meta marker: a small versioned record so future tooling can tell
-# what schema and versioning mode this KB was built with. Not a topic file
-# (non-.md), so KB scans skip it.
-def render_kb_meta(mode: str) -> str:
-    return (
-        f"schema_version: {SCHEMA_VERSION}\n"
-        f"mode: {mode}\n"
-        f"created: {dt.date.today().isoformat()}\n"
+# Builds the lightweight current plan document with today's date and an optional pending next step.
+def render_current_plan(next_step: str | None = None) -> str:
+    return PLAN_CURRENT_MD.format(
+        today=dt.date.today().isoformat(), next=next_step or "None yet."
     )
+
+
+# Builds the KB meta marker so tooling can read schema and mode without scanning topic files.
+def render_kb_meta(mode: str) -> str:
+    return render_kb_meta_record(SCHEMA_VERSION, mode, dt.date.today().isoformat())
+
+
+# Builds a KB meta marker from explicit fields, preserving mode/created during upgrade rewrites.
+def render_kb_meta_record(schema_version: int, mode: str, created: str) -> str:
+    return (
+        f"schema_version: {schema_version}\n"
+        f"mode: {mode}\n"
+        f"created: {created}\n"
+    )
+
+
+# Parses the tiny .kb-meta.yaml subset into string fields and format warnings.
+def read_kb_meta(kb: Path) -> tuple[dict[str, str] | None, list[str]]:
+    path = kb / KB_META_FILE
+    if not path.exists():
+        return None, []
+    meta: dict[str, str] = {}
+    warnings = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if ":" not in stripped:
+            warnings.append(f".agent-kb/{KB_META_FILE} line {line_number}: expected key: value")
+            continue
+        key, value = [part.strip() for part in stripped.split(":", 1)]
+        meta[key] = value
+    return meta, warnings
+
+
+# Parses a schema_version field into a non-negative integer when it is well-formed.
+def parse_schema_version(value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    return parsed if parsed >= 0 else None
+
+
+# Checks whether the parent .gitignore already excludes .agent-kb/.
+def parent_gitignores_kb(root: Path) -> bool:
+    path = root / ".gitignore"
+    if not path.exists():
+        return False
+    entries = {line.strip().rstrip("/") for line in path.read_text(encoding="utf-8").splitlines()}
+    return ".agent-kb" in entries
+
+
+# Infers the KB versioning mode from current files when older KBs lack metadata.
+def infer_kb_mode(root: Path, kb: Path) -> str:
+    if (kb / ".git").exists():
+        return "nested"
+    if parent_gitignores_kb(root):
+        return "local"
+    return "shared"
+
+
+# Creates or refreshes .kb-meta.yaml while preserving existing mode and created fields when valid.
+def upgrade_kb_meta(root: Path, kb: Path) -> tuple[str, dict[str, str], str | None]:
+    meta, warnings = read_kb_meta(kb)
+    inferred_note = None
+    if meta is None:
+        mode = infer_kb_mode(root, kb)
+        created = dt.date.today().isoformat()
+        (kb / KB_META_FILE).write_text(render_kb_meta_record(SCHEMA_VERSION, mode, created), encoding="utf-8")
+        return "created", {"schema_version": str(SCHEMA_VERSION), "mode": mode, "created": created}, f"mode inferred as {mode}"
+
+    schema_number = parse_schema_version(meta.get("schema_version"))
+    if schema_number is not None and schema_number > SCHEMA_VERSION:
+        return "current", meta, f"schema {schema_number} is newer than this skill; update the skill before upgrading"
+
+    mode = meta.get("mode", "")
+    if mode not in KB_MODES:
+        mode = infer_kb_mode(root, kb)
+        inferred_note = f"mode inferred as {mode}"
+    created = meta.get("created") or dt.date.today().isoformat()
+    desired = render_kb_meta_record(SCHEMA_VERSION, mode, created)
+    path = kb / KB_META_FILE
+    if path.read_text(encoding="utf-8") == desired and not warnings:
+        return "current", {"schema_version": str(SCHEMA_VERSION), "mode": mode, "created": created}, None
+    path.write_text(desired, encoding="utf-8")
+    return "updated", {"schema_version": str(SCHEMA_VERSION), "mode": mode, "created": created}, inferred_note
+
+
+# Warns when KB metadata is missing or stamped with a different scaffold schema.
+def schema_drift_warnings(kb: Path) -> list[str]:
+    meta, meta_warnings = read_kb_meta(kb)
+    if meta is None:
+        return [f"KB scaffold has no .agent-kb/{KB_META_FILE}; run upgrade to backfill schema metadata"]
+    warnings = [f"{warning}; run upgrade to refresh schema metadata" for warning in meta_warnings]
+    schema = meta.get("schema_version")
+    schema_number = parse_schema_version(schema)
+    if schema_number is None:
+        warnings.append(f"KB scaffold schema is {schema or 'unknown'}; run upgrade to refresh schema metadata")
+    elif schema_number < SCHEMA_VERSION:
+        found = schema or "unknown"
+        warnings.append(f"KB scaffold is schema {found}; this skill writes schema {SCHEMA_VERSION} - run upgrade")
+    elif schema_number > SCHEMA_VERSION:
+        warnings.append(f"KB scaffold is schema {schema_number}; this skill writes schema {SCHEMA_VERSION} - update this skill before modifying the KB")
+    return warnings
 
 
 # Formats a list of route paths for the Markdown routing table.
@@ -540,49 +807,116 @@ def has_protocol_section(path: Path) -> bool:
     return path.exists() and bool(PROTOCOL_SECTION_RE.search(path.read_text(encoding="utf-8")))
 
 
-# Checks whether a short instruction file only points agents to another instruction file.
+# Checks whether a file carries the full KB runtime protocol, not just a pointer section to it.
+def has_full_protocol(path: Path) -> bool:
+    return path.exists() and PROTOCOL_BODY_MARKER in path.read_text(encoding="utf-8")
+
+
+# Checks whether an instruction file, ignoring any injected protocol section, only points agents to another file.
 def is_pointer_file(path: Path, target_name: str) -> bool:
     if not path.exists():
         return False
-    text = path.read_text(encoding="utf-8")
+    text = PROTOCOL_SECTION_RE.sub("", path.read_text(encoding="utf-8"))
     text_lower = text.lower()
-    if has_protocol_section(path) or target_name.lower() not in text_lower:
+    if target_name.lower() not in text_lower:
         return False
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     pointer_words = ["see", "read", "refer", "follow", "use"]
     return len(lines) <= 8 and len(text) <= 1000 and any(word in text_lower for word in pointer_words)
 
 
-# Picks the instruction file that should receive the KB runtime protocol, preserving CLAUDE.md-primary repos.
+# Picks the protocol owner file: pointer arrangements decide direction, then an existing full protocol sticks.
 def protocol_target_path(root: Path) -> Path:
     agents_path = root / "AGENTS.md"
     claude_path = root / "CLAUDE.md"
-    for path in [agents_path, claude_path]:
-        if has_protocol_section(path):
-            return path
-    if agents_path.exists() and claude_path.exists() and is_pointer_file(agents_path, "CLAUDE.md"):
+    if agents_path.exists() and claude_path.exists():
+        if is_pointer_file(agents_path, "CLAUDE.md"):
+            return claude_path
+        if is_pointer_file(claude_path, "AGENTS.md"):
+            return agents_path
+    if has_full_protocol(claude_path):
         return claude_path
+    if has_full_protocol(agents_path):
+        return agents_path
     if claude_path.exists() and not agents_path.exists():
         return claude_path
     return agents_path
 
 
-# Adds or replaces the Project Knowledge Base section in the selected agent instruction file.
-def upsert_runtime_protocol(root: Path) -> tuple[Path, str]:
+# Ensures the other harness's instruction file can reach the protocol owner via a pointer, creating or migrating as needed.
+def ensure_counterpart_reach(root: Path, protocol_path: Path) -> str | None:
+    other_name = "CLAUDE.md" if protocol_path.name == "AGENTS.md" else "AGENTS.md"
+    counterpart = root / other_name
+    if not counterpart.exists():
+        counterpart.write_text(POINTER_FILE_TMPL.format(owner=protocol_path.name), encoding="utf-8")
+        return f"{other_name} created as a pointer to {protocol_path.name}"
+    text = counterpart.read_text(encoding="utf-8")
+    if has_full_protocol(counterpart):
+        # A duplicate or misplaced full protocol: keep one owner, leave a pointer (or nothing if one already exists).
+        stripped = PROTOCOL_SECTION_RE.sub("", text)
+        replacement = "" if protocol_path.name.lower() in stripped.lower() else POINTER_SECTION_TMPL.format(owner=protocol_path.name) + "\n"
+        updated = PROTOCOL_SECTION_RE.sub(lambda _: replacement, text)
+        updated = re.sub(r"\n{3,}", "\n\n", updated).rstrip() + "\n"
+        counterpart.write_text(updated, encoding="utf-8")
+        return f"{other_name} protocol replaced with a pointer to {protocol_path.name}"
+    if protocol_path.name.lower() in text.lower():
+        return None
+    index = protocol_insert_index(text)
+    head, tail = text[:index], text[index:]
+    head = head.rstrip("\n") + "\n\n" if head.strip() else head
+    block = POINTER_SECTION_TMPL.format(owner=protocol_path.name)
+    block = block + "\n" + tail.lstrip("\n") if tail.strip() else block
+    counterpart.write_text((head + block).rstrip() + "\n", encoding="utf-8")
+    return f"{other_name} pointer to {protocol_path.name} added"
+
+
+# Finds where to slot a new protocol: under the file's lead section, not above it — after the
+# H1/intro and the first `## ` section, before the second `## ` (or end of file as a fallback).
+def protocol_insert_index(text: str) -> int:
+    lines = text.splitlines(keepends=True)
+    pos = 0
+    i = 0
+    # Skip a leading H1 title line if present, so the protocol sits under it, not above.
+    if i < len(lines) and lines[i].lstrip().startswith("# "):
+        pos += len(lines[i])
+        i += 1
+    # Skip the title's intro paragraph up to the first `## ` subheading.
+    while i < len(lines) and not lines[i].lstrip().startswith("## "):
+        pos += len(lines[i])
+        i += 1
+    # If a first section exists, skip past it so the protocol lands under it, not above the
+    # consumer's lead section; with no `## ` at all this returns end-of-file (graceful append).
+    if i < len(lines):
+        pos += len(lines[i])
+        i += 1
+        while i < len(lines) and not lines[i].lstrip().startswith("## "):
+            pos += len(lines[i])
+            i += 1
+    return pos
+
+
+# Adds or replaces the Project Knowledge Base section while preserving the user's surrounding instructions.
+def upsert_runtime_protocol(root: Path) -> tuple[Path, str, str | None]:
     protocol_path = protocol_target_path(root)
     if not protocol_path.exists():
         protocol_path.write_text(RUNTIME_PROTOCOL, encoding="utf-8")
-        return protocol_path, "created"
+        return protocol_path, "created", ensure_counterpart_reach(root, protocol_path)
 
     text = protocol_path.read_text(encoding="utf-8")
     if PROTOCOL_SECTION_RE.search(text):
         updated = PROTOCOL_SECTION_RE.sub(RUNTIME_PROTOCOL.rstrip() + "\n\n", text).rstrip() + "\n"
+        if updated == text:
+            return protocol_path, "current", ensure_counterpart_reach(root, protocol_path)
         protocol_path.write_text(updated, encoding="utf-8")
-        return protocol_path, "updated"
+        return protocol_path, "updated", ensure_counterpart_reach(root, protocol_path)
 
-    separator = "" if text.endswith("\n\n") else "\n\n" if text.endswith("\n") else "\n\n"
-    protocol_path.write_text(text + separator + RUNTIME_PROTOCOL, encoding="utf-8")
-    return protocol_path, "appended"
+    index = protocol_insert_index(text)
+    head, tail = text[:index], text[index:]
+    head = head.rstrip("\n") + "\n\n" if head.strip() else head
+    block = RUNTIME_PROTOCOL.rstrip() + "\n"
+    block = block + "\n" + tail.lstrip("\n") if tail.strip() else block
+    protocol_path.write_text((head + block).rstrip() + "\n", encoding="utf-8")
+    return protocol_path, "appended", ensure_counterpart_reach(root, protocol_path)
 
 
 # Keeps the best-effort event log out of git; lives inside the KB so it travels with the scaffold.
@@ -645,7 +979,7 @@ def init_nested_repo(kb: Path) -> str:
     return "created"
 
 
-# Initializes the KB scaffold, runtime protocol, and the chosen versioning mode (nested by default).
+# Initializes the KB scaffold, runtime protocol, versioning mode, and any just-in-time next-step hints.
 def command_init(args: argparse.Namespace) -> int:
     root = repo_root(args)
     kb = kb_dir(root)
@@ -668,7 +1002,7 @@ def command_init(args: argparse.Namespace) -> int:
         "start.md": START_MD,
         "routes.yaml": ROUTES_YAML,
         "map.md": MAP_MD,
-        "plans/current.md": render_current_plan(),
+        "plans/current.md": render_current_plan(DISTILLATION_NEXT_STEP),
         ".gitignore": KB_GITIGNORE,
         ".kb-meta.yaml": render_kb_meta(mode),
     }.items():
@@ -679,7 +1013,7 @@ def command_init(args: argparse.Namespace) -> int:
         if write_if_missing(kb / relative, render_topic(title, read_when)):
             created.append(str(Path(".agent-kb") / relative))
 
-    protocol_path, protocol_action = upsert_runtime_protocol(root)
+    protocol_path, protocol_action, counterpart_action = upsert_runtime_protocol(root)
 
     # Set up the chosen versioning mode: nested/local keep the KB out of the parent
     # repo via .gitignore; nested additionally gives the KB its own git history.
@@ -692,6 +1026,8 @@ def command_init(args: argparse.Namespace) -> int:
 
     print(f"Initialized KB at {kb}")
     print(f"{protocol_path.name} protocol {protocol_action}.")
+    if counterpart_action:
+        print(f"{counterpart_action}.")
     if created:
         print("Created files:")
         for path in created:
@@ -716,6 +1052,18 @@ def command_init(args: argparse.Namespace) -> int:
         print("KB will travel with the parent repo; commit .agent-kb/ alongside your code.")
     elif mode == "local":
         print("KB is local-only and git-ignored; it has no version history.")
+    if kb_is_empty_scaffold(kb):
+        print(
+            "NEXT STEP - REQUIRED BEFORE YOU CLOSE OUT: this KB is an empty scaffold with no "
+            "project knowledge yet. Tell the user it needs a one-time distillation pass to be "
+            "useful, and offer to run it now: survey README/docs/git history, then fill topic "
+            "files with durable facts only (decisions, boundaries, pitfalls, doc-vs-reality "
+            "gaps), and mine git history for anomalies - silent dependency downgrades, version "
+            "pins, reverts, fix commits - with `git log -p`, not just subjects; record each "
+            "anomaly as a suspected workaround even when the reason is unrecorded. Not code "
+            "summaries or obvious code facts. "
+            "Only run it if the user confirms; if they decline, leave the scaffold as-is."
+        )
     return 0, {"created": len(created), "mode": mode}
 
 
@@ -744,7 +1092,8 @@ def command_upgrade(args: argparse.Namespace) -> int:
     if not (kb / "inbox").exists():
         (kb / "inbox").mkdir(parents=True)
 
-    protocol_path, protocol_action = upsert_runtime_protocol(root)
+    meta_action, meta, meta_note = upgrade_kb_meta(root, kb)
+    protocol_path, protocol_action, counterpart_action = upsert_runtime_protocol(root)
     gitignore_action = upgrade_scaffold_file(kb / ".gitignore", KB_GITIGNORE, False)
     start_action = upgrade_scaffold_file(kb / "start.md", START_MD, args.write_start)
     routes_action = upgrade_scaffold_file(kb / "routes.yaml", ROUTES_YAML, args.write_routes)
@@ -752,38 +1101,48 @@ def command_upgrade(args: argparse.Namespace) -> int:
     routes, route_errors = parse_routes_yaml(kb / "routes.yaml")
     map_content = render_map(routes) if not route_errors else MAP_MD
     map_action = upgrade_scaffold_file(kb / "map.md", map_content, args.write_map)
-    custom_routes_preserved = routes_action == "needs review" and args.write_map and not args.write_routes and not route_errors
+    custom_routes_preserved = routes_action == "needs review" and not args.write_routes and not route_errors
+    custom_plan_preserved = plan_action == "needs review" and not args.write_plan
 
     print(f"Upgraded KB at {kb}")
+    print(f".agent-kb/{KB_META_FILE} {meta_action}.")
+    if meta_note:
+        print(f"Metadata {meta_note}.")
     print(f"{protocol_path.name} protocol {protocol_action}.")
+    if counterpart_action:
+        print(f"{counterpart_action}.")
     print(f".agent-kb/.gitignore {gitignore_action}.")
     print(f".agent-kb/start.md {start_action}.")
     if custom_routes_preserved:
         print(".agent-kb/routes.yaml custom routes preserved.")
     else:
         print(f".agent-kb/routes.yaml {routes_action}.")
-    print(f".agent-kb/plans/current.md {plan_action}.")
+    if custom_plan_preserved:
+        print(".agent-kb/plans/current.md custom preserved.")
+    else:
+        print(f".agent-kb/plans/current.md {plan_action}.")
     print(f".agent-kb/map.md {map_action}.")
     if start_action == "needs review":
         print("Review .agent-kb/start.md manually or rerun with --write-start to replace it.")
     if custom_routes_preserved:
-        print("custom routes preserved; map generated from routes.yaml")
+        if args.write_map:
+            print("custom routes preserved; map generated from routes.yaml")
     elif routes_action == "needs review":
         print("Review .agent-kb/routes.yaml manually; use --write-routes only if you want the default routes.")
-    if plan_action == "needs review":
-        print("Review .agent-kb/plans/current.md manually; use --write-plan only if you want the default empty plan.")
     if map_action == "needs review":
         print("Review .agent-kb/map.md manually; use --write-map only if you want the default routing table.")
     # Name the files awaiting review (routes are excluded when intentionally preserved) so stats/output need no second run.
     named_actions = [
         ("start.md", start_action),
         ("routes.yaml", "current" if custom_routes_preserved else routes_action),
-        ("plans/current.md", plan_action),
+        ("plans/current.md", "current" if custom_plan_preserved else plan_action),
         ("map.md", map_action),
     ]
     review_files = [name for name, action in named_actions if action == "needs review"]
     if review_files:
         print(f"needs review: {', '.join(review_files)}")
+    if meta.get("mode") == "nested":
+        print("Nested KB mode: verify with `git -C .agent-kb status` and `git -C .agent-kb diff`; commit KB changes when done.")
     return 0, {"needs_review": len(review_files), "review_files": review_files}
 
 
@@ -967,6 +1326,15 @@ def is_empty_scaffold_topic(path: Path, kb: Path) -> bool:
     if not is_content_empty_topic(path, kb):
         return False
     return is_initial_changelog_only(markdown_section_body(path.read_text(encoding="utf-8"), "Change Log"))
+
+
+# Checks whether the KB still has only starter topic scaffolds, using the same empty-topic test as trim.
+def kb_is_empty_scaffold(kb: Path) -> bool:
+    docs = stable_topic_docs(kb)
+    topic_docs = [path for path in docs if path.relative_to(kb).parts[0] != "plans"]
+    if not topic_docs:
+        return False
+    return all(is_empty_scaffold_topic(path, kb) for path in topic_docs)
 
 
 # Checks whether a stable topic is an emptied husk: content gone, but its Change Log shows it once held knowledge.
@@ -1164,6 +1532,7 @@ def validate_kb(kb: Path) -> tuple[list[str], list[str]]:
 
     if not kb.exists():
         return ["missing .agent-kb/"], warnings
+    warnings.extend(schema_drift_warnings(kb))
     for relative in ["start.md", "routes.yaml", "map.md"]:
         if not (kb / relative).exists():
             errors.append(f"missing .agent-kb/{relative}")
@@ -1221,32 +1590,87 @@ def linked_docs_from(path: Path, kb: Path) -> list[Path]:
     return links
 
 
-# Computes topic documents reachable from map routes and reachable Markdown links.
-def reachable_docs(kb: Path, rows: list[tuple[str, str, str]]) -> set[Path]:
-    reachable: set[Path] = set()
-    queue: deque[Path] = deque()
+# Computes each document's shallowest route-link depth by BFS from route entry paths.
+def reachable_doc_depths(kb: Path, rows: list[tuple[str, str, str]]) -> dict[Path, int]:
+    depths: dict[Path, int] = {}
+    queue: deque[tuple[Path, int]] = deque()
     for _, read_first, also_consider in rows:
         for raw in split_path_cell(read_first) + split_path_cell(also_consider):
             normalized = normalize_kb_path(raw)
             if normalized and (kb / normalized).exists():
-                queue.append(normalized)
+                queue.append((normalized, 0))
 
     while queue:
-        relative = queue.popleft()
-        if relative in reachable:
+        relative, depth = queue.popleft()
+        if relative in depths:
             continue
-        reachable.add(relative)
+        depths[relative] = depth
         path = kb / relative
         if path.exists() and path.suffix == ".md":
-            queue.extend(linked_docs_from(path, kb))
-    return reachable
+            queue.extend((link, depth + 1) for link in linked_docs_from(path, kb))
+    return depths
 
 
-# Validates the KB scaffold, routes, links, inbox notes, and topic reachability.
+# Computes topic documents reachable from map routes and reachable Markdown links.
+def reachable_docs(kb: Path, rows: list[tuple[str, str, str]]) -> set[Path]:
+    return set(reachable_doc_depths(kb, rows))
+
+
+# Builds trim-only structure advisories from graph depth, per-doc fanout, and route count budgets.
+def trim_structure_report(kb: Path, routes: list[dict[str, object]]) -> dict:
+    rows = rows_from_routes(routes)
+    depths = reachable_doc_depths(kb, rows)
+    stable_relatives = {path.relative_to(kb) for path in stable_topic_docs(kb)}
+    deep_docs = [
+        (relative, depths[relative])
+        for relative in stable_relatives
+        if relative in depths and depths[relative] > TRIM_MAX_LINK_DEPTH
+    ]
+    deep_docs.sort(key=lambda item: (item[1], str(item[0])), reverse=True)
+
+    hubs = []
+    for path in stable_topic_docs(kb):
+        fanout = len(linked_docs_from(path, kb))
+        if fanout > TRIM_MAX_DOC_FANOUT:
+            hubs.append((path.relative_to(kb), fanout))
+    hubs.sort(key=lambda item: (item[1], str(item[0])), reverse=True)
+
+    route_count = len(routes)
+    return {
+        "deep_docs": deep_docs,
+        "max_depth": TRIM_MAX_LINK_DEPTH,
+        "hubs": hubs,
+        "max_fanout": TRIM_MAX_DOC_FANOUT,
+        "route_count": route_count,
+        "max_routes": TRIM_MAX_ROUTES,
+        "routes_over": route_count > TRIM_MAX_ROUTES,
+        "has_signals": bool(deep_docs or hubs or route_count > TRIM_MAX_ROUTES),
+    }
+
+
+# Validates the KB scaffold, routes, links, inbox notes, and topic reachability; flags a still-empty scaffold.
+# Warns when a harness instruction file (AGENTS.md/CLAUDE.md) cannot reach the KB runtime protocol.
+def protocol_reach_warnings(root: Path) -> list[str]:
+    agents_path = root / "AGENTS.md"
+    claude_path = root / "CLAUDE.md"
+    owner = next((path for path in (agents_path, claude_path) if has_full_protocol(path)), None)
+    if owner is None:
+        return ["runtime protocol not found in AGENTS.md or CLAUDE.md; run upgrade"]
+    other = claude_path if owner == agents_path else agents_path
+    if not other.exists():
+        return [f"{other.name} is missing; run upgrade to create a pointer to {owner.name}"]
+    if owner.name.lower() not in other.read_text(encoding="utf-8").lower():
+        return [f"{other.name} does not reference the KB protocol in {owner.name}; run upgrade"]
+    return []
+
+
+# Prints scaffold validation results, adding runtime-protocol warnings that need the repo root.
 def command_validate(args: argparse.Namespace) -> tuple[int, dict]:
     root = repo_root(args)
     kb = kb_dir(root)
     errors, warnings = validate_kb(kb)
+    if kb.exists():
+        warnings = warnings + protocol_reach_warnings(root)
 
     for warning in warnings:
         print(f"WARN: {warning}")
@@ -1256,10 +1680,16 @@ def command_validate(args: argparse.Namespace) -> tuple[int, dict]:
     if errors:
         return 1, metrics
     print(f"OK: validated {kb}")
+    if kb_is_empty_scaffold(kb):
+        print(
+            "ADVISORY: this KB is an empty scaffold (no distilled knowledge yet). "
+            "If you just initialized it, offer the user the one-time distillation pass "
+            "before closing out."
+        )
     return 0, metrics
 
 
-# Diagnoses or applies safe deterministic KB trimming.
+# Diagnoses or applies safe deterministic KB trimming, reporting advisory graph signals without making them blockers.
 def command_trim(args: argparse.Namespace) -> int:
     root = repo_root(args)
     kb = kb_dir(root)
@@ -1278,6 +1708,7 @@ def command_trim(args: argparse.Namespace) -> int:
     report = trim_size_report(
         kb, args.max_file_lines, args.max_file_chars, args.max_total_chars, args.max_inbox_notes
     )
+    structure_report = trim_structure_report(kb, routes)
     compact_recommended = report["compact_recommended"]
 
     if not args.write:
@@ -1300,7 +1731,8 @@ def command_trim(args: argparse.Namespace) -> int:
 
         cleanup = bool(candidates or husks)
         minor_only = report["minor_only"]
-        if not (cleanup or compact_recommended or minor_only):
+        structure_advisory = structure_report["has_signals"]
+        if not (cleanup or compact_recommended or minor_only or structure_advisory):
             if report["over_budget"]:
                 print("Trim diagnosis: lean (above soft budget).")
                 print(f"  Structure is clean: no oversize files, husks, or inbox backlog. Total "
@@ -1314,6 +1746,7 @@ def command_trim(args: argparse.Namespace) -> int:
                 "husks": 0,
                 "compact": False,
                 "minor_only": False,
+                "structure_advisory": False,
                 "over_budget": report["over_budget"],
                 "total_chars": report["total_chars"],
             }
@@ -1325,6 +1758,8 @@ def command_trim(args: argparse.Namespace) -> int:
             diagnosis = "cleanup + compact recommended" if cleanup else "compact recommended"
         elif cleanup:
             diagnosis = "cleanup recommended"
+        elif structure_advisory:
+            diagnosis = "structure advisories"
         else:
             diagnosis = "minor — optional"
         print(f"Trim diagnosis: {diagnosis}.")
@@ -1341,10 +1776,20 @@ def command_trim(args: argparse.Namespace) -> int:
             print(f"- compact signal: inbox has {report['inbox_count']} notes (max {report['max_inbox_notes']})")
         if report["over_budget"] and show_full_prompt:
             print(f"- soft signal: stable KB docs total {report['total_chars']} chars (above {report['max_total_chars']} soft budget; not a reason to over-compact)")
+        for relative, depth in structure_report["deep_docs"]:
+            print(f"- depth advisory: {relative} is depth {depth} from routes (budget {structure_report['max_depth']})")
+        for relative, fanout in structure_report["hubs"]:
+            print(f"- hub advisory: {relative} links to {fanout} docs (budget {structure_report['max_fanout']}); consider splitting if it mixes tasks")
+        if structure_report["routes_over"]:
+            print(f"- route-count advisory: routes.yaml has {structure_report['route_count']} routes (budget {structure_report['max_routes']})")
         if candidates:
             print()
             print("Next:")
             print(f"  {trim_write_command(args)}")
+        if structure_advisory:
+            print()
+            print("Structure advisories are soft: adjust routes, split hubs, or lift deep docs only")
+            print("when the structure hides recurring tasks; then rerun trim --recheck.")
         if compact_recommended:
             print()
             # Always-on guardrail so it survives even when the full prompt is suppressed in later loop rounds.
@@ -1364,6 +1809,7 @@ def command_trim(args: argparse.Namespace) -> int:
             "husks": len(husks),
             "compact": compact_recommended,
             "minor_only": minor_only,
+            "structure_advisory": structure_advisory,
             "over_budget": report["over_budget"],
             "total_chars": report["total_chars"],
         }
@@ -1492,8 +1938,8 @@ def command_compile(args: argparse.Namespace) -> int:
             kept.append((path.name, "target is unsure or invalid"))
             continue
         target = kb / target_rel
-        if not target.exists():
-            kept.append((path.name, f"target does not exist: {target_raw}"))
+        if not target.is_file():
+            kept.append((path.name, f"target is not an existing file: {target_raw}"))
             continue
         append_note_to_target(target, note, path.name)
         path.unlink()
@@ -1517,6 +1963,63 @@ def print_bar_chart(rows: list[tuple[str, int, str]], indent: str = "  ", width:
         print(f"{indent}{label:<{label_width}}  {bar:<{width}}  {suffix}")
 
 
+# Formats a numerator and denominator as both count and percentage.
+def format_rate(numerator: int, denominator: int) -> str:
+    if denominator == 0:
+        return "0/0 (n/a)"
+    return f"{numerator}/{denominator} ({numerator / denominator * 100:.1f}%)"
+
+
+# Prints read-observability metrics from transcript backfill and logged KB read events.
+def print_kb_read_stats(
+    kb: Path,
+    events: list[dict],
+    scan: TranscriptScan | None,
+    top: int,
+    dead_sessions: int,
+    backfill_error: str | None = None,
+) -> None:
+    read_events = [event for event in events if event.get("event") == "kb_read"]
+    print("KB read usage (transcript backfill):")
+    if backfill_error:
+        print(f"  (backfill failed: {backfill_error})")
+    elif scan is None:
+        print("  (backfill disabled)")
+    else:
+        hit_sessions = {str(event.get("session", "")) for event in read_events if str(event.get("session", "")) in scan.sessions}
+        print(f"  scanned sessions: {len(scan.sessions)}")
+        print(f"  KB hit rate: {format_rate(len(hit_sessions), len(scan.sessions))}")
+    if not read_events:
+        print("  (no KB reads logged yet)")
+        return
+
+    chars_by_session: dict[str, int] = {}
+    reads_by_file: dict[str, int] = {}
+    for event in read_events:
+        session = str(event.get("session", ""))
+        file = str(event.get("file", ""))
+        chars = int(event.get("chars") or 0)
+        chars_by_session[session] = chars_by_session.get(session, 0) + chars
+        reads_by_file[file] = reads_by_file.get(file, 0) + 1
+    session_count = max(1, len(chars_by_session))
+    print(f"  estimated KB chars/session: {sum(chars_by_session.values()) // session_count}")
+    rows = [(file, count, str(count)) for file, count in sorted(reads_by_file.items(), key=lambda kv: (-kv[1], kv[0]))]
+    print("  Most-read KB files:")
+    print_bar_chart(rows[:top], indent="    ")
+
+    candidate_pool = scan.sessions if scan is not None else set(chars_by_session)
+    if len(candidate_pool) >= dead_sessions:
+        read_files = set(reads_by_file)
+        dead = [str(path.relative_to(kb)) for path in stable_topic_docs(kb) if str(path.relative_to(kb)) not in read_files]
+        print(f"  Dead knowledge candidates (unread across {len(candidate_pool)} scanned/logged sessions):")
+        for file in dead[:top]:
+            print(f"    - {file}")
+        if not dead:
+            print("    (none)")
+    else:
+        print(f"  Dead knowledge candidates: need at least {dead_sessions} scanned/logged sessions")
+
+
 # Summarizes CLI usage from the event log and KB file churn from git history, drawn as bar charts.
 def command_stats(args: argparse.Namespace) -> int:
     root = repo_root(args)
@@ -1524,14 +2027,29 @@ def command_stats(args: argparse.Namespace) -> int:
     if not kb.exists():
         print("ERROR: missing .agent-kb/")
         return 1
+    drift_warnings = schema_drift_warnings(kb)
+    for warning in drift_warnings:
+        print(f"WARN: {warning}")
+    if drift_warnings:
+        print()
+    scan: TranscriptScan | None = None
+    added = 0
+    backfill_error = None
+    if not args.no_backfill:
+        try:
+            scan, added = backfill_kb_reads(root, args)
+        except Exception as err:
+            backfill_error = str(err)
+            scan, added = None, 0
 
     print("CLI command usage (.agent-kb/.log/events.jsonl):")
     events = read_events(kb / ".log" / "events.jsonl")
-    if not events:
+    cli_events = [event for event in events if event.get("event", "cli") == "cli"]
+    if not cli_events:
         print("  (no events logged yet)")
     else:
         counts: dict[str, list[int]] = {}
-        for event in events:
+        for event in cli_events:
             command = str(event.get("command", "?"))
             failed = 1 if event.get("exit", 0) != 0 else 0
             total, fails = counts.get(command, [0, 0])
@@ -1541,6 +2059,11 @@ def command_stats(args: argparse.Namespace) -> int:
             suffix = f"{total}" + (f"  ({fails} failed)" if fails else "")
             rows.append((command, total, suffix))
         print_bar_chart(rows[: args.top])
+
+    print()
+    if scan is not None:
+        print(f"Backfilled KB reads: {added} new event(s).")
+    print_kb_read_stats(kb, events, scan, args.top, args.dead_sessions, backfill_error)
 
     print()
     print("KB file churn (git history):")
@@ -1566,7 +2089,7 @@ def command_stats(args: argparse.Namespace) -> int:
     print()
     print("Latest outcomes (per command):")
     latest_by_command: dict[str, dict] = {}
-    for event in events:
+    for event in cli_events:
         if "metrics" in event:
             latest_by_command[str(event.get("command", "?"))] = event
     if not latest_by_command:
@@ -1626,9 +2149,15 @@ def build_parser() -> argparse.ArgumentParser:
     trim_parser.add_argument("--verbose", action="store_true", help="Always print the full agent compact prompt and soft-budget note (default prints them only on first detection in a loop).")
     trim_parser.set_defaults(func=command_trim)
 
-    stats_parser = subparsers.add_parser("stats", help="Summarize CLI usage and KB file churn.")
+    stats_parser = subparsers.add_parser("stats", help="Summarize CLI usage, KB reads, and KB file churn.")
     stats_parser.add_argument("--root", default=".", help="Repository root to manage.")
     stats_parser.add_argument("--top", type=int, default=5, help="Show at most this many rows per section (default 5).")
+    stats_parser.add_argument("--no-backfill", action="store_true", help="Do not scan local transcripts before rendering stats.")
+    stats_parser.add_argument("--claude-dir", default="~/.claude/projects", help="Claude Code projects transcript directory.")
+    stats_parser.add_argument("--codex-dir", default="~/.codex/sessions", help="Codex sessions transcript directory.")
+    stats_parser.add_argument("--no-backfill-claude", action="store_true", help="Skip Claude Code transcript backfill.")
+    stats_parser.add_argument("--no-backfill-codex", action="store_true", help="Skip Codex transcript backfill.")
+    stats_parser.add_argument("--dead-sessions", type=int, default=20, help="Minimum scanned/logged sessions before listing unread stable docs (default 20).")
     stats_parser.set_defaults(func=command_stats)
     return parser
 

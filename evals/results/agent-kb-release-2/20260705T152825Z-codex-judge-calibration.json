@@ -1,0 +1,62 @@
+{
+  "agreement": {
+    "agreed": 2,
+    "compared": 2,
+    "rate": 1.0
+  },
+  "bundle": "agent-kb-release-2",
+  "generated_at": "2026-07-05T15:28:44+00:00",
+  "judge": "codex",
+  "rows": [
+    {
+      "agreement": true,
+      "assertion_id": "keeps-feature-freeze",
+      "judge_provenance": {
+        "actual_model": null,
+        "cli_version": "codex-cli 0.142.5",
+        "effort": "medium",
+        "harness": "codex",
+        "max_turns": null,
+        "prompt_template_sha256": "7041fe15d4dd73f252c10d73866979b3635ef8273baeb3b36c69c56289bf9196",
+        "requested_model": "gpt-5.5"
+      },
+      "judge_raw_artifacts": {
+        "stderr": ".raw/agent-kb-release-2/20260705T152825Z/respect-current-release-focus-r1-judge.stderr.txt",
+        "stdout": ".raw/agent-kb-release-2/20260705T152825Z/respect-current-release-focus-r1-judge.stdout.jsonl"
+      },
+      "judge_status": "ok",
+      "new_passed": true,
+      "new_reason": "The answer identifies a measurement/validation step, explicitly says it is not proposing new commands or user-facing features, and ties that to the Release 2 validation-first feature freeze in the KB reference.",
+      "old_passed": true,
+      "old_reason": "The answer proposes rerunning the compliance analyzer and comparing metrics post-fix \u2014 a measurement/validation activity, not a new user-facing feature. It explicitly frames this as consistent with the feature-freeze/validation-first stance and does not propose building any new feature.",
+      "repetition": 1,
+      "task_id": "respect-current-release-focus"
+    },
+    {
+      "agreement": true,
+      "assertion_id": "keeps-semantic-work-with-agent",
+      "judge_provenance": {
+        "actual_model": null,
+        "cli_version": "codex-cli 0.142.5",
+        "effort": "medium",
+        "harness": "codex",
+        "max_turns": null,
+        "prompt_template_sha256": "7041fe15d4dd73f252c10d73866979b3635ef8273baeb3b36c69c56289bf9196",
+        "requested_model": "gpt-5.5"
+      },
+      "judge_raw_artifacts": {
+        "stderr": ".raw/agent-kb-release-2/20260705T152825Z/respect-trim-control-boundary-r1-judge.stderr.txt",
+        "stdout": ".raw/agent-kb-release-2/20260705T152825Z/respect-trim-control-boundary-r1-judge.stdout.jsonl"
+      },
+      "judge_status": "ok",
+      "new_passed": true,
+      "new_reason": "The answer matches the reference: `trim --write` is limited to safe mechanical cleanup, while semantic merges are explicitly left to agent judgment because they are not safely automatable.",
+      "old_passed": true,
+      "old_reason": "The agent answer matches the reference decision doc: trim --write is described as deterministic, reversible, mechanical cleanup (deleting empty scaffolds, pruning routes, regenerating map.md, validating), while semantic merges/redundancy are explicitly left to agent judgment via the compact prompt. It also correctly notes husks are flagged but never auto-deleted, mirroring the reference's 'delete manually' warning-only behavior, and gives the same underlying rationale (mechanical edits are safe/reviewable, semantic merges risk silent knowledge loss).",
+      "repetition": 1,
+      "task_id": "respect-trim-control-boundary"
+    }
+  ],
+  "run_id": "20260705T152825Z",
+  "source_summary": "/Users/lsl/Desktop/agent-context-kb-skill/evals/results/agent-kb-release-2/20260705T133515Z-claude.json"
+}

@@ -8,7 +8,18 @@ Current layout:
 
 - `skills/agent-context-kb/` - the Codex skill, including `SKILL.md`, UI metadata, and scripts.
 - `skills/agent-context-kb/scripts/agent_kb.py` - the CLI for KB init, validation, notes, and compile.
+- `evals/` - Release 2 eval bundles, runners, and summary result JSON files.
 - `AGENTS.md` - contributor and agent guidance for this repository.
+
+## Project Knowledge Base
+
+Use `.agent-kb/` before broad code search when planning, building, debugging, or reviewing.
+1. Read `.agent-kb/start.md`.
+2. Read `.agent-kb/routes.yaml`; pick only relevant routes.
+3. Read those KB docs, then search code for gaps.
+
+After work, update a topic or `.agent-kb/inbox/` only for reusable project knowledge.
+Do not store progress logs, chat summaries, secrets, or obvious code facts.
 
 ## Build, Test, and Development Commands
 
@@ -44,22 +55,3 @@ Pull requests should include a summary, affected paths, and manual verification.
 ## Agent-Specific Instructions
 
 Keep changes narrow. Do not turn this repository into a broad knowledge dump.
-
-
-## Project Knowledge Base
-
-Use `.agent-kb/` as the project knowledge base.
-Treat it as an agent-facing index and distilled knowledge layer; do not replace
-human docs with KB entries.
-
-Before non-trivial coding:
-1. Read `.agent-kb/start.md`.
-2. Read `.agent-kb/routes.yaml` as the source of truth; use `.agent-kb/map.md`
-   only as a readable view if helpful.
-3. Read only KB documents relevant to the current task.
-
-After coding:
-- Update `.agent-kb/` only when the work creates or changes reusable project knowledge.
-- Prefer the relevant topic file.
-- Use `.agent-kb/inbox/` when the right location is unclear.
-- Do not write ordinary progress logs or one-off chat summaries into KB.
