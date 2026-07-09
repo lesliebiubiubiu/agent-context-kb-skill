@@ -10,3 +10,4 @@ evals/results/**/*.raw.json
 2026-07-05-214925-local-command-caveatcaveat-the-messages-below.txt
 2026-07-06-003352-this-session-is-being-continued-from-a-previous-c.txt
 2026-07-06-193312-local-command-caveatcaveat-the-messages-below.txt
+session_records/
