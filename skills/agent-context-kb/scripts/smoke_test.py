@@ -513,42 +513,50 @@ def test_upgrade_reports_protocol_current_on_noop() -> None:
         result = run_cli(root, "upgrade")
         require(result.returncode == 0, "upgrade should succeed on a current protocol", result)
         require("AGENTS.md protocol current." in result.stdout, "no-op protocol rewrite should be reported as current", result)
+        require("CLAUDE.md protocol current." in result.stdout, "no-op CLAUDE.md rewrite should be reported as current", result)
 
 
-# Checks that init respects a CLAUDE.md-primary repo when AGENTS.md is only a pointer.
-def test_init_uses_claude_when_agents_points_to_it() -> None:
+# Checks that init injects the full protocol into both entry files while preserving their content.
+def test_init_injects_protocol_into_both_files() -> None:
     with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
         root = Path(tmp)
         agents = root / "AGENTS.md"
         claude = root / "CLAUDE.md"
-        agents.write_text("See CLAUDE.md for agent instructions.\n", encoding="utf-8")
+        agents.write_text("# Repo Instructions\n\nGeneral conventions here.\n", encoding="utf-8")
         claude.write_text("# Claude Instructions\n\nKeep the main instructions here.\n", encoding="utf-8")
         result = run_cli(root, "init")
-        require(result.returncode == 0, "init should succeed with CLAUDE.md-primary instructions", result)
-        require("CLAUDE.md protocol appended." in result.stdout, "init should report the CLAUDE.md protocol target", result)
-        require(agents.read_text(encoding="utf-8") == "See CLAUDE.md for agent instructions.\n", "AGENTS.md pointer should be left unchanged")
-        require("## Project Knowledge Base" in claude.read_text(encoding="utf-8"), "CLAUDE.md should receive the KB protocol")
+        require(result.returncode == 0, "init should succeed with both entry files present", result)
+        require("AGENTS.md protocol appended." in result.stdout, "init should report the AGENTS.md injection", result)
+        require("CLAUDE.md protocol appended." in result.stdout, "init should report the CLAUDE.md injection", result)
+        agents_text = agents.read_text(encoding="utf-8")
+        claude_text = claude.read_text(encoding="utf-8")
+        require("General conventions here." in agents_text, "AGENTS.md content should be preserved")
+        require("Keep the main instructions here." in claude_text, "CLAUDE.md content should be preserved")
+        require("`.agent-kb/` is this project's memory for coding agents" in agents_text, "AGENTS.md should carry the full protocol")
+        require("`.agent-kb/` is this project's memory for coding agents" in claude_text, "CLAUDE.md should carry the full protocol")
 
 
-# Checks that upgrade refreshes the KB protocol in CLAUDE.md when that is the existing protocol owner.
-def test_upgrade_updates_claude_protocol_owner() -> None:
+# Checks that upgrade refreshes a stale protocol section in both entry files.
+def test_upgrade_refreshes_stale_protocol_in_both_files() -> None:
     with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
         root = Path(tmp)
-        (root / "AGENTS.md").write_text("See CLAUDE.md for agent instructions.\n", encoding="utf-8")
-        (root / "CLAUDE.md").write_text("# Claude Instructions\n\nKeep the main instructions here.\n", encoding="utf-8")
         init_root(root)
+        agents = root / "AGENTS.md"
         claude = root / "CLAUDE.md"
+        agents.write_text("# Repo Instructions\n\n## Project Knowledge Base\n\nOld protocol.\n", encoding="utf-8")
         claude.write_text("# Claude Instructions\n\n## Project Knowledge Base\n\nOld protocol.\n", encoding="utf-8")
         result = run_cli(root, "upgrade")
-        require(result.returncode == 0, "upgrade should succeed with CLAUDE.md as protocol owner", result)
-        require("CLAUDE.md protocol updated." in result.stdout, "upgrade should report the CLAUDE.md protocol target", result)
-        text = claude.read_text(encoding="utf-8")
-        require("Old protocol." not in text, "upgrade should replace the old CLAUDE.md protocol section")
-        require("Use `.agent-kb/` before broad code search" in text, "upgrade should write the current protocol into CLAUDE.md")
+        require(result.returncode == 0, "upgrade should succeed with stale protocols", result)
+        require("AGENTS.md protocol updated." in result.stdout, "upgrade should report the AGENTS.md refresh", result)
+        require("CLAUDE.md protocol updated." in result.stdout, "upgrade should report the CLAUDE.md refresh", result)
+        for path in (agents, claude):
+            text = path.read_text(encoding="utf-8")
+            require("Old protocol." not in text, f"upgrade should replace the old {path.name} protocol section")
+            require("`.agent-kb/` is this project's memory for coding agents" in text, f"upgrade should write the current protocol into {path.name}")
 
 
-# Checks that AGENTS.md receives the protocol when CLAUDE.md is only a pointer to it.
-def test_agents_owner_when_claude_points_to_it() -> None:
+# Checks that upgrade replaces an old-style pointer section with the full protocol.
+def test_upgrade_replaces_pointer_section_with_protocol() -> None:
     with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
         root = Path(tmp)
         agents = root / "AGENTS.md"
@@ -561,68 +569,67 @@ def test_agents_owner_when_claude_points_to_it() -> None:
             "Run tests.\n",
             encoding="utf-8",
         )
-        claude.write_text("# Claude Instructions\n\nSee AGENTS.md for agent instructions.\n", encoding="utf-8")
+        claude.write_text(
+            "# Claude Instructions\n\n"
+            "## Project Knowledge Base\n\n"
+            "See [AGENTS.md](AGENTS.md) for the `.agent-kb/` protocol.\n",
+            encoding="utf-8",
+        )
         result = run_cli(root, "init")
-        require(result.returncode == 0, "init should succeed with CLAUDE.md pointing to AGENTS.md", result)
-        require("AGENTS.md protocol updated." in result.stdout, "init should report AGENTS.md as the protocol target", result)
+        require(result.returncode == 0, "init should succeed on a pointer-section repo", result)
         agents_text = agents.read_text(encoding="utf-8")
         require("Old protocol." not in agents_text, "AGENTS.md should replace the old protocol section")
-        require("Use `.agent-kb/` before broad code search" in agents_text, "AGENTS.md should own the Codex-visible protocol")
+        require("`.agent-kb/` is this project's memory for coding agents" in agents_text, "AGENTS.md should carry the full protocol")
         require("## Commands" in agents_text, "AGENTS.md should preserve unrelated instructions")
         claude_text = claude.read_text(encoding="utf-8")
-        require("Use `.agent-kb/` before broad code search" not in claude_text, "CLAUDE.md pointer should not receive a protocol copy")
-        require("AGENTS.md" in claude_text, "CLAUDE.md should keep pointing at AGENTS.md")
+        require("for the `.agent-kb/` protocol" not in claude_text, "CLAUDE.md pointer section should be migrated away")
+        require("`.agent-kb/` is this project's memory for coding agents" in claude_text, "CLAUDE.md should carry the full protocol")
 
 
-# Checks that init on a bare repo creates a CLAUDE.md pointer next to the AGENTS.md protocol owner.
-def test_init_creates_claude_pointer_for_agents_owner() -> None:
+# Checks that init on a bare repo creates both entry files with the full protocol.
+def test_init_creates_both_files_with_protocol() -> None:
     with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
         root = Path(tmp)
         result = run_cli(root, "init")
         require(result.returncode == 0, "init should succeed on a bare repo", result)
-        require("CLAUDE.md created as a pointer to AGENTS.md." in result.stdout, "init should report the counterpart pointer", result)
-        claude_text = (root / "CLAUDE.md").read_text(encoding="utf-8")
-        require("AGENTS.md" in claude_text, "CLAUDE.md pointer should reference AGENTS.md")
-        require("Use `.agent-kb/` before broad code search" not in claude_text, "CLAUDE.md pointer should not duplicate the protocol")
+        require("AGENTS.md protocol created." in result.stdout, "init should report the AGENTS.md creation", result)
+        require("CLAUDE.md protocol created." in result.stdout, "init should report the CLAUDE.md creation", result)
+        for name in ("AGENTS.md", "CLAUDE.md"):
+            text = (root / name).read_text(encoding="utf-8")
+            require("`.agent-kb/` is this project's memory for coding agents" in text, f"{name} should carry the full protocol")
 
 
-# Checks that upgrade migrates a protocol misplaced in a CLAUDE.md pointer file back to AGENTS.md.
-def test_upgrade_migrates_misplaced_claude_protocol() -> None:
+# Checks that upgrade migrates a legacy generated pointer file into a full-protocol file.
+def test_upgrade_migrates_legacy_pointer_file() -> None:
     with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
         root = Path(tmp)
         agents = root / "AGENTS.md"
         claude = root / "CLAUDE.md"
         agents.write_text("# Repo Instructions\n\n## Commands\n\nRun tests.\n", encoding="utf-8")
-        claude.write_text("# CLAUDE.md\n\nSee [AGENTS.md](AGENTS.md) for repository conventions.\n", encoding="utf-8")
         init_root(root)
-        # Recreate the legacy misplaced state: full protocol injected into the pointer file.
-        agents.write_text("# Repo Instructions\n\n## Commands\n\nRun tests.\n", encoding="utf-8")
+        # Recreate the legacy generated state: CLAUDE.md is only a pointer to the AGENTS.md owner.
         claude.write_text(
-            "# CLAUDE.md\n\n"
-            "See [AGENTS.md](AGENTS.md) for repository conventions.\n\n"
-            "## Project Knowledge Base\n\n"
-            "Use `.agent-kb/` before broad code search when planning.\n",
+            "See [AGENTS.md](AGENTS.md) for repository instructions and the `.agent-kb/` knowledge base protocol.\n",
             encoding="utf-8",
         )
         result = run_cli(root, "upgrade")
-        require(result.returncode == 0, "upgrade should succeed on the misplaced-protocol state", result)
-        require("AGENTS.md protocol appended." in result.stdout, "upgrade should move the protocol into AGENTS.md", result)
-        require("CLAUDE.md protocol replaced with a pointer to AGENTS.md." in result.stdout, "upgrade should report the migration", result)
-        require("Use `.agent-kb/` before broad code search" in agents.read_text(encoding="utf-8"), "AGENTS.md should own the protocol after migration")
+        require(result.returncode == 0, "upgrade should succeed on the legacy pointer file", result)
+        require("CLAUDE.md protocol appended." in result.stdout, "upgrade should report the pointer-file migration", result)
         claude_text = claude.read_text(encoding="utf-8")
-        require("Use `.agent-kb/` before broad code search" not in claude_text, "CLAUDE.md should no longer hold the full protocol")
-        require("AGENTS.md" in claude_text, "CLAUDE.md should still point at AGENTS.md")
+        require("See [AGENTS.md](AGENTS.md) for repository instructions." in claude_text, "CLAUDE.md should keep a plain cross-reference to AGENTS.md")
+        require("knowledge base protocol." not in claude_text, "CLAUDE.md should drop the legacy pointer protocol claim")
+        require("`.agent-kb/` is this project's memory for coding agents" in claude_text, "CLAUDE.md should now carry the full protocol")
 
 
-# Checks that validate warns when the counterpart instruction file cannot reach the protocol owner.
-def test_validate_warns_unreachable_protocol() -> None:
+# Checks that validate warns when an entry file lacks the current protocol.
+def test_validate_warns_missing_protocol() -> None:
     with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
         root = Path(tmp)
         init_root(root)
         (root / "CLAUDE.md").write_text("# Notes\n\nUnrelated instructions.\n", encoding="utf-8")
         result = run_cli(root, "validate")
-        require(result.returncode == 0, "protocol reach issues should be warnings, not errors", result)
-        require("does not reference the KB protocol in AGENTS.md" in result.stdout, "validate should warn about the unreachable protocol", result)
+        require(result.returncode == 0, "protocol presence issues should be warnings, not errors", result)
+        require("CLAUDE.md does not carry the current KB runtime protocol" in result.stdout, "validate should warn about the missing protocol", result)
 
 
 # Checks that upgrade replaces the old long runtime protocol with the slim protocol.
@@ -653,7 +660,7 @@ After the task, only when it created reusable project knowledge:
         result = run_cli(root, "upgrade")
         require(result.returncode == 0, "upgrade should succeed with an old long protocol", result)
         text = agents.read_text(encoding="utf-8")
-        require("Use `.agent-kb/` before broad code search" in text, "upgrade should write the slim protocol", result)
+        require("`.agent-kb/` is this project's memory for coding agents" in text, "upgrade should write the slim protocol", result)
         require("When you need to understand how this codebase works" not in text, "upgrade should remove old rationale prose")
 
 
@@ -2219,12 +2226,12 @@ def main() -> int:
         test_validate_warns_schema_drift,
         test_upgrade_preserves_newer_meta_schema,
         test_upgrade_reports_protocol_current_on_noop,
-        test_init_uses_claude_when_agents_points_to_it,
-        test_upgrade_updates_claude_protocol_owner,
-        test_agents_owner_when_claude_points_to_it,
-        test_init_creates_claude_pointer_for_agents_owner,
-        test_upgrade_migrates_misplaced_claude_protocol,
-        test_validate_warns_unreachable_protocol,
+        test_init_injects_protocol_into_both_files,
+        test_upgrade_refreshes_stale_protocol_in_both_files,
+        test_upgrade_replaces_pointer_section_with_protocol,
+        test_init_creates_both_files_with_protocol,
+        test_upgrade_migrates_legacy_pointer_file,
+        test_validate_warns_missing_protocol,
         test_upgrade_replaces_long_runtime_protocol,
         test_trim_diagnoses_empty_scaffold,
         test_trim_threshold_flag_reports_oversize_topic,

@@ -34,24 +34,35 @@ KB_MODES = {"nested", "shared", "local"}
 
 RUNTIME_PROTOCOL = """## Project Knowledge Base
 
-Use `.agent-kb/` before broad code search when planning, building, debugging, or reviewing.
+`.agent-kb/` is this project's memory for coding agents: read it before working,
+update it when your work changes what a future agent needs to know.
+
+At task start, before broad code search:
 1. Read `.agent-kb/start.md`.
-2. Read `.agent-kb/routes.yaml`; pick only relevant routes.
+2. Read `.agent-kb/routes.yaml`; pick the routes relevant to this task.
 3. Read those KB docs, then search code for gaps.
 
-After work, update a topic or `.agent-kb/inbox/` only for reusable project knowledge.
-Do not store progress logs, chat summaries, secrets, or obvious code facts.
+Before finishing:
+- Did this work change what a future agent needs to know? If yes, update the
+  relevant topic file, or add a note in `.agent-kb/inbox/` when the right place
+  is unclear. `start.md` defines what belongs in the KB.
 """
 
 PROTOCOL_SECTION_RE = re.compile(r"^## Project Knowledge Base\n.*?(?=^## |\Z)", re.M | re.S)
 
-PROTOCOL_BODY_MARKER = "Use `.agent-kb/` before broad code search"
+PROTOCOL_BODY_MARKER = "`.agent-kb/` is this project's memory for coding agents"
 
-POINTER_FILE_TMPL = (
-    "See [{owner}]({owner}) for repository instructions and the `.agent-kb/` knowledge base protocol.\n"
+# Both harness entry files carry the full protocol; the canonical text lives in
+# RUNTIME_PROTOCOL above and upgrade re-syncs each file from it.
+PROTOCOL_FILES = ("AGENTS.md", "CLAUDE.md")
+
+# Cross-reference line written into a freshly created entry file when the other one already exists.
+COUNTERPART_NOTE_TMPL = "See [{other}]({other}) for repository instructions.\n\n"
+
+# Legacy generated pointer-file sentence; upgrade trims its protocol claim now both files hold the protocol.
+LEGACY_POINTER_LINE_RE = re.compile(
+    r"See \[(AGENTS\.md|CLAUDE\.md)\]\(\1\) for repository instructions and the `\.agent-kb/` knowledge base protocol\."
 )
-
-POINTER_SECTION_TMPL = "## Project Knowledge Base\n\nSee [{owner}]({owner}) for the `.agent-kb/` protocol.\n"
 
 START_MD = """# Agent KB Start
 
@@ -88,7 +99,8 @@ write a separate note in `inbox/`.
 - One-off chat summaries
 - Secrets, tokens, cookies, credentials, or local-only state
 - Unverified guesses unless clearly marked as pending verification
-- Details that are already obvious from reading the code
+- Facts fully visible by opening a single file (cross-file structure, reasons,
+  and decisions do belong here, even when the code "shows" them)
 """
 
 DEFAULT_ROUTES = [
@@ -802,72 +814,28 @@ def rows_from_routes(routes: list[dict[str, object]]) -> list[tuple[str, str, st
     return rows
 
 
-# Checks whether an instruction file already contains the KB runtime protocol section.
-def has_protocol_section(path: Path) -> bool:
-    return path.exists() and bool(PROTOCOL_SECTION_RE.search(path.read_text(encoding="utf-8")))
-
-
-# Checks whether a file carries the full KB runtime protocol, not just a pointer section to it.
-def has_full_protocol(path: Path) -> bool:
-    return path.exists() and PROTOCOL_BODY_MARKER in path.read_text(encoding="utf-8")
-
-
-# Checks whether an instruction file, ignoring any injected protocol section, only points agents to another file.
-def is_pointer_file(path: Path, target_name: str) -> bool:
+# Adds or refreshes the protocol section in one entry file, migrating legacy pointer text and preserving the rest.
+def upsert_protocol_in_file(path: Path, counterpart_note: str) -> str:
     if not path.exists():
-        return False
-    text = PROTOCOL_SECTION_RE.sub("", path.read_text(encoding="utf-8"))
-    text_lower = text.lower()
-    if target_name.lower() not in text_lower:
-        return False
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    pointer_words = ["see", "read", "refer", "follow", "use"]
-    return len(lines) <= 8 and len(text) <= 1000 and any(word in text_lower for word in pointer_words)
+        path.write_text(counterpart_note + RUNTIME_PROTOCOL, encoding="utf-8")
+        return "created"
 
+    original = path.read_text(encoding="utf-8")
+    text = LEGACY_POINTER_LINE_RE.sub(r"See [\1](\1) for repository instructions.", original)
+    if PROTOCOL_SECTION_RE.search(text):
+        updated = PROTOCOL_SECTION_RE.sub(RUNTIME_PROTOCOL.rstrip() + "\n\n", text).rstrip() + "\n"
+        if updated == original:
+            return "current"
+        path.write_text(updated, encoding="utf-8")
+        return "updated"
 
-# Picks the protocol owner file: pointer arrangements decide direction, then an existing full protocol sticks.
-def protocol_target_path(root: Path) -> Path:
-    agents_path = root / "AGENTS.md"
-    claude_path = root / "CLAUDE.md"
-    if agents_path.exists() and claude_path.exists():
-        if is_pointer_file(agents_path, "CLAUDE.md"):
-            return claude_path
-        if is_pointer_file(claude_path, "AGENTS.md"):
-            return agents_path
-    if has_full_protocol(claude_path):
-        return claude_path
-    if has_full_protocol(agents_path):
-        return agents_path
-    if claude_path.exists() and not agents_path.exists():
-        return claude_path
-    return agents_path
-
-
-# Ensures the other harness's instruction file can reach the protocol owner via a pointer, creating or migrating as needed.
-def ensure_counterpart_reach(root: Path, protocol_path: Path) -> str | None:
-    other_name = "CLAUDE.md" if protocol_path.name == "AGENTS.md" else "AGENTS.md"
-    counterpart = root / other_name
-    if not counterpart.exists():
-        counterpart.write_text(POINTER_FILE_TMPL.format(owner=protocol_path.name), encoding="utf-8")
-        return f"{other_name} created as a pointer to {protocol_path.name}"
-    text = counterpart.read_text(encoding="utf-8")
-    if has_full_protocol(counterpart):
-        # A duplicate or misplaced full protocol: keep one owner, leave a pointer (or nothing if one already exists).
-        stripped = PROTOCOL_SECTION_RE.sub("", text)
-        replacement = "" if protocol_path.name.lower() in stripped.lower() else POINTER_SECTION_TMPL.format(owner=protocol_path.name) + "\n"
-        updated = PROTOCOL_SECTION_RE.sub(lambda _: replacement, text)
-        updated = re.sub(r"\n{3,}", "\n\n", updated).rstrip() + "\n"
-        counterpart.write_text(updated, encoding="utf-8")
-        return f"{other_name} protocol replaced with a pointer to {protocol_path.name}"
-    if protocol_path.name.lower() in text.lower():
-        return None
     index = protocol_insert_index(text)
     head, tail = text[:index], text[index:]
     head = head.rstrip("\n") + "\n\n" if head.strip() else head
-    block = POINTER_SECTION_TMPL.format(owner=protocol_path.name)
+    block = RUNTIME_PROTOCOL.rstrip() + "\n"
     block = block + "\n" + tail.lstrip("\n") if tail.strip() else block
-    counterpart.write_text((head + block).rstrip() + "\n", encoding="utf-8")
-    return f"{other_name} pointer to {protocol_path.name} added"
+    path.write_text((head + block).rstrip() + "\n", encoding="utf-8")
+    return "appended"
 
 
 # Finds where to slot a new protocol: under the file's lead section, not above it — after the
@@ -895,28 +863,15 @@ def protocol_insert_index(text: str) -> int:
     return pos
 
 
-# Adds or replaces the Project Knowledge Base section while preserving the user's surrounding instructions.
-def upsert_runtime_protocol(root: Path) -> tuple[Path, str, str | None]:
-    protocol_path = protocol_target_path(root)
-    if not protocol_path.exists():
-        protocol_path.write_text(RUNTIME_PROTOCOL, encoding="utf-8")
-        return protocol_path, "created", ensure_counterpart_reach(root, protocol_path)
-
-    text = protocol_path.read_text(encoding="utf-8")
-    if PROTOCOL_SECTION_RE.search(text):
-        updated = PROTOCOL_SECTION_RE.sub(RUNTIME_PROTOCOL.rstrip() + "\n\n", text).rstrip() + "\n"
-        if updated == text:
-            return protocol_path, "current", ensure_counterpart_reach(root, protocol_path)
-        protocol_path.write_text(updated, encoding="utf-8")
-        return protocol_path, "updated", ensure_counterpart_reach(root, protocol_path)
-
-    index = protocol_insert_index(text)
-    head, tail = text[:index], text[index:]
-    head = head.rstrip("\n") + "\n\n" if head.strip() else head
-    block = RUNTIME_PROTOCOL.rstrip() + "\n"
-    block = block + "\n" + tail.lstrip("\n") if tail.strip() else block
-    protocol_path.write_text((head + block).rstrip() + "\n", encoding="utf-8")
-    return protocol_path, "appended", ensure_counterpart_reach(root, protocol_path)
+# Injects the canonical protocol into every entry file so each harness gets it pinned at session start.
+def upsert_runtime_protocol(root: Path) -> list[tuple[str, str]]:
+    preexisting = {name: (root / name).exists() for name in PROTOCOL_FILES}
+    results = []
+    for name in PROTOCOL_FILES:
+        other = next(n for n in PROTOCOL_FILES if n != name)
+        note = COUNTERPART_NOTE_TMPL.format(other=other) if preexisting[other] else ""
+        results.append((name, upsert_protocol_in_file(root / name, note)))
+    return results
 
 
 # Keeps the best-effort event log out of git; lives inside the KB so it travels with the scaffold.
@@ -1013,7 +968,7 @@ def command_init(args: argparse.Namespace) -> int:
         if write_if_missing(kb / relative, render_topic(title, read_when)):
             created.append(str(Path(".agent-kb") / relative))
 
-    protocol_path, protocol_action, counterpart_action = upsert_runtime_protocol(root)
+    protocol_actions = upsert_runtime_protocol(root)
 
     # Set up the chosen versioning mode: nested/local keep the KB out of the parent
     # repo via .gitignore; nested additionally gives the KB its own git history.
@@ -1025,9 +980,8 @@ def command_init(args: argparse.Namespace) -> int:
         nested_status = init_nested_repo(kb)
 
     print(f"Initialized KB at {kb}")
-    print(f"{protocol_path.name} protocol {protocol_action}.")
-    if counterpart_action:
-        print(f"{counterpart_action}.")
+    for name, action in protocol_actions:
+        print(f"{name} protocol {action}.")
     if created:
         print("Created files:")
         for path in created:
@@ -1093,7 +1047,7 @@ def command_upgrade(args: argparse.Namespace) -> int:
         (kb / "inbox").mkdir(parents=True)
 
     meta_action, meta, meta_note = upgrade_kb_meta(root, kb)
-    protocol_path, protocol_action, counterpart_action = upsert_runtime_protocol(root)
+    protocol_actions = upsert_runtime_protocol(root)
     gitignore_action = upgrade_scaffold_file(kb / ".gitignore", KB_GITIGNORE, False)
     start_action = upgrade_scaffold_file(kb / "start.md", START_MD, args.write_start)
     routes_action = upgrade_scaffold_file(kb / "routes.yaml", ROUTES_YAML, args.write_routes)
@@ -1108,9 +1062,8 @@ def command_upgrade(args: argparse.Namespace) -> int:
     print(f".agent-kb/{KB_META_FILE} {meta_action}.")
     if meta_note:
         print(f"Metadata {meta_note}.")
-    print(f"{protocol_path.name} protocol {protocol_action}.")
-    if counterpart_action:
-        print(f"{counterpart_action}.")
+    for name, action in protocol_actions:
+        print(f"{name} protocol {action}.")
     print(f".agent-kb/.gitignore {gitignore_action}.")
     print(f".agent-kb/start.md {start_action}.")
     if custom_routes_preserved:
@@ -1648,20 +1601,16 @@ def trim_structure_report(kb: Path, routes: list[dict[str, object]]) -> dict:
     }
 
 
-# Validates the KB scaffold, routes, links, inbox notes, and topic reachability; flags a still-empty scaffold.
-# Warns when a harness instruction file (AGENTS.md/CLAUDE.md) cannot reach the KB runtime protocol.
-def protocol_reach_warnings(root: Path) -> list[str]:
-    agents_path = root / "AGENTS.md"
-    claude_path = root / "CLAUDE.md"
-    owner = next((path for path in (agents_path, claude_path) if has_full_protocol(path)), None)
-    if owner is None:
-        return ["runtime protocol not found in AGENTS.md or CLAUDE.md; run upgrade"]
-    other = claude_path if owner == agents_path else agents_path
-    if not other.exists():
-        return [f"{other.name} is missing; run upgrade to create a pointer to {owner.name}"]
-    if owner.name.lower() not in other.read_text(encoding="utf-8").lower():
-        return [f"{other.name} does not reference the KB protocol in {owner.name}; run upgrade"]
-    return []
+# Warns when an entry file (AGENTS.md/CLAUDE.md) is missing or lacks the current KB runtime protocol.
+def protocol_presence_warnings(root: Path) -> list[str]:
+    warnings = []
+    for name in PROTOCOL_FILES:
+        path = root / name
+        if not path.exists():
+            warnings.append(f"{name} is missing; run upgrade to create it with the KB runtime protocol")
+        elif PROTOCOL_BODY_MARKER not in path.read_text(encoding="utf-8"):
+            warnings.append(f"{name} does not carry the current KB runtime protocol; run upgrade")
+    return warnings
 
 
 # Prints scaffold validation results, adding runtime-protocol warnings that need the repo root.
@@ -1670,7 +1619,7 @@ def command_validate(args: argparse.Namespace) -> tuple[int, dict]:
     kb = kb_dir(root)
     errors, warnings = validate_kb(kb)
     if kb.exists():
-        warnings = warnings + protocol_reach_warnings(root)
+        warnings = warnings + protocol_presence_warnings(root)
 
     for warning in warnings:
         print(f"WARN: {warning}")
