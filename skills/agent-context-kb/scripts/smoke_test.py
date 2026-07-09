@@ -544,7 +544,7 @@ def test_upgrade_updates_claude_protocol_owner() -> None:
         require("CLAUDE.md protocol updated." in result.stdout, "upgrade should report the CLAUDE.md protocol target", result)
         text = claude.read_text(encoding="utf-8")
         require("Old protocol." not in text, "upgrade should replace the old CLAUDE.md protocol section")
-        require("Use `.agent-kb/` before broad code search" in text, "upgrade should write the current protocol into CLAUDE.md")
+        require("`.agent-kb/` is this project's memory for coding agents" in text, "upgrade should write the current protocol into CLAUDE.md")
 
 
 # Checks that AGENTS.md receives the protocol when CLAUDE.md is only a pointer to it.
@@ -567,10 +567,10 @@ def test_agents_owner_when_claude_points_to_it() -> None:
         require("AGENTS.md protocol updated." in result.stdout, "init should report AGENTS.md as the protocol target", result)
         agents_text = agents.read_text(encoding="utf-8")
         require("Old protocol." not in agents_text, "AGENTS.md should replace the old protocol section")
-        require("Use `.agent-kb/` before broad code search" in agents_text, "AGENTS.md should own the Codex-visible protocol")
+        require("`.agent-kb/` is this project's memory for coding agents" in agents_text, "AGENTS.md should own the Codex-visible protocol")
         require("## Commands" in agents_text, "AGENTS.md should preserve unrelated instructions")
         claude_text = claude.read_text(encoding="utf-8")
-        require("Use `.agent-kb/` before broad code search" not in claude_text, "CLAUDE.md pointer should not receive a protocol copy")
+        require("`.agent-kb/` is this project's memory for coding agents" not in claude_text, "CLAUDE.md pointer should not receive a protocol copy")
         require("AGENTS.md" in claude_text, "CLAUDE.md should keep pointing at AGENTS.md")
 
 
@@ -583,7 +583,7 @@ def test_init_creates_claude_pointer_for_agents_owner() -> None:
         require("CLAUDE.md created as a pointer to AGENTS.md." in result.stdout, "init should report the counterpart pointer", result)
         claude_text = (root / "CLAUDE.md").read_text(encoding="utf-8")
         require("AGENTS.md" in claude_text, "CLAUDE.md pointer should reference AGENTS.md")
-        require("Use `.agent-kb/` before broad code search" not in claude_text, "CLAUDE.md pointer should not duplicate the protocol")
+        require("`.agent-kb/` is this project's memory for coding agents" not in claude_text, "CLAUDE.md pointer should not duplicate the protocol")
 
 
 # Checks that upgrade migrates a protocol misplaced in a CLAUDE.md pointer file back to AGENTS.md.
@@ -608,9 +608,10 @@ def test_upgrade_migrates_misplaced_claude_protocol() -> None:
         require(result.returncode == 0, "upgrade should succeed on the misplaced-protocol state", result)
         require("AGENTS.md protocol appended." in result.stdout, "upgrade should move the protocol into AGENTS.md", result)
         require("CLAUDE.md protocol replaced with a pointer to AGENTS.md." in result.stdout, "upgrade should report the migration", result)
-        require("Use `.agent-kb/` before broad code search" in agents.read_text(encoding="utf-8"), "AGENTS.md should own the protocol after migration")
+        require("`.agent-kb/` is this project's memory for coding agents" in agents.read_text(encoding="utf-8"), "AGENTS.md should own the protocol after migration")
         claude_text = claude.read_text(encoding="utf-8")
-        require("Use `.agent-kb/` before broad code search" not in claude_text, "CLAUDE.md should no longer hold the full protocol")
+        require("Use `.agent-kb/` before broad code search" not in claude_text, "CLAUDE.md should no longer hold the legacy protocol")
+        require("`.agent-kb/` is this project's memory for coding agents" not in claude_text, "CLAUDE.md should no longer hold the full protocol")
         require("AGENTS.md" in claude_text, "CLAUDE.md should still point at AGENTS.md")
 
 
@@ -653,7 +654,7 @@ After the task, only when it created reusable project knowledge:
         result = run_cli(root, "upgrade")
         require(result.returncode == 0, "upgrade should succeed with an old long protocol", result)
         text = agents.read_text(encoding="utf-8")
-        require("Use `.agent-kb/` before broad code search" in text, "upgrade should write the slim protocol", result)
+        require("`.agent-kb/` is this project's memory for coding agents" in text, "upgrade should write the slim protocol", result)
         require("When you need to understand how this codebase works" not in text, "upgrade should remove old rationale prose")
 
 

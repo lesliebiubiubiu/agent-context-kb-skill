@@ -47,6 +47,15 @@ python3 scripts/agent_kb.py stats --root /path/to/repo
 Record durable knowledge only; the full do/don't canon lives in the generated
 `.agent-kb/start.md`. Summarize or link human docs rather than copying them in.
 
+Each layer has exactly one owner — do not restate another layer's content here:
+
+- **Trigger layer** (protocol section in `AGENTS.md`/`CLAUDE.md`): when to read
+  and when to update, nothing else. Owned by `RUNTIME_PROTOCOL` in
+  `scripts/agent_kb.py`.
+- **Canon layer** (`.agent-kb/start.md`): what counts as durable knowledge and
+  the do/don't lists.
+- **Skill layer** (this file): maintenance commands only.
+
 ## Lightweight Plans
 
 Use `.agent-kb/plans/current.md` for durable continuity: current focus, major

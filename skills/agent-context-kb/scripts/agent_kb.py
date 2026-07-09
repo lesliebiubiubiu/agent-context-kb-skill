@@ -34,18 +34,30 @@ KB_MODES = {"nested", "shared", "local"}
 
 RUNTIME_PROTOCOL = """## Project Knowledge Base
 
-Use `.agent-kb/` before broad code search when planning, building, debugging, or reviewing.
+`.agent-kb/` is this project's memory for coding agents: read it before working,
+update it when your work changes what a future agent needs to know.
+
+At task start, before broad code search:
 1. Read `.agent-kb/start.md`.
-2. Read `.agent-kb/routes.yaml`; pick only relevant routes.
+2. Read `.agent-kb/routes.yaml`; pick the routes relevant to this task.
 3. Read those KB docs, then search code for gaps.
 
-After work, update a topic or `.agent-kb/inbox/` only for reusable project knowledge.
-Do not store progress logs, chat summaries, secrets, or obvious code facts.
+Before finishing:
+- Did this work change what a future agent needs to know? If yes, update the
+  relevant topic file, or add a note in `.agent-kb/inbox/` when the right place
+  is unclear. `start.md` defines what belongs in the KB.
 """
 
 PROTOCOL_SECTION_RE = re.compile(r"^## Project Knowledge Base\n.*?(?=^## |\Z)", re.M | re.S)
 
-PROTOCOL_BODY_MARKER = "Use `.agent-kb/` before broad code search"
+PROTOCOL_BODY_MARKER = "`.agent-kb/` is this project's memory for coding agents"
+
+# Older generated protocol bodies, so owner detection and upgrade still recognize
+# KBs written by previous skill versions.
+LEGACY_PROTOCOL_MARKERS = (
+    "Use `.agent-kb/` before broad code search",
+    "Use `.agent-kb/` as the project knowledge base",
+)
 
 POINTER_FILE_TMPL = (
     "See [{owner}]({owner}) for repository instructions and the `.agent-kb/` knowledge base protocol.\n"
@@ -88,7 +100,8 @@ write a separate note in `inbox/`.
 - One-off chat summaries
 - Secrets, tokens, cookies, credentials, or local-only state
 - Unverified guesses unless clearly marked as pending verification
-- Details that are already obvious from reading the code
+- Facts fully visible by opening a single file (cross-file structure, reasons,
+  and decisions do belong here, even when the code "shows" them)
 """
 
 DEFAULT_ROUTES = [
@@ -807,9 +820,12 @@ def has_protocol_section(path: Path) -> bool:
     return path.exists() and bool(PROTOCOL_SECTION_RE.search(path.read_text(encoding="utf-8")))
 
 
-# Checks whether a file carries the full KB runtime protocol, not just a pointer section to it.
+# Checks whether a file carries the full KB runtime protocol (current or legacy), not just a pointer section to it.
 def has_full_protocol(path: Path) -> bool:
-    return path.exists() and PROTOCOL_BODY_MARKER in path.read_text(encoding="utf-8")
+    if not path.exists():
+        return False
+    text = path.read_text(encoding="utf-8")
+    return any(marker in text for marker in (PROTOCOL_BODY_MARKER, *LEGACY_PROTOCOL_MARKERS))
 
 
 # Checks whether an instruction file, ignoring any injected protocol section, only points agents to another file.
