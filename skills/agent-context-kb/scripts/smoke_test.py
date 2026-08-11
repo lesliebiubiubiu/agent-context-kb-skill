@@ -1255,6 +1255,91 @@ def test_backfill_skips_unparseable_transcript() -> None:
         )
 
 
+# Checks that one unparseable transcript is skipped without discarding other transcripts' compliance events.
+def test_compliance_skips_unparseable_transcript() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        base = Path(tmp)
+        root = base / "repo"
+        root.mkdir()
+        init_root(root)
+        codex_dir = base / "codex" / "sessions"
+        for name in ("rollout-bad.jsonl", "rollout-good.jsonl"):
+            write_jsonl(
+                codex_dir / name,
+                [
+                    {"timestamp": "2026-07-05T00:00:00Z", "type": "session_meta", "payload": {"cwd": str(root)}},
+                    {
+                        "timestamp": "2026-07-05T00:00:01Z",
+                        "type": "function_call",
+                        "payload": {
+                            "name": "functions.exec_command",
+                            "arguments": json.dumps(
+                                {"cmd": "sed -n '1,40p' .agent-kb/start.md", "workdir": str(root)}
+                            ),
+                        },
+                    },
+                ],
+            )
+
+        import transcript_reads
+
+        original_parse = transcript_reads.parse_codex_tool_events
+
+        # Raises only for the poisoned transcript so the collection has to isolate that one file.
+        def flaky_parse(path: Path, scan_root: Path):
+            if path.name == "rollout-bad.jsonl":
+                raise RuntimeError("Could not determine home directory.")
+            return original_parse(path, scan_root)
+
+        transcript_reads.parse_codex_tool_events = flaky_parse
+        try:
+            # The analyzer resolves --root before scanning, so mirror that here for symlinked temp paths.
+            scan_root = root.resolve()
+            events = transcript_reads.collect_tool_events(scan_root, None, codex_dir)
+        finally:
+            transcript_reads.parse_codex_tool_events = original_parse
+
+        require(
+            [event.kind for event in events] == ["kb_entry_read"],
+            f"the good transcript's event should survive a failing sibling, got {[e.kind for e in events]}",
+        )
+
+
+# Checks that a `~3` token in a non-read command cannot crash the compliance analyzer.
+def test_compliance_survives_junk_home_token() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        base = Path(tmp)
+        root = base / "repo"
+        root.mkdir()
+        init_root(root)
+        claude_dir = base / "claude" / "projects"
+        claude_dir.mkdir(parents=True)
+        codex_dir = base / "codex" / "sessions"
+        write_jsonl(
+            codex_dir / "rollout-tilde-token.jsonl",
+            [
+                {"timestamp": "2026-07-05T00:00:00Z", "type": "session_meta", "payload": {"cwd": str(root)}},
+                {
+                    "timestamp": "2026-07-05T00:00:01Z",
+                    "type": "function_call",
+                    "payload": {
+                        "name": "functions.exec_command",
+                        # `rg` is not a KB_READ_COMMAND, so classify_codex_command scrapes every word.
+                        "arguments": json.dumps({"cmd": "rg -n '~3' src", "workdir": str(root)}),
+                    },
+                },
+            ],
+        )
+
+        result = run_compliance(root, claude_dir, codex_dir)
+        require(result.returncode == 0, "compliance analyzer should survive a junk `~3` token", result)
+        require(
+            "Could not determine home directory" not in result.stderr,
+            "a junk `~3` token should not reach the analyzer as an error",
+            result,
+        )
+
+
 # Checks that the private compliance analyzer parses synthetic Claude and Codex transcripts.
 def test_compliance_analyzer_synthetic_transcripts() -> None:
     with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
@@ -2362,6 +2447,8 @@ def main() -> int:
         test_resolve_path_tolerates_junk_home_token,
         test_stats_backfill_survives_junk_home_token,
         test_backfill_skips_unparseable_transcript,
+        test_compliance_skips_unparseable_transcript,
+        test_compliance_survives_junk_home_token,
         test_compliance_analyzer_synthetic_transcripts,
         test_eval_runner_dry_run,
         test_eval_runner_shared_kb_dry_run,

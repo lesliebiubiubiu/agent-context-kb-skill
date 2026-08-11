@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 import json
 from pathlib import Path
 import re
 import shlex
+import sys
 
 
 KB_READ_COMMANDS = {"cat", "head", "tail", "sed", "nl", "less", "more"}
@@ -467,13 +469,22 @@ def scan_transcripts(root: Path, claude_dir: Path | None, codex_dir: Path | None
     return merge_scans(scans)
 
 
+# Parses one transcript and returns no events when it fails, so one bad file cannot end the scan.
+def safe_tool_events(path: Path, root: Path, parse: Callable[[Path, Path], list[ToolEvent]]) -> list[ToolEvent]:
+    try:
+        return parse(path, root)
+    except Exception as err:
+        print(f"WARN: skipped unparseable transcript {path.name}: {err}", file=sys.stderr)
+        return []
+
+
 # Collects normalized compliance events from local Claude Code and Codex transcripts.
 def collect_tool_events(root: Path, claude_dir: Path | None, codex_dir: Path | None) -> list[ToolEvent]:
     events: list[ToolEvent] = []
     if claude_dir is not None:
         for path in claude_transcript_paths(claude_dir, root):
-            events.extend(parse_claude_tool_events(path, root))
+            events.extend(safe_tool_events(path, root, parse_claude_tool_events))
     if codex_dir is not None:
         for path in codex_transcript_paths(codex_dir, root):
-            events.extend(parse_codex_tool_events(path, root))
+            events.extend(safe_tool_events(path, root, parse_codex_tool_events))
     return events
