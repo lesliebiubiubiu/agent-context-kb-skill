@@ -1147,6 +1147,114 @@ def test_stats_backfills_kb_reads() -> None:
         require(len(read_events) == 3, "event log should contain exactly three deduped kb_read events")
 
 
+# Checks that a `~N` token stays resolvable instead of raising when no such user exists.
+def test_resolve_path_tolerates_junk_home_token() -> None:
+    from transcript_reads import resolve_path
+
+    for token in ("~3", "~nosuchuser-agent-kb"):
+        try:
+            resolved = resolve_path(token)
+        except Exception as err:  # noqa: BLE001 - the bug under test was an unexpected raise
+            require(False, f"resolve_path({token!r}) should not raise, got {type(err).__name__}: {err}")
+        require(
+            resolved == Path(token).resolve(),
+            f"resolve_path({token!r}) should fall back to plain resolve without expansion",
+        )
+
+
+# Checks that a transcript containing a `~3`-style token still backfills reads from every transcript.
+def test_stats_backfill_survives_junk_home_token() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        base = Path(tmp)
+        root = base / "repo"
+        root.mkdir()
+        init_root(root)
+        codex_dir = base / "codex" / "sessions"
+        write_jsonl(
+            codex_dir / "rollout-tilde-token.jsonl",
+            [
+                {"timestamp": "2026-07-05T00:00:00Z", "type": "session_meta", "payload": {"cwd": str(root)}},
+                {
+                    "timestamp": "2026-07-05T00:00:01Z",
+                    "type": "function_call",
+                    "payload": {
+                        "name": "functions.exec_command",
+                        "arguments": json.dumps({"cmd": "cat ~3", "workdir": str(root)}),
+                    },
+                },
+            ],
+        )
+        write_jsonl(
+            codex_dir / "rollout-real-read.jsonl",
+            [
+                {"timestamp": "2026-07-05T00:00:00Z", "type": "session_meta", "payload": {"cwd": str(root)}},
+                {
+                    "timestamp": "2026-07-05T00:00:01Z",
+                    "type": "function_call",
+                    "payload": {
+                        "name": "functions.exec_command",
+                        "arguments": json.dumps({"cmd": "sed -n '1,40p' .agent-kb/start.md", "workdir": str(root)}),
+                    },
+                },
+            ],
+        )
+
+        result = run_cli(root, "stats", "--codex-dir", str(codex_dir), "--dead-sessions", "1")
+        require(result.returncode == 0, "stats should succeed despite a junk `~3` token", result)
+        require("backfill failed" not in result.stdout, "a junk `~3` token should not fail the whole backfill", result)
+        require("Backfilled KB reads: 1 new event(s)." in result.stdout, "the sibling transcript read should count", result)
+
+
+# Checks that one unparseable transcript is skipped without discarding other transcripts' KB reads.
+def test_backfill_skips_unparseable_transcript() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        base = Path(tmp)
+        root = base / "repo"
+        root.mkdir()
+        init_root(root)
+        codex_dir = base / "codex" / "sessions"
+        for name in ("rollout-bad.jsonl", "rollout-good.jsonl"):
+            write_jsonl(
+                codex_dir / name,
+                [
+                    {"timestamp": "2026-07-05T00:00:00Z", "type": "session_meta", "payload": {"cwd": str(root)}},
+                    {
+                        "timestamp": "2026-07-05T00:00:01Z",
+                        "type": "function_call",
+                        "payload": {
+                            "name": "functions.exec_command",
+                            "arguments": json.dumps(
+                                {"cmd": "sed -n '1,40p' .agent-kb/start.md", "workdir": str(root)}
+                            ),
+                        },
+                    },
+                ],
+            )
+
+        import agent_kb
+
+        original_parse = agent_kb.parse_codex_transcript
+
+        # Raises only for the poisoned transcript so the scan has to isolate that one file.
+        def flaky_parse(path: Path, scan_root: Path):
+            if path.name == "rollout-bad.jsonl":
+                raise RuntimeError("Could not determine home directory.")
+            return original_parse(path, scan_root)
+
+        agent_kb.parse_codex_transcript = flaky_parse
+        try:
+            # The CLI resolves --root before scanning, so mirror that here for symlinked temp paths.
+            scan_root = root.resolve()
+            scan = agent_kb.scan_transcripts_incremental(scan_root, scan_root / ".agent-kb", None, codex_dir)
+        finally:
+            agent_kb.parse_codex_transcript = original_parse
+
+        require(
+            [event.file for event in scan.reads] == ["start.md"],
+            f"the good transcript's read should survive a failing sibling, got {[e.file for e in scan.reads]}",
+        )
+
+
 # Checks that the private compliance analyzer parses synthetic Claude and Codex transcripts.
 def test_compliance_analyzer_synthetic_transcripts() -> None:
     with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
@@ -2251,6 +2359,9 @@ def main() -> int:
         test_note_body_redacted_in_log,
         test_stats_reports_cli_usage,
         test_stats_backfills_kb_reads,
+        test_resolve_path_tolerates_junk_home_token,
+        test_stats_backfill_survives_junk_home_token,
+        test_backfill_skips_unparseable_transcript,
         test_compliance_analyzer_synthetic_transcripts,
         test_eval_runner_dry_run,
         test_eval_runner_shared_kb_dry_run,

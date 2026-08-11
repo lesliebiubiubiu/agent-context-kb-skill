@@ -442,6 +442,7 @@ def scan_transcripts_incremental(root: Path, kb: Path, claude_dir: Path | None, 
     codex_needles = {str(root), root.name, ".agent-kb"}
 
     # Parses one transcript when changed, otherwise restores its cached root-owned sessions.
+    # A file that fails to parse is skipped and left uncached, so one bad transcript cannot end the scan.
     def scan_path(path: Path, harness: str, needs_mention: bool) -> None:
         signature = transcript_signature(path)
         if signature is None:
@@ -457,12 +458,16 @@ def scan_transcripts_incremental(root: Path, kb: Path, claude_dir: Path | None, 
             sessions.update(str(session) for session in cached.get("sessions", []))
             next_files[key] = cached
             return
-        if needs_mention and not transcript_mentions(path, codex_needles):
-            scan = TranscriptScan(set(), [])
-        elif harness == "claude":
-            scan = parse_claude_transcript(path, root)
-        else:
-            scan = parse_codex_transcript(path, root)
+        try:
+            if needs_mention and not transcript_mentions(path, codex_needles):
+                scan = TranscriptScan(set(), [])
+            elif harness == "claude":
+                scan = parse_claude_transcript(path, root)
+            else:
+                scan = parse_codex_transcript(path, root)
+        except Exception as err:
+            print(f"WARN: skipped unparseable transcript {path.name}: {err}")
+            return
         sessions.update(scan.sessions)
         reads.extend(scan.reads)
         next_files[key] = transcript_cache_entry(harness, signature, scan)

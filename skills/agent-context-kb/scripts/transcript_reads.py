@@ -44,8 +44,13 @@ class ToolEvent:
 
 
 # Returns a resolved Path while tolerating missing files and user-relative input.
+# Junk tokens scraped from recorded commands (e.g. `~3`) make expanduser raise, so fall back to no expansion.
 def resolve_path(path: str | Path) -> Path:
-    return Path(path).expanduser().resolve()
+    try:
+        expanded = Path(path).expanduser()
+    except RuntimeError:
+        expanded = Path(path)
+    return expanded.resolve()
 
 
 # Reads JSONL records from a transcript one line at a time, skipping blank or malformed lines.
