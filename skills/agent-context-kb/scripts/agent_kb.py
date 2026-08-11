@@ -271,7 +271,9 @@ TRIM_MAX_ROUTES = 15
 # Char overage at or above this fraction is "major" (the file likely carries compactable bulk);
 # anything else — including line-only overage — is "minor", an advisory the agent can stop on.
 TRIM_MAJOR_OVERAGE = 0.10
-TRANSCRIPT_CACHE_VERSION = 2
+# Bumped to 3 when transcript attribution moved from process-cwd resolution to session workdir:
+# caches written before that hold cross-project sessions and must be recomputed, not reused.
+TRANSCRIPT_CACHE_VERSION = 3
 
 
 # Returns the repository root from an argparse namespace.
@@ -439,7 +441,7 @@ def scan_transcripts_incremental(root: Path, kb: Path, claude_dir: Path | None, 
     next_files: dict[str, dict] = {}
     sessions: set[str] = set()
     reads: list[KbReadEvent] = []
-    codex_needles = {str(root), root.name, ".agent-kb"}
+    codex_needles = {str(root), root.name}
 
     # Parses one transcript when changed, otherwise restores its cached root-owned sessions.
     # A file that fails to parse is skipped and left uncached, so one bad transcript cannot end the scan.
@@ -481,6 +483,32 @@ def scan_transcripts_incremental(root: Path, kb: Path, claude_dir: Path | None, 
 
     write_transcript_cache(kb, {"version": TRANSCRIPT_CACHE_VERSION, "files": next_files})
     return TranscriptScan(sessions, reads)
+
+
+# Drops transcript-derived kb_read events and the scan cache so the next backfill rebuilds them.
+# Unparseable lines and CLI events are kept: only kb_read records are derived data safe to rebuild.
+def reset_kb_read_events(kb: Path) -> int:
+    log_path = kb / ".log" / "events.jsonl"
+    removed = 0
+    if log_path.exists():
+        kept: list[str] = []
+        for line in log_path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if stripped:
+                try:
+                    if json.loads(stripped).get("event") == "kb_read":
+                        removed += 1
+                        continue
+                except json.JSONDecodeError:
+                    pass
+            kept.append(line)
+        if removed:
+            log_path.write_text("".join(f"{line}\n" for line in kept), encoding="utf-8")
+    try:
+        transcript_cache_path(kb).unlink()
+    except OSError:
+        pass
+    return removed
 
 
 # Scans transcripts for this repo and backfills KB read events into the local event log.
@@ -1989,6 +2017,13 @@ def command_stats(args: argparse.Namespace) -> int:
     scan: TranscriptScan | None = None
     added = 0
     backfill_error = None
+    if args.rebuild_reads:
+        if args.no_backfill:
+            print("ERROR: --rebuild-reads needs the backfill; drop --no-backfill")
+            return 1
+        removed = reset_kb_read_events(kb)
+        print(f"Rebuilding KB read history: dropped {removed} transcript-derived event(s).")
+        print()
     if not args.no_backfill:
         try:
             scan, added = backfill_kb_reads(root, args)
@@ -2107,6 +2142,11 @@ def build_parser() -> argparse.ArgumentParser:
     stats_parser.add_argument("--root", default=".", help="Repository root to manage.")
     stats_parser.add_argument("--top", type=int, default=5, help="Show at most this many rows per section (default 5).")
     stats_parser.add_argument("--no-backfill", action="store_true", help="Do not scan local transcripts before rendering stats.")
+    stats_parser.add_argument(
+        "--rebuild-reads",
+        action="store_true",
+        help="Drop transcript-derived kb_read events and rebuild them from scratch (fixes logs polluted by older scans).",
+    )
     stats_parser.add_argument("--claude-dir", default="~/.claude/projects", help="Claude Code projects transcript directory.")
     stats_parser.add_argument("--codex-dir", default="~/.codex/sessions", help="Codex sessions transcript directory.")
     stats_parser.add_argument("--no-backfill-claude", action="store_true", help="Skip Claude Code transcript backfill.")

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import importlib.util
+import os
 import re
 import subprocess
 import sys
@@ -20,13 +21,15 @@ from transcript_reads import claude_project_name  # noqa: E402
 
 
 # Runs the KB CLI against a temporary repository and captures output for assertions.
-def run_cli(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+# `cwd` matters for transcript attribution tests, where a bare path must not resolve against it.
+def run_cli(root: Path, *args: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(SCRIPT), *args, "--root", str(root)],
         check=False,
         encoding="utf-8",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        cwd=None if cwd is None else str(cwd),
     )
 
 
@@ -1145,6 +1148,136 @@ def test_stats_backfills_kb_reads() -> None:
         log = (root / ".agent-kb" / ".log" / "events.jsonl").read_text(encoding="utf-8")
         read_events = [json.loads(line) for line in log.splitlines() if '"event": "kb_read"' in line]
         require(len(read_events) == 3, "event log should contain exactly three deduped kb_read events")
+
+
+# Checks that a bare path is never resolved against the process cwd, only against a session workdir.
+def test_root_relative_rejects_bare_paths() -> None:
+    from transcript_reads import command_paths, root_relative
+
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp).resolve()
+        (root / ".agent-kb").mkdir()
+        # Stand inside root: that is the case where a bare path silently became a root path.
+        previous_cwd = Path.cwd()
+        os.chdir(root)
+        try:
+            require(
+                root_relative(".agent-kb/start.md", root) is None,
+                "a bare path must not resolve against the process cwd",
+            )
+        finally:
+            os.chdir(previous_cwd)
+        require(
+            root_relative(str(root / ".agent-kb" / "start.md"), root) == Path(".agent-kb/start.md"),
+            "an absolute path inside root must still resolve",
+        )
+        require(
+            command_paths("cat .agent-kb/start.md", root, None) == [],
+            "without a workdir a bare path must be dropped, not guessed",
+        )
+        require(
+            Path(".agent-kb/start.md") in command_paths("cat .agent-kb/start.md", root, root),
+            "with a workdir inside root a bare path must resolve",
+        )
+        require(
+            Path(".agent-kb/start.md") in command_paths("cat .agent-kb/start.md; echo done", root, root),
+            "shell punctuation glued to an operand must not create a phantom path",
+        )
+
+    from transcript_reads import codex_kb_read_path
+
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp).resolve()
+        (root / ".agent-kb").mkdir()
+        require(
+            codex_kb_read_path("cat .agent-kb/start.md; echo done", root, root) == Path(".agent-kb/start.md"),
+            "a trailing `;` must be trimmed rather than dropping a real KB read",
+        )
+        require(
+            codex_kb_read_path("cat .agent-kb/`, x", root, root) is None,
+            "a junk token after `.agent-kb/` must not be recorded as a KB doc read",
+        )
+
+
+# Checks that a session working in another project never counts as a read of this repo's KB.
+def test_stats_ignores_other_project_transcripts() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        base = Path(tmp)
+        root = base / "repo"
+        other = base / "other-project"
+        root.mkdir()
+        other.mkdir()
+        init_root(root)
+        init_root(other)
+        (other / ".agent-kb" / "architecture").mkdir(parents=True, exist_ok=True)
+        (other / ".agent-kb" / "architecture" / "vlm-eval.md").write_text("foreign\n", encoding="utf-8")
+        codex_dir = base / "codex" / "sessions"
+        write_jsonl(
+            codex_dir / "rollout-other-project.jsonl",
+            [
+                {"timestamp": "2026-08-11T00:00:00Z", "type": "session_meta", "payload": {"cwd": str(other)}},
+                {
+                    "timestamp": "2026-08-11T00:00:01Z",
+                    "type": "function_call",
+                    "payload": {
+                        "name": "functions.exec_command",
+                        "arguments": json.dumps(
+                            {"cmd": "sed -n '1,40p' .agent-kb/architecture/vlm-eval.md", "workdir": str(other)}
+                        ),
+                    },
+                },
+            ],
+        )
+        write_jsonl(
+            codex_dir / "rollout-own.jsonl",
+            [
+                {"timestamp": "2026-08-11T01:00:00Z", "type": "session_meta", "payload": {"cwd": str(root)}},
+                {
+                    "timestamp": "2026-08-11T01:00:01Z",
+                    "type": "function_call",
+                    "payload": {
+                        "name": "functions.exec_command",
+                        "arguments": json.dumps({"cmd": "sed -n '1,40p' .agent-kb/start.md", "workdir": str(root)}),
+                    },
+                },
+            ],
+        )
+
+        # Run from inside the repo: that is what made a foreign bare path land under root.
+        result = run_cli(root, "stats", "--codex-dir", str(codex_dir), "--no-backfill-claude", cwd=root)
+        require(result.returncode == 0, "stats should succeed with a foreign transcript present", result)
+        require("vlm-eval" not in result.stdout, "another project's KB read must not be counted", result)
+        require("Backfilled KB reads: 1 new event(s)." in result.stdout, "only the own-repo read should count", result)
+        require("scanned sessions: 1" in result.stdout, "the foreign session must not inflate the denominator", result)
+        log = (root / ".agent-kb" / ".log" / "events.jsonl").read_text(encoding="utf-8")
+        require("vlm-eval" not in log, "the foreign read must not reach events.jsonl either")
+
+
+# Checks that --rebuild-reads drops derived kb_read events while keeping CLI history.
+def test_stats_rebuild_reads_drops_polluted_events() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        base = Path(tmp)
+        root = base / "repo"
+        root.mkdir()
+        init_root(root)
+        log_path = root / ".agent-kb" / ".log" / "events.jsonl"
+        polluted = [
+            {"ts": "2026-08-01T00:00:00Z", "event": "kb_read", "session": "codex:foreign", "file": "architecture/vlm-eval.md", "chars": 0},
+            {"ts": "2026-08-01T00:00:01Z", "event": "cli", "command": "validate", "exit": 0},
+        ]
+        with log_path.open("a", encoding="utf-8") as handle:
+            for event in polluted:
+                handle.write(json.dumps(event) + "\n")
+
+        result = run_cli(root, "stats", "--rebuild-reads", "--no-backfill-claude", "--no-backfill-codex")
+        require(result.returncode == 0, "stats --rebuild-reads should succeed", result)
+        require("dropped 1 transcript-derived event(s)." in result.stdout, "the polluted read should be dropped", result)
+        text = log_path.read_text(encoding="utf-8")
+        require("vlm-eval" not in text, "the polluted kb_read must be gone from the log")
+        require('"command": "validate"' in text, "CLI history must be preserved by a rebuild")
+
+        result = run_cli(root, "stats", "--rebuild-reads", "--no-backfill")
+        require(result.returncode == 1, "--rebuild-reads with --no-backfill should be refused", result)
 
 
 # Checks that a `~N` token stays resolvable instead of raising when no such user exists.
@@ -2444,6 +2577,9 @@ def main() -> int:
         test_note_body_redacted_in_log,
         test_stats_reports_cli_usage,
         test_stats_backfills_kb_reads,
+        test_root_relative_rejects_bare_paths,
+        test_stats_ignores_other_project_transcripts,
+        test_stats_rebuild_reads_drops_polluted_events,
         test_resolve_path_tolerates_junk_home_token,
         test_stats_backfill_survives_junk_home_token,
         test_backfill_skips_unparseable_transcript,

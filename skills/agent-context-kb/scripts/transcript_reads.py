@@ -17,6 +17,11 @@ AGENTS_INSTRUCTION_FILE = "AGENTS.md"
 SOURCE_SEARCH_TOOLS = {"Grep", "Glob", "LS"}
 SOURCE_EDIT_TOOLS = {"Edit", "MultiEdit", "Write", "NotebookEdit"}
 SHELL_SEARCH_COMMANDS = {"rg", "grep", "find", "ls"}
+# Shell punctuation shlex leaves glued to an unquoted operand, e.g. `cat start.md; echo done`.
+SHELL_TOKEN_TRIM = "'\"`;&|<>()"
+# KB docs only ever carry these suffixes. Codex reads are scraped from free-form command text,
+# so this rejects junk tokens that happen to sit after a `.agent-kb/` prefix.
+KB_DOC_SUFFIXES = {".md", ".yaml", ".yml", ".json", ".txt"}
 SHELL_EDIT_COMMANDS = {"apply_patch", "perl", "ruby"}
 
 
@@ -111,13 +116,20 @@ def claude_project_dirs(base: Path, root: Path) -> list[Path]:
     return sorted(path for path in (base / name for name in names) if path.exists() and path.is_dir())
 
 
-# Returns whether a path is inside root and, if so, its relative path.
+# Returns whether an absolute path is inside root and, if so, its relative path.
+# Relative input is rejected on purpose: resolving it here would use the process cwd, which
+# attributes another project's transcript paths to this repo. Callers join it with the session workdir.
 def root_relative(path_value: str, root: Path) -> Path | None:
     if not path_value:
         return None
     try:
-        candidate = resolve_path(path_value)
-        return candidate.relative_to(root)
+        expanded = Path(path_value).expanduser()
+    except RuntimeError:
+        return None
+    if not expanded.is_absolute():
+        return None
+    try:
+        return expanded.resolve().relative_to(root)
     except (OSError, ValueError):
         return None
 
@@ -291,28 +303,28 @@ def command_words(command: str) -> list[str]:
 
 
 # Finds root-relative paths mentioned in a shell command.
+# A bare path means "relative to the session's workdir", so it is only resolved when that workdir is known.
 def command_paths(command: str, root: Path, workdir: Path | None) -> list[Path]:
     relatives: list[Path] = []
     for word in command_words(command):
-        cleaned = word.strip("'\"")
+        cleaned = word.strip(SHELL_TOKEN_TRIM)
+        if not cleaned or cleaned.startswith("-"):
+            continue
         relative = root_relative(cleaned, root)
+        if relative is None and workdir is not None:
+            relative = root_relative(str(workdir / cleaned), root)
         if relative is not None:
             relatives.append(relative)
-            continue
-        if workdir is not None and not cleaned.startswith("-"):
-            relative = root_relative(str(workdir / cleaned), root)
-            if relative is not None:
-                relatives.append(relative)
     return relatives
 
 
-# Extracts the first `.agent-kb/` path read by a Codex shell command.
+# Extracts the first `.agent-kb/` doc path read by a Codex shell command.
 def codex_kb_read_path(command: str, root: Path, workdir: Path | None) -> Path | None:
     words = command_words(command)
     if not words or Path(words[0]).name not in KB_READ_COMMANDS:
         return None
     for relative in command_paths(command, root, workdir):
-        if kb_relative(relative) is not None:
+        if kb_relative(relative) is not None and relative.suffix.lower() in KB_DOC_SUFFIXES:
             return relative
     return None
 
@@ -357,9 +369,12 @@ def parse_codex_transcript(path: Path, root: Path) -> TranscriptScan:
         if record.get("type") == "session_meta":
             cwd = str(payload.get("cwd") or payload.get("workdir") or "")
             cwd_path = resolve_path(cwd) if cwd else None
+            # Track the session's own cwd even when it is another project, so its bare
+            # paths resolve there and fail the root check instead of landing under root.
+            if cwd_path is not None:
+                current_workdir = cwd_path
             if path_is_inside_root(cwd_path, root):
                 sessions.add(session)
-                current_workdir = cwd_path
             continue
         tool_payload = codex_record_tool_payload(record)
         if tool_payload is None:
@@ -390,9 +405,10 @@ def parse_codex_tool_events(path: Path, root: Path) -> list[ToolEvent]:
         if record.get("type") == "session_meta":
             cwd = str(payload.get("cwd") or payload.get("workdir") or "")
             cwd_path = resolve_path(cwd) if cwd else None
+            if cwd_path is not None:
+                current_workdir = cwd_path
             if path_is_inside_root(cwd_path, root):
                 belongs_to_root = True
-                current_workdir = cwd_path
             continue
         tool_payload = codex_record_tool_payload(record)
         if tool_payload is None:
@@ -443,9 +459,12 @@ def claude_transcript_paths(base: Path, root: Path) -> list[Path]:
     return sorted(paths)
 
 
-# Collects Codex transcript paths that cheaply mention this root or KB paths.
+# Collects Codex transcript paths that cheaply mention this root.
+# Codex sessions are date-partitioned, not per-project, so this is only a prefilter for which
+# files to open; the parsers decide ownership from cwd/workdir. A `.agent-kb` needle is not used
+# here because it matches every project's KB sessions.
 def codex_transcript_paths(base: Path, root: Path) -> list[Path]:
-    needles = {str(root), root.name, ".agent-kb"}
+    needles = {str(root), root.name}
     return [path for path in transcript_paths(base) if transcript_mentions(path, needles)]
 
 
