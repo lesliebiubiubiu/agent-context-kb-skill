@@ -25,18 +25,17 @@ PRICING_PATH = SCRIPT_DIR / "pricing.json"
 TRANSCRIPT_SCRIPT_DIR = REPO_DIR / "skills" / "agent-context-kb" / "scripts"
 sys.path.insert(0, str(TRANSCRIPT_SCRIPT_DIR))
 from transcript_reads import (  # noqa: E402
-    KB_READ_COMMANDS,
-    command_paths,
-    command_words,
     codex_command_arg,
     codex_record_tool_payload,
     codex_tool_call,
+    codex_tool_commands,
     iter_jsonl,
     kb_relative,
     path_is_inside_root,
     read_kind_for_relative,
     resolve_path,
     root_relative,
+    shell_kb_read_paths,
 )
 
 
@@ -558,19 +557,23 @@ def parse_jsonl_agent_output(stdout: str) -> dict:
     }
 
 
-# Converts a Codex function call payload into the scorer's existing tool-call shape.
-def normalize_codex_tool_payload(payload: dict, fallback_workdir: Path | None = None) -> dict:
+# Converts a Codex function call payload into the scorer's existing tool-call shape, one call per command.
+# Codex sends `exec` as a JavaScript wrapper that can hold several commands, each with its own workdir,
+# so every command becomes its own shell call; a payload with no command keeps its single original row.
+def normalize_codex_tool_payload(payload: dict, fallback_workdir: Path | None = None) -> list[dict]:
     name, args = codex_tool_call(payload)
     if "apply_patch" in name:
-        return {"name": "apply_patch", "input": args}
-    command = codex_command_arg(args)
-    if command:
-        workdir = args.get("workdir") or (str(fallback_workdir) if fallback_workdir else None)
+        return [{"name": "apply_patch", "input": args}]
+    calls = []
+    for command, command_workdir in codex_tool_commands(payload):
+        if not command:
+            continue
+        workdir = command_workdir or args.get("workdir") or (str(fallback_workdir) if fallback_workdir else None)
         tool_input = {"command": command, "cmd": command}
         if workdir:
             tool_input["workdir"] = str(workdir)
-        return {"name": "shell", "input": tool_input}
-    return {"name": name or "tool", "input": args}
+        calls.append({"name": "shell", "input": tool_input})
+    return calls or [{"name": name or "tool", "input": args}]
 
 
 # Converts a Codex command_execution item into the scorer's shell-call shape.
@@ -587,17 +590,21 @@ def normalize_codex_command_execution(item: dict, fallback_workdir: Path | None 
 
 
 # Finds Codex function-call records anywhere inside one JSON event.
+# One record can normalize into several calls, because a single `exec` payload can run several commands.
 def extract_codex_tool_calls(value, fallback_workdir: Path | None = None) -> list[dict]:
     calls = []
     if isinstance(value, dict):
-        if value.get("type") == "command_execution":
+        # Only a string `type` can name a record kind; tool JSON schemas nest `"type": {...}`,
+        # which the membership tests below would reject with a TypeError instead of skipping.
+        kind = value.get("type") if isinstance(value.get("type"), str) else None
+        if kind == "command_execution":
             call = normalize_codex_command_execution(value, fallback_workdir)
             return [call] if call is not None else []
-        payload = codex_record_tool_payload(value)
+        payload = codex_record_tool_payload(value) if kind else None
         if payload is not None:
-            return [normalize_codex_tool_payload(payload, fallback_workdir)]
-        elif value.get("type") in {"function_call", "custom_tool_call"} and (value.get("name") or value.get("tool_name")):
-            return [normalize_codex_tool_payload(value, fallback_workdir)]
+            return normalize_codex_tool_payload(payload, fallback_workdir)
+        elif kind in {"function_call", "custom_tool_call"} and (value.get("name") or value.get("tool_name")):
+            return normalize_codex_tool_payload(value, fallback_workdir)
         for child in value.values():
             calls.extend(extract_codex_tool_calls(child, fallback_workdir))
     elif isinstance(value, list):
@@ -870,6 +877,8 @@ def direct_kb_tool_path(raw_path: str, root: Path) -> Path | None:
 
 
 # Extracts repo-relative KB file reads from one normalized tool call.
+# Shell calls go through the shared `shell_kb_read_paths` rule, so a read chained after another
+# command (`rg ... && sed -n '1,40p' .agent-kb/start.md`) counts here exactly as it does elsewhere.
 def kb_read_paths_for_tool_call(call: dict, root: Path) -> list[str]:
     tool_input = call.get("input") if isinstance(call.get("input"), dict) else {}
     paths: list[Path] = []
@@ -880,11 +889,9 @@ def kb_read_paths_for_tool_call(call: dict, root: Path) -> list[str]:
                 paths.append(path)
     elif call.get("name") in COMMAND_TOOL_NAMES:
         command = codex_command_arg({"cmd": tool_input.get("cmd") or tool_input.get("command") or ""})
-        words = command_words(command)
-        if words and Path(words[0]).name in KB_READ_COMMANDS:
-            workdir_raw = str(tool_input.get("workdir") or "")
-            workdir = resolve_path(workdir_raw) if workdir_raw else root
-            paths.extend(path for path in command_paths(command, root, workdir) if kb_relative(path) is not None)
+        workdir_raw = str(tool_input.get("workdir") or "")
+        workdir = resolve_path(workdir_raw) if workdir_raw else root
+        paths.extend(shell_kb_read_paths(command, root, workdir))
     return [str(path) for path in paths]
 
 

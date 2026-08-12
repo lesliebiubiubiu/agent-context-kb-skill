@@ -77,14 +77,46 @@ def resolve_since(value: str, root: Path) -> datetime:
     return parsed
 
 
-# Groups events by session while preserving their observed order.
+# Groups events into logical sessions, keeping only the main-thread files of each session.
+# Sub-agent events are dropped rather than woven into the stream on purpose: this analyzer is
+# order-sensitive, a sub-agent explores code by design and its record indices restart per file, so
+# interleaving them would invent "read the KB after exploring code" verdicts no agent produced.
+# A sub-agent-only group therefore disappears instead of being judged as a session of its own.
+# (`stats` differs deliberately: it has no ordering, so it can credit sub-agent KB reads to the parent.)
+# The remaining files are ordered as whole blocks by start time, never interleaved, because only the
+# record order inside a file is exact. A later file can then only be pushed further back, never in
+# front of an earlier file's KB read, so merging cannot invent a late-KB-read verdict; the cost is
+# that a long first file can hide a genuinely late read, which is the safe direction to err in.
 def group_events_by_session(events: list[ToolEvent]) -> dict[str, list[ToolEvent]]:
     grouped: dict[str, list[ToolEvent]] = {}
     for event in events:
+        if not event.user_thread:
+            continue
         grouped.setdefault(event.session, []).append(event)
     for session_events in grouped.values():
-        session_events.sort(key=lambda event: (event.order, event.timestamp))
+        session_events.sort(key=lambda event: (event.file_key, event.order))
     return grouped
+
+
+# Lays a session's transcript files end to end so events from different files compare on one axis.
+# Each block is offset by the record counts of the blocks before it, so an event's number keeps
+# meaning "records into the session" — the unit the late-read buckets are stated in.
+def session_orders(session_events: list[ToolEvent]) -> list[int]:
+    lengths = {event.file_key: event.file_records for event in session_events}
+    offsets: dict[str, int] = {}
+    cursor = 0
+    for key in sorted(lengths):
+        offsets[key] = cursor
+        cursor += lengths[key]
+    return [offsets[event.file_key] + event.order for event in session_events]
+
+
+# Returns the first event of any of these kinds together with its session-global order.
+def first_event(events: list[ToolEvent], orders: list[int], kinds: set[str]) -> tuple[ToolEvent | None, int | None]:
+    for event, order in zip(events, orders):
+        if event.kind in kinds:
+            return event, order
+    return None, None
 
 
 # Returns the earliest real timestamp observed in a session.
@@ -118,20 +150,19 @@ def late_read_bucket(delta: int | None) -> str | None:
     return "20+ actions late"
 
 
-# Classifies a session by the first KB and source events the analyzer can observe.
+# Classifies a session by the session-global order of the first KB and source events observed.
 def classify_session(
-    first_kb: ToolEvent | None,
-    first_any_kb: ToolEvent | None,
-    first_source: ToolEvent | None,
+    first_kb: int | None,
+    first_any_kb: int | None,
+    first_source: int | None,
 ) -> tuple[bool, str, str | None]:
     if first_source is None:
         return False, "kb_first_not_applicable", None
-    if first_kb and first_kb.order < first_source.order:
+    if first_kb is not None and first_kb < first_source:
         return True, "compliant", None
-    if first_kb and first_kb.order > first_source.order:
-        delta = first_kb.order - first_source.order
-        return True, "late_kb_read", late_read_bucket(delta)
-    if first_any_kb and first_any_kb.order < first_source.order:
+    if first_kb is not None and first_kb > first_source:
+        return True, "late_kb_read", late_read_bucket(first_kb - first_source)
+    if first_any_kb is not None and first_any_kb < first_source:
         return True, "non_entry_kb_read", None
     if first_kb is None:
         return True, "no_kb_read", None
@@ -142,11 +173,12 @@ def classify_session(
 def summarize_sessions(events: list[ToolEvent]) -> list[SessionResult]:
     results = []
     for session, session_events in sorted(group_events_by_session(events).items()):
-        first_kb = next((event for event in session_events if event.kind == "kb_entry_read"), None)
-        first_any_kb = next((event for event in session_events if event.kind in {"kb_entry_read", "kb_read"}), None)
-        first_source = next((event for event in session_events if event.kind in {"source_explore", "source_edit"}), None)
+        orders = session_orders(session_events)
+        _kb, first_kb = first_event(session_events, orders, {"kb_entry_read"})
+        _any_kb, first_any_kb = first_event(session_events, orders, {"kb_entry_read", "kb_read"})
+        source, first_source = first_event(session_events, orders, {"source_explore", "source_edit"})
         read_agents_md = any(event.kind == "agents_read" for event in session_events)
-        compliant = bool(first_kb and (not first_source or first_kb.order < first_source.order))
+        compliant = first_kb is not None and (first_source is None or first_kb < first_source)
         applicable, category, bucket = classify_session(first_kb, first_any_kb, first_source)
         harness = session_events[0].harness if session_events else "unknown"
         results.append(
@@ -158,11 +190,11 @@ def summarize_sessions(events: list[ToolEvent]) -> list[SessionResult]:
                 category=category,
                 late_bucket=bucket,
                 read_agents_md=read_agents_md,
-                first_kb_order=first_kb.order if first_kb else None,
-                first_any_kb_order=first_any_kb.order if first_any_kb else None,
-                first_source_order=first_source.order if first_source else None,
-                first_source_kind=first_source.kind if first_source else None,
-                first_source_path=first_source.path if first_source else "",
+                first_kb_order=first_kb,
+                first_any_kb_order=first_any_kb,
+                first_source_order=first_source,
+                first_source_kind=source.kind if source else None,
+                first_source_path=source.path if source else "",
             )
         )
     return results
@@ -213,7 +245,7 @@ def print_summary_block(label: str, results: list[SessionResult], indent: str = 
         and (result.first_kb_order is None or result.first_source_order < result.first_kb_order)
     )
     print(f"{indent}{label}")
-    print(f"{indent}Sessions analyzed: {total}")
+    print(f"{indent}Sessions analyzed (logical user sessions): {total}")
     print(f"{indent}KB entry hit rate: {format_rate(hit, total)}")
     print(f"{indent}Any KB hit rate: {format_rate(any_hit, total)}")
     print(f"{indent}Read compliance: {format_rate(compliant, total)}")
@@ -254,7 +286,12 @@ def print_breakdowns(results: list[SessionResult]) -> None:
 
 
 # Prints the compliance summary and optional per-session details.
+# The session-unit note leads because the counts below are per logical session, not per transcript
+# file, which is a different (much smaller) denominator than a file-per-session reading would give.
 def print_report(results: list[SessionResult], details: bool) -> None:
+    print("Session unit: one logical session - resumed/forked transcript files count once, and")
+    print("sub-agent rollouts are folded into the session that spawned them, never judged alone.")
+    print()
     print_summary_block("Compliance summary", results)
     print("Write-back compliance: deferred (needs heuristic or manual labels)")
     print_breakdowns(results)

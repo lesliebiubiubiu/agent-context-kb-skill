@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import importlib.util
+import os
 import re
 import subprocess
 import sys
@@ -20,13 +21,15 @@ from transcript_reads import claude_project_name  # noqa: E402
 
 
 # Runs the KB CLI against a temporary repository and captures output for assertions.
-def run_cli(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+# `cwd` matters for transcript attribution tests, where a bare path must not resolve against it.
+def run_cli(root: Path, *args: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(SCRIPT), *args, "--root", str(root)],
         check=False,
         encoding="utf-8",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        cwd=None if cwd is None else str(cwd),
     )
 
 
@@ -1147,6 +1150,902 @@ def test_stats_backfills_kb_reads() -> None:
         require(len(read_events) == 3, "event log should contain exactly three deduped kb_read events")
 
 
+# Appends a backfill-shaped kb_read event so stats fixtures can seed read history at a chosen KB path.
+def append_kb_read_event(root: Path, file: str, session: str) -> None:
+    log = root / ".agent-kb" / ".log" / "events.jsonl"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "ts": "2026-07-05T00:00:00Z",
+        "event": "kb_read",
+        "kind": "kb_read",
+        "source": "backfill",
+        "harness": "claude",
+        "session": session,
+        "file": file,
+        "chars": 1200,
+    }
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record) + "\n")
+
+
+# Collects the rows printed under one stats section, stopping at the next header or blank line.
+def stats_section_rows(stdout: str, header: str) -> list[str]:
+    rows: list[str] = []
+    header_indent = None
+    for line in stdout.splitlines():
+        if header_indent is None:
+            if line.strip().startswith(header):
+                header_indent = len(line) - len(line.lstrip())
+            continue
+        indent = len(line) - len(line.lstrip())
+        if not line.strip() or indent <= header_indent:
+            break
+        rows.append(line.strip())
+    return rows
+
+
+# Checks that reads logged before a git rename still count for the doc under its current path.
+def test_stats_follows_kb_renames() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp) / "repo"
+        root.mkdir(parents=True)
+        result = run_cli(root, "init", "--shared")
+        require(result.returncode == 0, "shared init should succeed", result)
+        create_fixture_commit(root, {"README.md": "fixture\n"})
+        run_fixture_git(root, "mv", ".agent-kb/architecture/overview.md", ".agent-kb/architecture/system-overview.md")
+        run_fixture_git(root, "commit", "-m", "rename overview")
+        append_kb_read_event(root, "architecture/overview.md", "session-old-path")
+
+        result = run_cli(root, "stats", "--no-backfill", "--dead-sessions", "1", "--top", "30")
+        require(result.returncode == 0, "stats should succeed after a KB rename", result)
+        dead = stats_section_rows(result.stdout, "Dead knowledge candidates")
+        require(
+            "- architecture/system-overview.md" not in dead,
+            "a doc read under its pre-rename path should not be reported dead",
+            result,
+        )
+        most_read = stats_section_rows(result.stdout, "Most-read KB files")
+        require(
+            any(row.startswith("architecture/system-overview.md ") for row in most_read),
+            "most-read chart should credit the current path",
+            result,
+        )
+        require(
+            not any(row.startswith("architecture/overview.md ") for row in most_read),
+            "most-read chart should not keep a separate row for the pre-rename path",
+            result,
+        )
+
+
+# Checks that stats degrades to path-exact read matching when no git history is available.
+def test_stats_dead_candidates_without_git() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp) / "repo"
+        root.mkdir(parents=True)
+        # Shared mode in a directory that is not a git repo: no nested KB repo, no parent history.
+        result = run_cli(root, "init", "--shared")
+        require(result.returncode == 0, "shared init should succeed", result)
+        kb = root / ".agent-kb"
+        (kb / "architecture" / "overview.md").rename(kb / "architecture" / "system-overview.md")
+        append_kb_read_event(root, "architecture/overview.md", "session-old-path")
+
+        result = run_cli(root, "stats", "--no-backfill", "--dead-sessions", "1", "--top", "30")
+        require(result.returncode == 0, "stats should succeed without git history", result)
+        require("Traceback" not in result.stderr, "stats should not crash without git history", result)
+        require(
+            "- architecture/system-overview.md" in stats_section_rows(result.stdout, "Dead knowledge candidates"),
+            "without rename history the moved doc keeps today's dead-candidate behaviour",
+            result,
+        )
+
+
+# Checks that a bare path is never resolved against the process cwd, only against a session workdir.
+def test_root_relative_rejects_bare_paths() -> None:
+    from transcript_reads import command_paths, root_relative
+
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp).resolve()
+        (root / ".agent-kb").mkdir()
+        # Stand inside root: that is the case where a bare path silently became a root path.
+        previous_cwd = Path.cwd()
+        os.chdir(root)
+        try:
+            require(
+                root_relative(".agent-kb/start.md", root) is None,
+                "a bare path must not resolve against the process cwd",
+            )
+        finally:
+            os.chdir(previous_cwd)
+        require(
+            root_relative(str(root / ".agent-kb" / "start.md"), root) == Path(".agent-kb/start.md"),
+            "an absolute path inside root must still resolve",
+        )
+        require(
+            command_paths("cat .agent-kb/start.md", root, None) == [],
+            "without a workdir a bare path must be dropped, not guessed",
+        )
+        require(
+            Path(".agent-kb/start.md") in command_paths("cat .agent-kb/start.md", root, root),
+            "with a workdir inside root a bare path must resolve",
+        )
+        require(
+            Path(".agent-kb/start.md") in command_paths("cat .agent-kb/start.md; echo done", root, root),
+            "shell punctuation glued to an operand must not create a phantom path",
+        )
+
+    from transcript_reads import codex_kb_read_path
+
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp).resolve()
+        (root / ".agent-kb").mkdir()
+        require(
+            codex_kb_read_path("cat .agent-kb/start.md; echo done", root, root) == Path(".agent-kb/start.md"),
+            "a trailing `;` must be trimmed rather than dropping a real KB read",
+        )
+        require(
+            codex_kb_read_path("cat .agent-kb/`, x", root, root) is None,
+            "a junk token after `.agent-kb/` must not be recorded as a KB doc read",
+        )
+
+
+# Checks that Codex `exec` JS wrapper payloads surface their reads in both parsers.
+def test_codex_record_tool_payload_survives_dict_type() -> None:
+    from transcript_reads import codex_record_tool_payload
+
+    # Transcripts embed tool JSON schemas, whose `type` is a dict. Testing an unhashable
+    # value against a set raises TypeError, which aborted extraction for the whole file.
+    schema_node = {"type": {"type": "string", "description": "a parameter"}}
+    require(
+        codex_record_tool_payload(schema_node) is None,
+        "a dict-valued `type` must return None, not raise",
+    )
+    require(
+        codex_record_tool_payload({"type": "response_item", "payload": {"type": {"nested": True}}}) is None,
+        "a dict-valued payload `type` must return None, not raise",
+    )
+    require(
+        codex_record_tool_payload({"type": "function_call", "payload": {"name": "exec"}}) == {"name": "exec"},
+        "a well-formed function_call record must still return its payload",
+    )
+
+
+def test_codex_exec_wrapper_reads() -> None:
+    from transcript_reads import parse_codex_tool_events, parse_codex_transcript
+
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        base = Path(tmp).resolve()
+        root = base / "repo"
+        (root / ".agent-kb" / "workflows").mkdir(parents=True)
+        workdir = str(root)
+        # Unquoted `cmd` key, and a read hidden behind `&&` in a compound command.
+        compound_input = (
+            'const r = await tools.exec_command({cmd:"pwd && sed -n \'1,240p\' .agent-kb/start.md",'
+            '"workdir":"' + workdir + '","yield_time_ms":10000}); text(r.output);\n'
+        )
+        # Quoted `cmd` key, the other spelling Codex records.
+        quoted_input = 'const r = await tools.exec_command({"cmd":"cat .agent-kb/routes.yaml","workdir":"' + workdir + '"});'
+        # Several commands in one payload, each carrying its own workdir.
+        promise_input = (
+            "const results = await Promise.all(["
+            'tools.exec_command({"cmd":"sed -n \'1,10p\' .agent-kb/workflows/local-dev.md","workdir":"' + workdir + '"}), '
+            'tools.exec_command({cmd:"cat .agent-kb/map.md","workdir":"' + workdir + '"})'
+            "]);"
+        )
+        patch_input = "*** Begin Patch\n*** Update File: .agent-kb/start.md\n@@\n-old\n+new\n*** End Patch\n"
+        transcript = base / "codex" / "sessions" / "rollout-exec-wrapper.jsonl"
+        write_jsonl(
+            transcript,
+            [
+                {"timestamp": "2026-07-05T00:00:00Z", "type": "session_meta", "payload": {"cwd": workdir}},
+                {
+                    "timestamp": "2026-07-05T00:00:01Z",
+                    "type": "response_item",
+                    "payload": {"type": "custom_tool_call", "name": "exec", "input": compound_input},
+                },
+                {
+                    "timestamp": "2026-07-05T00:00:02Z",
+                    "type": "response_item",
+                    "payload": {"type": "custom_tool_call", "name": "exec", "input": quoted_input},
+                },
+                {
+                    "timestamp": "2026-07-05T00:00:03Z",
+                    "type": "response_item",
+                    "payload": {"type": "custom_tool_call", "name": "exec", "input": promise_input},
+                },
+                {
+                    "timestamp": "2026-07-05T00:00:04Z",
+                    "type": "response_item",
+                    "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": patch_input},
+                },
+            ],
+        )
+
+        scan = parse_codex_transcript(transcript, root)
+        require(
+            sorted(read.file for read in scan.reads)
+            == ["map.md", "routes.yaml", "start.md", "workflows/local-dev.md"],
+            f"the exec JS wrapper should yield every read it ran, got {sorted(r.file for r in scan.reads)}",
+        )
+        require(
+            sum(1 for read in scan.reads if read.file == "start.md") == 1,
+            "an `apply_patch` body must not be counted as a KB read",
+        )
+
+        events = parse_codex_tool_events(transcript, root)
+        require(
+            [event.kind for event in events]
+            == ["kb_entry_read", "kb_entry_read", "kb_read", "kb_read", "source_edit"],
+            f"the analyzer should see the same wrapper commands, got {[e.kind for e in events]}",
+        )
+
+
+# Checks that a Claude Bash command reading a KB doc counts, while a bare mention does not.
+def test_claude_bash_kb_read() -> None:
+    from transcript_reads import parse_claude_tool_events, parse_claude_transcript
+
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        base = Path(tmp).resolve()
+        root = base / "repo"
+        (root / ".agent-kb" / "plans").mkdir(parents=True)
+        transcript = base / "claude" / "projects" / "session-bash-read.jsonl"
+        write_jsonl(
+            transcript,
+            [
+                {
+                    "timestamp": "2026-07-05T00:00:00Z",
+                    "cwd": str(root),
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "name": "Bash",
+                                "input": {"command": "sed -n '1,40p' .agent-kb/start.md"},
+                            }
+                        ]
+                    },
+                },
+                {
+                    # No cwd on this record: the session cwd seen earlier has to carry over.
+                    "timestamp": "2026-07-05T00:00:01Z",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "name": "Bash",
+                                "input": {"command": "git add .agent-kb/plans/current.md"},
+                            }
+                        ]
+                    },
+                },
+            ],
+        )
+
+        scan = parse_claude_transcript(transcript, root)
+        require(
+            [read.file for read in scan.reads] == ["start.md"],
+            f"a Claude Bash `sed` on a KB doc should count as a read, got {[r.file for r in scan.reads]}",
+        )
+        events = parse_claude_tool_events(transcript, root)
+        require(
+            [event.kind for event in events] == ["kb_entry_read"],
+            f"the analyzer should see the Bash KB read and skip `git add`, got {[e.kind for e in events]}",
+        )
+
+
+# Checks that a session working in another project never counts as a read of this repo's KB.
+def test_stats_ignores_other_project_transcripts() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        base = Path(tmp)
+        root = base / "repo"
+        other = base / "other-project"
+        root.mkdir()
+        other.mkdir()
+        init_root(root)
+        init_root(other)
+        (other / ".agent-kb" / "architecture").mkdir(parents=True, exist_ok=True)
+        (other / ".agent-kb" / "architecture" / "vlm-eval.md").write_text("foreign\n", encoding="utf-8")
+        codex_dir = base / "codex" / "sessions"
+        write_jsonl(
+            codex_dir / "rollout-other-project.jsonl",
+            [
+                {"timestamp": "2026-08-11T00:00:00Z", "type": "session_meta", "payload": {"cwd": str(other)}},
+                {
+                    "timestamp": "2026-08-11T00:00:01Z",
+                    "type": "function_call",
+                    "payload": {
+                        "name": "functions.exec_command",
+                        "arguments": json.dumps(
+                            {"cmd": "sed -n '1,40p' .agent-kb/architecture/vlm-eval.md", "workdir": str(other)}
+                        ),
+                    },
+                },
+            ],
+        )
+        write_jsonl(
+            codex_dir / "rollout-own.jsonl",
+            [
+                {"timestamp": "2026-08-11T01:00:00Z", "type": "session_meta", "payload": {"cwd": str(root)}},
+                {
+                    "timestamp": "2026-08-11T01:00:01Z",
+                    "type": "function_call",
+                    "payload": {
+                        "name": "functions.exec_command",
+                        "arguments": json.dumps({"cmd": "sed -n '1,40p' .agent-kb/start.md", "workdir": str(root)}),
+                    },
+                },
+            ],
+        )
+
+        # Run from inside the repo: that is what made a foreign bare path land under root.
+        result = run_cli(root, "stats", "--codex-dir", str(codex_dir), "--no-backfill-claude", cwd=root)
+        require(result.returncode == 0, "stats should succeed with a foreign transcript present", result)
+        require("vlm-eval" not in result.stdout, "another project's KB read must not be counted", result)
+        require("Backfilled KB reads: 1 new event(s)." in result.stdout, "only the own-repo read should count", result)
+        require("scanned sessions: 1" in result.stdout, "the foreign session must not inflate the denominator", result)
+        log = (root / ".agent-kb" / ".log" / "events.jsonl").read_text(encoding="utf-8")
+        require("vlm-eval" not in log, "the foreign read must not reach events.jsonl either")
+
+
+# Checks that --rebuild-reads drops derived kb_read events while keeping CLI history.
+def test_stats_rebuild_reads_drops_polluted_events() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        base = Path(tmp)
+        root = base / "repo"
+        root.mkdir()
+        init_root(root)
+        log_path = root / ".agent-kb" / ".log" / "events.jsonl"
+        polluted = [
+            {"ts": "2026-08-01T00:00:00Z", "event": "kb_read", "session": "codex:foreign", "file": "architecture/vlm-eval.md", "chars": 0},
+            {"ts": "2026-08-01T00:00:01Z", "event": "cli", "command": "validate", "exit": 0},
+        ]
+        with log_path.open("a", encoding="utf-8") as handle:
+            for event in polluted:
+                handle.write(json.dumps(event) + "\n")
+
+        result = run_cli(root, "stats", "--rebuild-reads", "--no-backfill-claude", "--no-backfill-codex")
+        require(result.returncode == 0, "stats --rebuild-reads should succeed", result)
+        require("dropped 1 transcript-derived event(s)." in result.stdout, "the polluted read should be dropped", result)
+        text = log_path.read_text(encoding="utf-8")
+        require("vlm-eval" not in text, "the polluted kb_read must be gone from the log")
+        require('"command": "validate"' in text, "CLI history must be preserved by a rebuild")
+
+        result = run_cli(root, "stats", "--rebuild-reads", "--no-backfill")
+        require(result.returncode == 1, "--rebuild-reads with --no-backfill should be refused", result)
+
+
+# Builds one Codex rollout: a session_meta plus an optional KB read, as this repo's real rollouts look.
+def write_codex_rollout(path: Path, root: Path, meta: dict, read_file: str | None = None) -> None:
+    records = [{"timestamp": "2026-08-11T00:00:00Z", "type": "session_meta", "payload": {"cwd": str(root), **meta}}]
+    if read_file:
+        records.append(
+            {
+                "timestamp": "2026-08-11T00:00:01Z",
+                "type": "function_call",
+                "payload": {
+                    "name": "functions.exec_command",
+                    "arguments": json.dumps({"cmd": f"sed -n '1,40p' .agent-kb/{read_file}", "workdir": str(root)}),
+                },
+            }
+        )
+    write_jsonl(path, records)
+
+
+# Checks that a Codex sub-agent rollout is credited to the session that spawned it, not counted alone.
+def test_codex_subagent_rollout_merges_into_parent() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        base = Path(tmp)
+        root = base / "repo"
+        root.mkdir()
+        init_root(root)
+        codex_dir = base / "codex" / "sessions"
+        write_codex_rollout(
+            codex_dir / "rollout-parent.jsonl",
+            root,
+            {"id": "sid-parent", "session_id": "sid-parent", "thread_source": "user"},
+        )
+        write_codex_rollout(
+            codex_dir / "rollout-subagent.jsonl",
+            root,
+            {
+                "id": "sid-child",
+                "session_id": "sid-parent",
+                "thread_source": "subagent",
+                "parent_thread_id": "sid-parent",
+            },
+            read_file="start.md",
+        )
+
+        result = run_cli(root, "stats", "--codex-dir", str(codex_dir), "--no-backfill-claude")
+        require(result.returncode == 0, "stats should succeed with a sub-agent rollout present", result)
+        require("scanned sessions: 1" in result.stdout, "a sub-agent rollout must not be its own session", result)
+        require("KB hit rate: 1/1 (100.0%)" in result.stdout, "the sub-agent read should credit its parent session", result)
+
+
+# Checks that the several rollout files of one resumed Codex session collapse into one session.
+def test_codex_resume_pair_collapses_to_one_session() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        base = Path(tmp)
+        root = base / "repo"
+        root.mkdir()
+        init_root(root)
+        codex_dir = base / "codex" / "sessions"
+        write_codex_rollout(
+            codex_dir / "rollout-first.jsonl",
+            root,
+            {"id": "sid-first", "session_id": "sid-first", "thread_source": "user"},
+            read_file="start.md",
+        )
+        # A resumed rollout replays the earlier thread and ends on the session it continued into.
+        write_jsonl(
+            codex_dir / "rollout-resumed.jsonl",
+            [
+                {
+                    "timestamp": "2026-08-11T01:00:00Z",
+                    "type": "session_meta",
+                    "payload": {"cwd": str(root), "id": "sid-first", "session_id": "sid-first", "thread_source": "user"},
+                },
+                {
+                    "timestamp": "2026-08-11T01:00:01Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "cwd": str(root),
+                        "id": "sid-resumed",
+                        "session_id": "sid-first",
+                        "thread_source": "user",
+                        "forked_from_id": "sid-first",
+                    },
+                },
+            ],
+        )
+
+        result = run_cli(root, "stats", "--codex-dir", str(codex_dir), "--no-backfill-claude")
+        require(result.returncode == 0, "stats should succeed with a resumed rollout present", result)
+        require("scanned sessions: 1" in result.stdout, "a resumed rollout must not add a second session", result)
+        require("KB hit rate: 1/1 (100.0%)" in result.stdout, "the resumed session keeps its earlier read", result)
+
+
+# Checks that a sub-agent session with no user thread of its own leaves numerator and denominator.
+def test_codex_subagent_only_session_is_excluded() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        base = Path(tmp)
+        root = base / "repo"
+        root.mkdir()
+        init_root(root)
+        codex_dir = base / "codex" / "sessions"
+        write_codex_rollout(
+            codex_dir / "rollout-user.jsonl",
+            root,
+            {"id": "sid-user", "session_id": "sid-user", "thread_source": "user"},
+        )
+        write_codex_rollout(
+            codex_dir / "rollout-orphan-subagent.jsonl",
+            root,
+            {"id": "sid-orphan", "session_id": "sid-missing-parent", "thread_source": "subagent"},
+            read_file="start.md",
+        )
+
+        result = run_cli(root, "stats", "--codex-dir", str(codex_dir), "--no-backfill-claude")
+        require(result.returncode == 0, "stats should succeed with an orphan sub-agent rollout", result)
+        require("scanned sessions: 1" in result.stdout, "a sub-agent-only session must not be counted", result)
+        require("KB hit rate: 0/1 (0.0%)" in result.stdout, "its read must not count either", result)
+        require("Backfilled KB reads: 0 new event(s)." in result.stdout, "no orphan read should reach the log", result)
+
+
+# Checks that a Claude sidechain transcript is folded into the session that spawned it.
+def test_claude_sidechain_credits_parent_session() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        base = Path(tmp)
+        root = base / "repo"
+        root.mkdir()
+        init_root(root)
+        claude_dir = base / "claude" / "projects" / fixture_claude_project_name(root)
+        write_jsonl(
+            claude_dir / "main-thread.jsonl",
+            [{"timestamp": "2026-08-11T00:00:00Z", "cwd": str(root), "sessionId": "claude-sid"}],
+        )
+        write_jsonl(
+            claude_dir / "sidechain.jsonl",
+            [
+                {
+                    "timestamp": "2026-08-11T00:00:01Z",
+                    "cwd": str(root),
+                    "sessionId": "claude-sid",
+                    "isSidechain": True,
+                    "agentId": "agent-1",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "name": "Read",
+                                "input": {"file_path": str(root / ".agent-kb" / "start.md")},
+                            }
+                        ]
+                    },
+                }
+            ],
+        )
+
+        result = run_cli(root, "stats", "--claude-dir", str(base / "claude" / "projects"), "--no-backfill-codex")
+        require(result.returncode == 0, "stats should succeed with a sidechain transcript present", result)
+        require("scanned sessions: 1" in result.stdout, "a sidechain file must not be its own session", result)
+        require("KB hit rate: 1/1 (100.0%)" in result.stdout, "the sidechain read should credit its parent session", result)
+
+
+# Checks that a cache written by an older scanner makes stats rebuild kb_read events by itself.
+def test_stats_rebuilds_reads_on_cache_version_change() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        base = Path(tmp)
+        root = base / "repo"
+        root.mkdir()
+        init_root(root)
+        codex_dir = base / "codex" / "sessions"
+        write_codex_rollout(
+            codex_dir / "rollout-read.jsonl",
+            root,
+            {"id": "sid-user", "session_id": "sid-user", "thread_source": "user"},
+            read_file="start.md",
+        )
+
+        result = run_cli(root, "stats", "--codex-dir", str(codex_dir), "--no-backfill-claude")
+        require("Backfilled KB reads: 1 new event(s)." in result.stdout, "first run should log the read", result)
+
+        # Simulate a log left behind by an older scanner: file-shaped session ids plus its cache.
+        log_path = root / ".agent-kb" / ".log" / "events.jsonl"
+        cache_path = root / ".agent-kb" / ".log" / "transcript-backfill-cache.json"
+        log_path.write_text(
+            json.dumps({"ts": "2026-08-01T00:00:00Z", "event": "cli", "command": "validate", "exit": 0})
+            + "\n"
+            + json.dumps(
+                {
+                    "ts": "2026-08-01T00:00:01Z",
+                    "event": "kb_read",
+                    "source": "backfill",
+                    "session": "codex:rollout-read",
+                    "file": "start.md",
+                    "chars": 10,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        cache_path.write_text(json.dumps({"version": 1, "files": {}}) + "\n", encoding="utf-8")
+
+        result = run_cli(root, "stats", "--codex-dir", str(codex_dir), "--no-backfill-claude")
+        require(result.returncode == 0, "stats should succeed after a cache version change", result)
+        require("dropped 1 stale transcript-derived event(s)" in result.stdout, "the stale read should be dropped", result)
+        require("Backfilled KB reads: 1 new event(s)." in result.stdout, "the read should be rebuilt", result)
+        require("KB hit rate: 1/1 (100.0%)" in result.stdout, "the rebuilt read must join the new session id", result)
+        text = log_path.read_text(encoding="utf-8")
+        require("codex:rollout-read" not in text, "the stale file-shaped session id must be gone")
+        require('"command": "validate"' in text, "CLI history must survive an automatic rebuild")
+
+
+# Checks that a `~N` token stays resolvable instead of raising when no such user exists.
+def test_resolve_path_tolerates_junk_home_token() -> None:
+    from transcript_reads import resolve_path
+
+    for token in ("~3", "~nosuchuser-agent-kb"):
+        try:
+            resolved = resolve_path(token)
+        except Exception as err:  # noqa: BLE001 - the bug under test was an unexpected raise
+            require(False, f"resolve_path({token!r}) should not raise, got {type(err).__name__}: {err}")
+        require(
+            resolved == Path(token).resolve(),
+            f"resolve_path({token!r}) should fall back to plain resolve without expansion",
+        )
+
+
+# Checks that a transcript containing a `~3`-style token still backfills reads from every transcript.
+def test_stats_backfill_survives_junk_home_token() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        base = Path(tmp)
+        root = base / "repo"
+        root.mkdir()
+        init_root(root)
+        codex_dir = base / "codex" / "sessions"
+        write_jsonl(
+            codex_dir / "rollout-tilde-token.jsonl",
+            [
+                {"timestamp": "2026-07-05T00:00:00Z", "type": "session_meta", "payload": {"cwd": str(root)}},
+                {
+                    "timestamp": "2026-07-05T00:00:01Z",
+                    "type": "function_call",
+                    "payload": {
+                        "name": "functions.exec_command",
+                        "arguments": json.dumps({"cmd": "cat ~3", "workdir": str(root)}),
+                    },
+                },
+            ],
+        )
+        write_jsonl(
+            codex_dir / "rollout-real-read.jsonl",
+            [
+                {"timestamp": "2026-07-05T00:00:00Z", "type": "session_meta", "payload": {"cwd": str(root)}},
+                {
+                    "timestamp": "2026-07-05T00:00:01Z",
+                    "type": "function_call",
+                    "payload": {
+                        "name": "functions.exec_command",
+                        "arguments": json.dumps({"cmd": "sed -n '1,40p' .agent-kb/start.md", "workdir": str(root)}),
+                    },
+                },
+            ],
+        )
+
+        result = run_cli(root, "stats", "--codex-dir", str(codex_dir), "--dead-sessions", "1")
+        require(result.returncode == 0, "stats should succeed despite a junk `~3` token", result)
+        require("backfill failed" not in result.stdout, "a junk `~3` token should not fail the whole backfill", result)
+        require("Backfilled KB reads: 1 new event(s)." in result.stdout, "the sibling transcript read should count", result)
+
+
+# Checks that one unparseable transcript is skipped without discarding other transcripts' KB reads.
+def test_backfill_skips_unparseable_transcript() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        base = Path(tmp)
+        root = base / "repo"
+        root.mkdir()
+        init_root(root)
+        codex_dir = base / "codex" / "sessions"
+        for name in ("rollout-bad.jsonl", "rollout-good.jsonl"):
+            write_jsonl(
+                codex_dir / name,
+                [
+                    {"timestamp": "2026-07-05T00:00:00Z", "type": "session_meta", "payload": {"cwd": str(root)}},
+                    {
+                        "timestamp": "2026-07-05T00:00:01Z",
+                        "type": "function_call",
+                        "payload": {
+                            "name": "functions.exec_command",
+                            "arguments": json.dumps(
+                                {"cmd": "sed -n '1,40p' .agent-kb/start.md", "workdir": str(root)}
+                            ),
+                        },
+                    },
+                ],
+            )
+
+        import agent_kb
+
+        original_parse = agent_kb.parse_codex_transcript
+
+        # Raises only for the poisoned transcript so the scan has to isolate that one file.
+        def flaky_parse(path: Path, scan_root: Path):
+            if path.name == "rollout-bad.jsonl":
+                raise RuntimeError("Could not determine home directory.")
+            return original_parse(path, scan_root)
+
+        agent_kb.parse_codex_transcript = flaky_parse
+        try:
+            # The CLI resolves --root before scanning, so mirror that here for symlinked temp paths.
+            scan_root = root.resolve()
+            scan = agent_kb.scan_transcripts_incremental(scan_root, scan_root / ".agent-kb", None, codex_dir)
+        finally:
+            agent_kb.parse_codex_transcript = original_parse
+
+        require(
+            [event.file for event in scan.reads] == ["start.md"],
+            f"the good transcript's read should survive a failing sibling, got {[e.file for e in scan.reads]}",
+        )
+
+
+# Checks that one unparseable transcript is skipped without discarding other transcripts' compliance events.
+def test_compliance_skips_unparseable_transcript() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        base = Path(tmp)
+        root = base / "repo"
+        root.mkdir()
+        init_root(root)
+        codex_dir = base / "codex" / "sessions"
+        for name in ("rollout-bad.jsonl", "rollout-good.jsonl"):
+            write_jsonl(
+                codex_dir / name,
+                [
+                    {"timestamp": "2026-07-05T00:00:00Z", "type": "session_meta", "payload": {"cwd": str(root)}},
+                    {
+                        "timestamp": "2026-07-05T00:00:01Z",
+                        "type": "function_call",
+                        "payload": {
+                            "name": "functions.exec_command",
+                            "arguments": json.dumps(
+                                {"cmd": "sed -n '1,40p' .agent-kb/start.md", "workdir": str(root)}
+                            ),
+                        },
+                    },
+                ],
+            )
+
+        import transcript_reads
+
+        original_parse = transcript_reads.parse_codex_tool_events
+
+        # Raises only for the poisoned transcript so the collection has to isolate that one file.
+        def flaky_parse(path: Path, scan_root: Path):
+            if path.name == "rollout-bad.jsonl":
+                raise RuntimeError("Could not determine home directory.")
+            return original_parse(path, scan_root)
+
+        transcript_reads.parse_codex_tool_events = flaky_parse
+        try:
+            # The analyzer resolves --root before scanning, so mirror that here for symlinked temp paths.
+            scan_root = root.resolve()
+            events = transcript_reads.collect_tool_events(scan_root, None, codex_dir)
+        finally:
+            transcript_reads.parse_codex_tool_events = original_parse
+
+        require(
+            [event.kind for event in events] == ["kb_entry_read"],
+            f"the good transcript's event should survive a failing sibling, got {[e.kind for e in events]}",
+        )
+
+
+# Checks that a `~3` token in a non-read command cannot crash the compliance analyzer.
+def test_compliance_survives_junk_home_token() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        base = Path(tmp)
+        root = base / "repo"
+        root.mkdir()
+        init_root(root)
+        claude_dir = base / "claude" / "projects"
+        claude_dir.mkdir(parents=True)
+        codex_dir = base / "codex" / "sessions"
+        write_jsonl(
+            codex_dir / "rollout-tilde-token.jsonl",
+            [
+                {"timestamp": "2026-07-05T00:00:00Z", "type": "session_meta", "payload": {"cwd": str(root)}},
+                {
+                    "timestamp": "2026-07-05T00:00:01Z",
+                    "type": "function_call",
+                    "payload": {
+                        "name": "functions.exec_command",
+                        # `rg` is not a KB_READ_COMMAND, so classify_codex_command scrapes every word.
+                        "arguments": json.dumps({"cmd": "rg -n '~3' src", "workdir": str(root)}),
+                    },
+                },
+            ],
+        )
+
+        result = run_compliance(root, claude_dir, codex_dir)
+        require(result.returncode == 0, "compliance analyzer should survive a junk `~3` token", result)
+        require(
+            "Could not determine home directory" not in result.stderr,
+            "a junk `~3` token should not reach the analyzer as an error",
+            result,
+        )
+
+
+# Builds a Codex `session_meta` record carrying the logical session id and thread source.
+def codex_session_meta(timestamp: str, workdir: Path, session_id: str, thread_source: str) -> dict:
+    return {
+        "timestamp": timestamp,
+        "type": "session_meta",
+        "payload": {"cwd": str(workdir), "session_id": session_id, "thread_source": thread_source},
+    }
+
+
+# Builds one Codex `exec` tool-call record for compliance fixtures.
+def codex_exec_record(timestamp: str, command: str, workdir: Path) -> dict:
+    return {
+        "timestamp": timestamp,
+        "type": "function_call",
+        "payload": {
+            "name": "functions.exec_command",
+            "arguments": json.dumps({"cmd": command, "workdir": str(workdir)}),
+        },
+    }
+
+
+# Checks that a sub-agent rollout is folded into the session that spawned it, never judged alone.
+def test_compliance_merges_sub_agent_rollouts() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        base = Path(tmp)
+        root = base / "repo"
+        root.mkdir()
+        init_root(root)
+        (root / "src.py").write_text("print('hi')\n", encoding="utf-8")
+        claude_dir = base / "claude" / "projects"
+        claude_dir.mkdir(parents=True)
+        codex_dir = base / "codex" / "sessions"
+        write_jsonl(
+            codex_dir / "rollout-parent.jsonl",
+            [
+                codex_session_meta("2026-08-12T00:00:00Z", root, "s-parent", "user"),
+                codex_exec_record("2026-08-12T00:00:01Z", "git status", root),
+                codex_exec_record("2026-08-12T00:00:02Z", "date", root),
+                codex_exec_record("2026-08-12T00:00:03Z", "sed -n '1,40p' .agent-kb/start.md", root),
+                codex_exec_record("2026-08-12T00:00:04Z", "rg print src.py", root),
+            ],
+        )
+        # The guardian explores at record 1, before the parent's KB read at record 3: merging on the
+        # per-file record index would rank it first and invent a late-KB-read verdict for the parent.
+        write_jsonl(
+            codex_dir / "rollout-guardian.jsonl",
+            [
+                codex_session_meta("2026-08-12T00:00:05Z", root, "s-parent", "guardian"),
+                codex_exec_record("2026-08-12T00:00:06Z", "rg print src.py", root),
+            ],
+        )
+        write_jsonl(
+            codex_dir / "rollout-guardian-orphan.jsonl",
+            [
+                codex_session_meta("2026-08-12T00:10:00Z", root, "s-orphan", "guardian"),
+                codex_exec_record("2026-08-12T00:10:01Z", "rg print src.py", root),
+            ],
+        )
+
+        result = run_compliance(root, claude_dir, codex_dir, "--details")
+        require(result.returncode == 0, "compliance analyzer should succeed on sub-agent rollouts", result)
+        require(
+            "Sessions analyzed (logical user sessions): 1" in result.stdout,
+            "a sub-agent rollout should not add a session of its own",
+            result,
+        )
+        require(
+            "- codex:s-parent [codex] compliant category=compliant" in result.stdout,
+            "sub-agent exploration must not turn the parent session into a late KB read",
+            result,
+        )
+        require(
+            "codex:s-orphan" not in result.stdout,
+            "a sub-agent-only session should leave the report entirely",
+            result,
+        )
+        require(
+            "rollout-guardian" not in result.stdout,
+            "no session should still be named after a transcript file",
+            result,
+        )
+
+
+# Checks that a resumed session is one session, ordered as whole files rather than interleaved.
+def test_compliance_merges_resumed_rollouts() -> None:
+    from transcript_reads import transcript_file_key
+
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        base = Path(tmp)
+        root = base / "repo"
+        root.mkdir()
+        init_root(root)
+        (root / "src.py").write_text("print('hi')\n", encoding="utf-8")
+        claude_dir = base / "claude" / "projects"
+        claude_dir.mkdir(parents=True)
+        codex_dir = base / "codex" / "sessions"
+        write_jsonl(
+            codex_dir / "rollout-first.jsonl",
+            [
+                codex_session_meta("2026-08-12T01:00:00Z", root, "s-resumed", "user"),
+                codex_exec_record("2026-08-12T01:00:01Z", "git status", root),
+                codex_exec_record("2026-08-12T01:00:02Z", "date", root),
+                codex_exec_record("2026-08-12T01:00:03Z", "sed -n '1,40p' .agent-kb/start.md", root),
+            ],
+        )
+        # The resumed file explores at its record 1, so interleaving by record index would place it
+        # before the KB read the first file recorded at index 3.
+        write_jsonl(
+            codex_dir / "rollout-resumed.jsonl",
+            [
+                codex_session_meta("2026-08-12T02:00:00Z", root, "s-resumed", "user"),
+                codex_exec_record("2026-08-12T02:00:01Z", "rg print src.py", root),
+            ],
+        )
+
+        result = run_compliance(root, claude_dir, codex_dir, "--details")
+        require(result.returncode == 0, "compliance analyzer should succeed on a resumed session", result)
+        require(
+            "Sessions analyzed (logical user sessions): 1" in result.stdout,
+            "a resumed session should be counted once, not once per transcript file",
+            result,
+        )
+        require(
+            "- codex:s-resumed [codex] compliant category=compliant first_kb=3 first_any_kb=3 first_source=5" in result.stdout,
+            "the resumed file's records should continue after the first file's four records",
+            result,
+        )
+        require(
+            transcript_file_key(Path("a.jsonl"), "") > transcript_file_key(Path("z.jsonl"), "2026-08-12T00:00:00Z"),
+            "a file with no timestamp must sort last so it cannot jump ahead of another file's KB read",
+        )
+
+
 # Checks that the private compliance analyzer parses synthetic Claude and Codex transcripts.
 def test_compliance_analyzer_synthetic_transcripts() -> None:
     with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
@@ -1453,7 +2352,7 @@ def test_compliance_analyzer_synthetic_transcripts() -> None:
 
         result = run_compliance(root, claude_dir, codex_dir, "--details")
         require(result.returncode == 0, "compliance analyzer should succeed", result)
-        require("Sessions analyzed: 11" in result.stdout, "analyzer should count all synthetic sessions", result)
+        require("Sessions analyzed (logical user sessions): 11" in result.stdout, "analyzer should count all synthetic sessions", result)
         require("KB entry hit rate: 7/11 (63.6%)" in result.stdout, "analyzer should report entry reads", result)
         require("Any KB hit rate: 8/11 (72.7%)" in result.stdout, "analyzer should report all KB reads", result)
         require("Read compliance: 5/11 (45.5%)" in result.stdout, "analyzer should report raw compliant sessions", result)
@@ -1474,10 +2373,10 @@ def test_compliance_analyzer_synthetic_transcripts() -> None:
             result,
         )
         require("Breakdown by harness:" in result.stdout, "analyzer should print harness breakdown", result)
-        require("  claude\n  Sessions analyzed: 3" in result.stdout, "analyzer should report Claude sessions separately", result)
+        require("  claude\n  Sessions analyzed (logical user sessions): 3" in result.stdout, "analyzer should report Claude sessions separately", result)
         require("Claude AGENTS.md delivery:" in result.stdout, "analyzer should print AGENTS.md delivery split", result)
-        require("  read AGENTS.md\n  Sessions analyzed: 2" in result.stdout, "delivery split should count AGENTS.md readers", result)
-        require("  did not read AGENTS.md\n  Sessions analyzed: 1" in result.stdout, "delivery split should count Claude sessions without AGENTS.md", result)
+        require("  read AGENTS.md\n  Sessions analyzed (logical user sessions): 2" in result.stdout, "delivery split should count AGENTS.md readers", result)
+        require("  did not read AGENTS.md\n  Sessions analyzed (logical user sessions): 1" in result.stdout, "delivery split should count Claude sessions without AGENTS.md", result)
         require("category=late_kb_read late_bucket=20+ actions late" in result.stdout, "details should include late bucket")
         require("read_agents_md=True" in result.stdout, "details should expose AGENTS.md read status")
         require(
@@ -1525,7 +2424,7 @@ def test_compliance_analyzer_synthetic_transcripts() -> None:
             "since filter should count sessions without real timestamps",
             result,
         )
-        require("Sessions analyzed: 1" in result.stdout, "since filter should keep only post-cutoff sessions", result)
+        require("Sessions analyzed (logical user sessions): 1" in result.stdout, "since filter should keep only post-cutoff sessions", result)
 
 
 # Checks that the Release 2 eval runner can parse a bundle and write summary JSON without invoking an agent.
@@ -2251,6 +3150,26 @@ def main() -> int:
         test_note_body_redacted_in_log,
         test_stats_reports_cli_usage,
         test_stats_backfills_kb_reads,
+        test_stats_follows_kb_renames,
+        test_stats_dead_candidates_without_git,
+        test_root_relative_rejects_bare_paths,
+        test_codex_record_tool_payload_survives_dict_type,
+        test_codex_exec_wrapper_reads,
+        test_claude_bash_kb_read,
+        test_stats_ignores_other_project_transcripts,
+        test_stats_rebuild_reads_drops_polluted_events,
+        test_codex_subagent_rollout_merges_into_parent,
+        test_codex_resume_pair_collapses_to_one_session,
+        test_codex_subagent_only_session_is_excluded,
+        test_claude_sidechain_credits_parent_session,
+        test_stats_rebuilds_reads_on_cache_version_change,
+        test_resolve_path_tolerates_junk_home_token,
+        test_stats_backfill_survives_junk_home_token,
+        test_backfill_skips_unparseable_transcript,
+        test_compliance_skips_unparseable_transcript,
+        test_compliance_survives_junk_home_token,
+        test_compliance_merges_sub_agent_rollouts,
+        test_compliance_merges_resumed_rollouts,
         test_compliance_analyzer_synthetic_transcripts,
         test_eval_runner_dry_run,
         test_eval_runner_shared_kb_dry_run,
