@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import re
@@ -23,6 +23,16 @@ SHELL_TOKEN_TRIM = "'\"`;&|<>()"
 # so this rejects junk tokens that happen to sit after a `.agent-kb/` prefix.
 KB_DOC_SUFFIXES = {".md", ".yaml", ".yml", ".json", ".txt"}
 SHELL_EDIT_COMMANDS = {"apply_patch", "perl", "ruby"}
+# Shell operators that chain several commands into one recorded string.
+SHELL_SEGMENT_RE = re.compile(r"&&|\|\||;|\n")
+# Codex records `exec` calls as JavaScript source, e.g.
+# `tools.exec_command({cmd:"sed -n '1,40p' .agent-kb/start.md","workdir":"/repo"})`.
+# The keys appear both bare and quoted, so match either form.
+JS_CMD_RE = re.compile(r'"?\bcmd"?\s*:\s*("(?:[^"\\]|\\.)*")')
+JS_WORKDIR_RE = re.compile(r'"?\bworkdir"?\s*:\s*("(?:[^"\\]|\\.)*")')
+JS_EXEC_MARKER = "exec_command"
+# Codex sends edits as a patch body, never as a read, whatever text the patch happens to quote.
+PATCH_PREFIX = "*** Begin Patch"
 
 
 @dataclass(frozen=True)
@@ -36,8 +46,12 @@ class KbReadEvent:
 
 @dataclass(frozen=True)
 class TranscriptScan:
+    # Logical sessions (one per session id), not transcript files: a resumed session and its
+    # sub-agents share one id. `user_sessions` holds those seen through a user thread, which is
+    # what makes a session a "session a human started in this repo".
     sessions: set[str]
     reads: list[KbReadEvent]
+    user_sessions: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -190,6 +204,25 @@ def read_kind_for_relative(relative: Path) -> str:
     return "source_explore"
 
 
+# Builds one transcript file's scan result, stamping its collected reads with the logical session id.
+# A file that never touched root owns nothing; a sub-agent file still reports its parent's session,
+# but only a user thread puts that session into `user_sessions` (the denominator).
+def file_scan(session: str, harness: str, owned: bool, user_thread: bool, found: list[tuple[str, str, int]]) -> TranscriptScan:
+    if not owned:
+        return TranscriptScan(set(), [], set())
+    reads = [KbReadEvent(session, harness, timestamp, file, chars) for timestamp, file, chars in found]
+    return TranscriptScan({session}, reads, {session} if user_thread else set())
+
+
+# Keeps only sessions a human started: a logical session counts when at least one of its transcript
+# files is a user thread, so sub-agent reads stay (they carry the parent id) but sub-agent-only
+# sessions leave both the numerator and the denominator.
+def user_thread_scan(scan: TranscriptScan) -> TranscriptScan:
+    sessions = scan.sessions & scan.user_sessions
+    reads = [read for read in scan.reads if read.session in sessions]
+    return TranscriptScan(sessions, reads, sessions)
+
+
 # Walks nested Claude message content and yields tool_use dictionaries.
 def claude_tool_uses(record: dict) -> list[dict]:
     message = record.get("message") if isinstance(record.get("message"), dict) else record
@@ -202,27 +235,50 @@ def claude_tool_uses(record: dict) -> list[dict]:
 
 
 # Extracts KB read events and root-owned session membership from one Claude Code transcript.
+# Reads are held as plain tuples until the file is read out, so they can be stamped with the
+# logical session id (`sessionId`, which sidechain files share with their parent) rather than
+# with the file name, which would split one session into several.
 def parse_claude_transcript(path: Path, root: Path) -> TranscriptScan:
+    # No `sessionId` anywhere means a single-file session, and a record without `isSidechain`
+    # is a main thread: both fall back to "one user session named after the file".
     session = f"claude:{path.stem}"
-    sessions: set[str] = set()
-    reads: list[KbReadEvent] = []
+    user_thread = False
+    owned = False
+    found: list[tuple[str, str, int]] = []
+    current_cwd: Path | None = None
     for index, record in enumerate(iter_jsonl(path)):
+        session_id = str(record.get("sessionId") or "")
+        if session_id:
+            session = f"claude:{session_id}"
+        if not record.get("isSidechain"):
+            user_thread = True
         cwd = record_cwd(record)
+        # Keep the last cwd seen, including another project's, so bare Bash paths resolve there.
+        if cwd is not None:
+            current_cwd = cwd
         if path_is_inside_root(cwd, root):
-            sessions.add(session)
+            owned = True
         timestamp = str(record.get("timestamp") or f"{path.name}:{index}")
         for tool_use in claude_tool_uses(record):
-            if tool_use.get("name") != "Read":
-                continue
+            name = str(tool_use.get("name", ""))
             tool_input = tool_use.get("input") if isinstance(tool_use.get("input"), dict) else {}
-            relative = root_relative(str(tool_input.get("file_path") or ""), root)
-            if relative is None:
-                continue
-            sessions.add(session)
-            kb_path = kb_relative(relative)
-            if kb_path is not None:
-                reads.append(KbReadEvent(session, "claude", timestamp, kb_path, file_chars(root, relative)))
-    return TranscriptScan(sessions, reads)
+            if name == "Read":
+                relative = root_relative(str(tool_input.get("file_path") or ""), root)
+                if relative is None:
+                    continue
+                owned = True
+                kb_path = kb_relative(relative)
+                if kb_path is not None:
+                    found.append((timestamp, kb_path, file_chars(root, relative)))
+            elif name == "Bash":
+                # A `cat`/`sed`/... on a KB doc is a read too, under the same rules as Codex shell calls.
+                for relative in shell_kb_read_paths(str(tool_input.get("command") or ""), root, current_cwd):
+                    kb_path = kb_relative(relative)
+                    if kb_path is None:
+                        continue
+                    owned = True
+                    found.append((timestamp, kb_path, file_chars(root, relative)))
+    return file_scan(session, "claude", owned, user_thread, found)
 
 
 # Extracts normalized compliance events from one Claude Code transcript.
@@ -230,8 +286,12 @@ def parse_claude_tool_events(path: Path, root: Path) -> list[ToolEvent]:
     events: list[ToolEvent] = []
     belongs_to_root = False
     session = f"claude:{path.stem}"
+    current_cwd: Path | None = None
     for index, record in enumerate(iter_jsonl(path)):
-        if path_is_inside_root(record_cwd(record), root):
+        cwd = record_cwd(record)
+        if cwd is not None:
+            current_cwd = cwd
+        if path_is_inside_root(cwd, root):
             belongs_to_root = True
         timestamp = str(record.get("timestamp", ""))
         for tool_use in claude_tool_uses(record):
@@ -243,6 +303,12 @@ def parse_claude_tool_events(path: Path, root: Path) -> list[ToolEvent]:
                 belongs_to_root = True
             if name == "Read" and relative is not None:
                 events.append(ToolEvent(session, "claude", timestamp, index, read_kind_for_relative(relative), str(relative)))
+            elif name == "Bash":
+                # Classify Bash with the shared shell rules so a KB read done in the shell still counts.
+                kind, event_path = classify_codex_command(str(tool_input.get("command") or ""), root, current_cwd)
+                if kind and (path_is_inside_root(current_cwd, root) or event_path):
+                    events.append(ToolEvent(session, "claude", timestamp, index, kind, event_path))
+                    belongs_to_root = True
             elif name in SOURCE_SEARCH_TOOLS:
                 if relative is not None and kb_relative(relative) is not None:
                     continue
@@ -253,10 +319,15 @@ def parse_claude_tool_events(path: Path, root: Path) -> list[ToolEvent]:
     return events if belongs_to_root else []
 
 
+# Returns the raw argument payload of a Codex tool call before any decoding.
+def codex_raw_args(payload: dict):
+    return payload.get("arguments") or payload.get("input") or payload.get("parameters") or {}
+
+
 # Parses a Codex function-call payload into a tool name and argument dictionary.
 def codex_tool_call(payload: dict) -> tuple[str, dict]:
     name = str(payload.get("name") or payload.get("tool_name") or "")
-    raw_args = payload.get("arguments") or payload.get("input") or payload.get("parameters") or {}
+    raw_args = codex_raw_args(payload)
     if isinstance(raw_args, str):
         try:
             parsed = json.loads(raw_args)
@@ -282,6 +353,46 @@ def codex_command_arg(args: dict) -> str:
     if len(words) >= 3 and Path(words[0]).name in {"bash", "sh", "zsh"} and words[1] in {"-c", "-lc"}:
         return words[2]
     return command
+
+
+# Decodes one JSON string literal lifted out of a JS payload, returning "" when it is malformed.
+def js_string(literal: str) -> str:
+    try:
+        value = json.loads(literal)
+    except json.JSONDecodeError:
+        return ""
+    return value if isinstance(value, str) else ""
+
+
+# Pulls the (command, workdir) pairs out of a Codex `exec` JavaScript payload.
+# The payload is JS source, not JSON, so it is split at each `exec_command` call site and each
+# call's `cmd`/`workdir` fields are read with regexes; patch bodies are edits and yield nothing.
+def js_exec_commands(source: str) -> list[tuple[str, str]]:
+    if source.lstrip().startswith(PATCH_PREFIX):
+        return []
+    segments = source.split(JS_EXEC_MARKER)
+    if len(segments) > 1:
+        segments = segments[1:]
+    pairs: list[tuple[str, str]] = []
+    for segment in segments:
+        workdir_match = JS_WORKDIR_RE.search(segment)
+        workdir = js_string(workdir_match.group(1)) if workdir_match else ""
+        for match in JS_CMD_RE.finditer(segment):
+            command = js_string(match.group(1))
+            if command:
+                pairs.append((command, workdir))
+    return pairs
+
+
+# Returns the (command, workdir) pairs one Codex tool call ran.
+# JSON arguments hold a single command; an `exec` call arrives as a JS wrapper string that can
+# hold several, so the JS decoder is the fallback whenever the arguments are not JSON.
+def codex_tool_commands(payload: dict) -> list[tuple[str, str]]:
+    _name, args = codex_tool_call(payload)
+    if args:
+        return [(codex_command_arg(args), str(args.get("workdir") or ""))]
+    raw_args = codex_raw_args(payload)
+    return js_exec_commands(raw_args) if isinstance(raw_args, str) else []
 
 
 # Returns the tool payload for the known Codex transcript record shapes.
@@ -318,28 +429,62 @@ def command_paths(command: str, root: Path, workdir: Path | None) -> list[Path]:
     return relatives
 
 
+# Splits a compound shell command into the individual commands it chains together.
+# An operator can also sit inside a quoted argument (`sed -n '1,5p;9p' f`), which leaves a segment
+# with unbalanced quotes, so any such split is discarded and the command is kept whole.
+def command_segments(command: str) -> list[str]:
+    segments = [segment.strip() for segment in SHELL_SEGMENT_RE.split(command) if segment.strip()]
+    for segment in segments:
+        try:
+            shlex.split(segment)
+        except ValueError:
+            return [command.strip()] if command.strip() else []
+    return segments
+
+
+# Finds every `.agent-kb/` doc read by a shell command, one chained segment at a time.
+# Both harnesses call this, so "a shell command that reads a KB doc" has a single definition.
+def shell_kb_read_paths(command: str, root: Path, workdir: Path | None) -> list[Path]:
+    found: list[Path] = []
+    for segment in command_segments(command):
+        words = command_words(segment)
+        if not words or Path(words[0]).name not in KB_READ_COMMANDS:
+            continue
+        for relative in command_paths(segment, root, workdir):
+            if kb_relative(relative) is None or relative.suffix.lower() not in KB_DOC_SUFFIXES:
+                continue
+            if relative not in found:
+                found.append(relative)
+    return found
+
+
 # Extracts the first `.agent-kb/` doc path read by a Codex shell command.
 def codex_kb_read_path(command: str, root: Path, workdir: Path | None) -> Path | None:
-    words = command_words(command)
-    if not words or Path(words[0]).name not in KB_READ_COMMANDS:
-        return None
-    for relative in command_paths(command, root, workdir):
-        if kb_relative(relative) is not None and relative.suffix.lower() in KB_DOC_SUFFIXES:
-            return relative
-    return None
+    paths = shell_kb_read_paths(command, root, workdir)
+    return paths[0] if paths else None
 
 
 # Classifies a Codex shell command as KB read, AGENTS.md read, source action, or irrelevant.
+# A KB read wins over any other segment; otherwise the first classifiable segment decides.
 def classify_codex_command(command: str, root: Path, workdir: Path | None) -> tuple[str | None, str]:
+    kb_read_path = codex_kb_read_path(command, root, workdir)
+    if kb_read_path is not None:
+        rel = kb_relative(kb_read_path) or ""
+        return ("kb_entry_read" if rel in KB_ENTRY_FILES else "kb_read"), str(kb_read_path)
+    for segment in command_segments(command):
+        kind, event_path = classify_codex_segment(segment, root, workdir)
+        if kind:
+            return kind, event_path
+    return None, ""
+
+
+# Classifies one non-compound shell command by its executable and the root paths it names.
+def classify_codex_segment(command: str, root: Path, workdir: Path | None) -> tuple[str | None, str]:
     words = command_words(command)
     if not words:
         return None, ""
     executable = Path(words[0]).name
     paths = command_paths(command, root, workdir)
-    kb_read_path = codex_kb_read_path(command, root, workdir)
-    if kb_read_path is not None:
-        rel = kb_relative(kb_read_path) or ""
-        return ("kb_entry_read" if rel in KB_ENTRY_FILES else "kb_read"), str(kb_read_path)
     if executable in KB_READ_COMMANDS:
         for path in paths:
             if str(path) == AGENTS_INSTRUCTION_FILE:
@@ -358,15 +503,28 @@ def classify_codex_command(command: str, root: Path, workdir: Path | None) -> tu
 
 
 # Extracts KB read events and root-owned session membership from one Codex transcript.
+# A sub-agent or resumed rollout already records the root thread's id in `session_meta.session_id`,
+# so keying on it (instead of on the file) merges those rollouts into the session that started them.
+# A rollout can carry several `session_meta` records when it is resumed or forked; the last one
+# wins, which folds every file of a resume chain onto the thread the chain ended up in.
 def parse_codex_transcript(path: Path, root: Path) -> TranscriptScan:
+    # An old rollout without `thread_source` has no sub-agent concept at all, so it is a user
+    # session; only an explicit non-user thread_source marks a rollout as a sub-agent.
     session = f"codex:{path.stem}"
-    sessions: set[str] = set()
-    reads: list[KbReadEvent] = []
+    user_thread = True
+    owned = False
+    found: list[tuple[str, str, int]] = []
     current_workdir: Path | None = None
     for index, record in enumerate(iter_jsonl(path)):
         payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
         timestamp = str(record.get("timestamp") or f"{path.name}:{index}")
         if record.get("type") == "session_meta":
+            session_id = str(payload.get("session_id") or "")
+            if session_id:
+                session = f"codex:{session_id}"
+            thread_source = str(payload.get("thread_source") or "")
+            if thread_source:
+                user_thread = thread_source == "user"
             cwd = str(payload.get("cwd") or payload.get("workdir") or "")
             cwd_path = resolve_path(cwd) if cwd else None
             # Track the session's own cwd even when it is another project, so its bare
@@ -374,23 +532,27 @@ def parse_codex_transcript(path: Path, root: Path) -> TranscriptScan:
             if cwd_path is not None:
                 current_workdir = cwd_path
             if path_is_inside_root(cwd_path, root):
-                sessions.add(session)
+                owned = True
             continue
         tool_payload = codex_record_tool_payload(record)
         if tool_payload is None:
             continue
         _name, args = codex_tool_call(tool_payload)
-        command = codex_command_arg(args)
         workdir_raw = str(args.get("workdir") or "")
-        workdir = resolve_path(workdir_raw) if workdir_raw else current_workdir
-        if path_is_inside_root(workdir, root):
-            sessions.add(session)
-        relative = codex_kb_read_path(command, root, workdir)
-        kb_path = kb_relative(relative) if relative is not None else None
-        if kb_path is not None:
-            sessions.add(session)
-            reads.append(KbReadEvent(session, "codex", timestamp, kb_path, file_chars(root, relative)))
-    return TranscriptScan(sessions, reads)
+        default_workdir = resolve_path(workdir_raw) if workdir_raw else current_workdir
+        if path_is_inside_root(default_workdir, root):
+            owned = True
+        for command, command_workdir_raw in codex_tool_commands(tool_payload):
+            workdir = resolve_path(command_workdir_raw) if command_workdir_raw else default_workdir
+            if path_is_inside_root(workdir, root):
+                owned = True
+            for relative in shell_kb_read_paths(command, root, workdir):
+                kb_path = kb_relative(relative)
+                if kb_path is None:
+                    continue
+                owned = True
+                found.append((timestamp, kb_path, file_chars(root, relative)))
+    return file_scan(session, "codex", owned, user_thread, found)
 
 
 # Extracts normalized compliance events from one Codex transcript.
@@ -414,20 +576,23 @@ def parse_codex_tool_events(path: Path, root: Path) -> list[ToolEvent]:
         if tool_payload is None:
             continue
         name, args = codex_tool_call(tool_payload)
-        command = codex_command_arg(args)
         workdir_raw = str(args.get("workdir") or "")
-        workdir = resolve_path(workdir_raw) if workdir_raw else current_workdir
-        in_root_workdir = path_is_inside_root(workdir, root)
-        if in_root_workdir:
+        default_workdir = resolve_path(workdir_raw) if workdir_raw else current_workdir
+        if path_is_inside_root(default_workdir, root):
             belongs_to_root = True
         if "apply_patch" in name:
-            if in_root_workdir:
+            if path_is_inside_root(default_workdir, root):
                 events.append(ToolEvent(session, "codex", timestamp, index, "source_edit"))
             continue
-        kind, event_path = classify_codex_command(command, root, workdir)
-        if kind and (in_root_workdir or event_path):
-            events.append(ToolEvent(session, "codex", timestamp, index, kind, event_path))
-            belongs_to_root = True
+        for command, command_workdir_raw in codex_tool_commands(tool_payload):
+            workdir = resolve_path(command_workdir_raw) if command_workdir_raw else default_workdir
+            in_root_workdir = path_is_inside_root(workdir, root)
+            if in_root_workdir:
+                belongs_to_root = True
+            kind, event_path = classify_codex_command(command, root, workdir)
+            if kind and (in_root_workdir or event_path):
+                events.append(ToolEvent(session, "codex", timestamp, index, kind, event_path))
+                belongs_to_root = True
     return events if belongs_to_root else []
 
 
@@ -468,14 +633,17 @@ def codex_transcript_paths(base: Path, root: Path) -> list[Path]:
     return [path for path in transcript_paths(base) if transcript_mentions(path, needles)]
 
 
-# Merges multiple transcript scan results into one result.
+# Merges per-file transcript scan results into one result, keeping user-thread membership separate
+# so the user-thread rule can be applied once the whole scan (all files of a session) is known.
 def merge_scans(scans: list[TranscriptScan]) -> TranscriptScan:
     sessions: set[str] = set()
+    user_sessions: set[str] = set()
     reads: list[KbReadEvent] = []
     for scan in scans:
         sessions.update(scan.sessions)
+        user_sessions.update(scan.user_sessions)
         reads.extend(scan.reads)
-    return TranscriptScan(sessions, reads)
+    return TranscriptScan(sessions, reads, user_sessions)
 
 
 # Scans local Claude Code and Codex transcripts for KB reads belonging to root.
@@ -485,7 +653,7 @@ def scan_transcripts(root: Path, claude_dir: Path | None, codex_dir: Path | None
         scans.extend(parse_claude_transcript(path, root) for path in claude_transcript_paths(claude_dir, root))
     if codex_dir is not None:
         scans.extend(parse_codex_transcript(path, root) for path in codex_transcript_paths(codex_dir, root))
-    return merge_scans(scans)
+    return user_thread_scan(merge_scans(scans))
 
 
 # Parses one transcript and returns no events when it fails, so one bad file cannot end the scan.

@@ -21,6 +21,7 @@ from transcript_reads import (
     resolve_path as resolve_transcript_path,
     transcript_mentions,
     transcript_paths,
+    user_thread_scan,
 )
 
 
@@ -273,7 +274,10 @@ TRIM_MAX_ROUTES = 15
 TRIM_MAJOR_OVERAGE = 0.10
 # Bumped to 3 when transcript attribution moved from process-cwd resolution to session workdir:
 # caches written before that hold cross-project sessions and must be recomputed, not reused.
-TRANSCRIPT_CACHE_VERSION = 3
+# Bumped to 4 when a session became the logical session (shared by sub-agent and resumed
+# transcript files) instead of one file, and shell KB reads started being detected: older caches
+# hold both file-shaped session ids and reads a blinder parser missed.
+TRANSCRIPT_CACHE_VERSION = 4
 
 
 # Returns the repository root from an argparse namespace.
@@ -405,6 +409,20 @@ def read_transcript_cache(kb: Path) -> dict:
     return cache
 
 
+# Returns whether a cache file from a different scanner version is present.
+# Such a cache means the logged kb_read events were derived by an older scanner, so their session
+# ids no longer join the current ones and the hit rate would silently read as near zero.
+def transcript_cache_is_outdated(kb: Path) -> bool:
+    path = transcript_cache_path(kb)
+    if not path.exists():
+        return False
+    try:
+        cache = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return True
+    return not isinstance(cache, dict) or cache.get("version") != TRANSCRIPT_CACHE_VERSION
+
+
 # Writes the local transcript backfill cache best-effort so stats never fails because of caching.
 def write_transcript_cache(kb: Path, cache: dict) -> None:
     try:
@@ -425,12 +443,15 @@ def transcript_signature(path: Path) -> dict | None:
 
 
 # Converts one transcript scan into a cache entry that keeps only denominator-safe session data.
+# A single file cannot tell whether its session has a user thread, so the entry also records
+# whether this file is one; the whole-scan aggregation applies the user-thread rule.
 def transcript_cache_entry(harness: str, signature: dict, scan: TranscriptScan) -> dict:
     return {
         "harness": harness,
         "mtime_ns": signature["mtime_ns"],
         "size": signature["size"],
         "sessions": sorted(scan.sessions),
+        "user_sessions": sorted(scan.user_sessions),
     }
 
 
@@ -440,6 +461,7 @@ def scan_transcripts_incremental(root: Path, kb: Path, claude_dir: Path | None, 
     cached_files = cache.get("files", {})
     next_files: dict[str, dict] = {}
     sessions: set[str] = set()
+    user_sessions: set[str] = set()
     reads: list[KbReadEvent] = []
     codex_needles = {str(root), root.name}
 
@@ -458,6 +480,7 @@ def scan_transcripts_incremental(root: Path, kb: Path, claude_dir: Path | None, 
             and cached.get("size") == signature["size"]
         ):
             sessions.update(str(session) for session in cached.get("sessions", []))
+            user_sessions.update(str(session) for session in cached.get("user_sessions", []))
             next_files[key] = cached
             return
         try:
@@ -471,6 +494,7 @@ def scan_transcripts_incremental(root: Path, kb: Path, claude_dir: Path | None, 
             print(f"WARN: skipped unparseable transcript {path.name}: {err}")
             return
         sessions.update(scan.sessions)
+        user_sessions.update(scan.user_sessions)
         reads.extend(scan.reads)
         next_files[key] = transcript_cache_entry(harness, signature, scan)
 
@@ -482,7 +506,7 @@ def scan_transcripts_incremental(root: Path, kb: Path, claude_dir: Path | None, 
             scan_path(path, "codex", True)
 
     write_transcript_cache(kb, {"version": TRANSCRIPT_CACHE_VERSION, "files": next_files})
-    return TranscriptScan(sessions, reads)
+    return user_thread_scan(TranscriptScan(sessions, reads, user_sessions))
 
 
 # Drops transcript-derived kb_read events and the scan cache so the next backfill rebuilds them.
@@ -1952,8 +1976,65 @@ def format_rate(numerator: int, denominator: int) -> str:
     return f"{numerator}/{denominator} ({numerator / denominator * 100:.1f}%)"
 
 
-# Prints read-observability metrics from transcript backfill and logged KB read events.
+# Follows a rename chain to the newest path, stopping on a missing link or a loop.
+def latest_renamed_path(renames: dict[str, str], start: str) -> str:
+    current = start
+    seen = {start}
+    while True:
+        following = renames.get(current)
+        if following is None or following in seen:
+            return current
+        seen.add(following)
+        current = following
+
+
+# Maps every historical KB path to the doc's current path so read stats survive renames;
+# one `git log` pass collects rename records (same nested/parent repo choice as git_churn),
+# then each chain is followed to its newest name. Returns {} when git history is unavailable.
+def kb_rename_map(root: Path) -> dict[str, str]:
+    kb = kb_dir(root)
+    log_options = ["--format=", "--name-status", "-M", "--diff-filter=R", "-z"]
+    if (kb / ".git").exists():
+        # KB is its own repo: rename records already use KB-relative paths.
+        cmd = ["git", "-C", str(kb), "log", *log_options]
+        prefix = ""
+    else:
+        cmd = ["git", "-C", str(root), "log", *log_options, "--", ".agent-kb"]
+        prefix = ".agent-kb/"
+    try:
+        result = subprocess.run(
+            cmd,
+            check=True,
+            encoding="utf-8",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return {}
+    # -z writes each rename as three NUL-separated fields: status, old path, new path; newest commit first.
+    fields = [field for field in result.stdout.split("\0") if field]
+    direct: dict[str, str] = {}
+    index = 0
+    while index + 2 < len(fields):
+        status, old, new = fields[index], fields[index + 1], fields[index + 2]
+        if not status.startswith("R"):
+            index += 1
+            continue
+        index += 3
+        if not old.startswith(prefix) or not new.startswith(prefix):
+            continue
+        old, new = old[len(prefix) :], new[len(prefix) :]
+        # Newest rename wins; a path that exists again today is a live doc, not an alias.
+        if old == new or old in direct or (kb / old).is_file():
+            continue
+        direct[old] = new
+    return {old: latest_renamed_path(direct, old) for old in direct}
+
+
+# Prints read-observability metrics from transcript backfill and logged KB read events,
+# counting reads under a doc's current path even when they were logged before a rename.
 def print_kb_read_stats(
+    root: Path,
     kb: Path,
     events: list[dict],
     scan: TranscriptScan | None,
@@ -1975,11 +2056,15 @@ def print_kb_read_stats(
         print("  (no KB reads logged yet)")
         return
 
+    # Reads are logged under the path a doc had at read time, so fold renamed paths into
+    # the current one; both views below then count a moved doc as the same doc.
+    renames = kb_rename_map(root)
     chars_by_session: dict[str, int] = {}
     reads_by_file: dict[str, int] = {}
     for event in read_events:
         session = str(event.get("session", ""))
         file = str(event.get("file", ""))
+        file = renames.get(file, file)
         chars = int(event.get("chars") or 0)
         chars_by_session[session] = chars_by_session.get(session, 0) + chars
         reads_by_file[file] = reads_by_file.get(file, 0) + 1
@@ -2024,6 +2109,12 @@ def command_stats(args: argparse.Namespace) -> int:
         removed = reset_kb_read_events(kb)
         print(f"Rebuilding KB read history: dropped {removed} transcript-derived event(s).")
         print()
+    elif not args.no_backfill and transcript_cache_is_outdated(kb):
+        # Old events were derived by an older scanner and no longer match the session ids it
+        # produces now, so rebuild them instead of reporting a hit rate that quietly collapses.
+        removed = reset_kb_read_events(kb)
+        print(f"Transcript scanner changed (cache v{TRANSCRIPT_CACHE_VERSION}): dropped {removed} stale transcript-derived event(s) and rescanned.")
+        print()
     if not args.no_backfill:
         try:
             scan, added = backfill_kb_reads(root, args)
@@ -2052,7 +2143,7 @@ def command_stats(args: argparse.Namespace) -> int:
     print()
     if scan is not None:
         print(f"Backfilled KB reads: {added} new event(s).")
-    print_kb_read_stats(kb, events, scan, args.top, args.dead_sessions, backfill_error)
+    print_kb_read_stats(root, kb, events, scan, args.top, args.dead_sessions, backfill_error)
 
     print()
     print("KB file churn (git history):")

@@ -1150,6 +1150,95 @@ def test_stats_backfills_kb_reads() -> None:
         require(len(read_events) == 3, "event log should contain exactly three deduped kb_read events")
 
 
+# Appends a backfill-shaped kb_read event so stats fixtures can seed read history at a chosen KB path.
+def append_kb_read_event(root: Path, file: str, session: str) -> None:
+    log = root / ".agent-kb" / ".log" / "events.jsonl"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "ts": "2026-07-05T00:00:00Z",
+        "event": "kb_read",
+        "kind": "kb_read",
+        "source": "backfill",
+        "harness": "claude",
+        "session": session,
+        "file": file,
+        "chars": 1200,
+    }
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record) + "\n")
+
+
+# Collects the rows printed under one stats section, stopping at the next header or blank line.
+def stats_section_rows(stdout: str, header: str) -> list[str]:
+    rows: list[str] = []
+    header_indent = None
+    for line in stdout.splitlines():
+        if header_indent is None:
+            if line.strip().startswith(header):
+                header_indent = len(line) - len(line.lstrip())
+            continue
+        indent = len(line) - len(line.lstrip())
+        if not line.strip() or indent <= header_indent:
+            break
+        rows.append(line.strip())
+    return rows
+
+
+# Checks that reads logged before a git rename still count for the doc under its current path.
+def test_stats_follows_kb_renames() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp) / "repo"
+        root.mkdir(parents=True)
+        result = run_cli(root, "init", "--shared")
+        require(result.returncode == 0, "shared init should succeed", result)
+        create_fixture_commit(root, {"README.md": "fixture\n"})
+        run_fixture_git(root, "mv", ".agent-kb/architecture/overview.md", ".agent-kb/architecture/system-overview.md")
+        run_fixture_git(root, "commit", "-m", "rename overview")
+        append_kb_read_event(root, "architecture/overview.md", "session-old-path")
+
+        result = run_cli(root, "stats", "--no-backfill", "--dead-sessions", "1", "--top", "30")
+        require(result.returncode == 0, "stats should succeed after a KB rename", result)
+        dead = stats_section_rows(result.stdout, "Dead knowledge candidates")
+        require(
+            "- architecture/system-overview.md" not in dead,
+            "a doc read under its pre-rename path should not be reported dead",
+            result,
+        )
+        most_read = stats_section_rows(result.stdout, "Most-read KB files")
+        require(
+            any(row.startswith("architecture/system-overview.md ") for row in most_read),
+            "most-read chart should credit the current path",
+            result,
+        )
+        require(
+            not any(row.startswith("architecture/overview.md ") for row in most_read),
+            "most-read chart should not keep a separate row for the pre-rename path",
+            result,
+        )
+
+
+# Checks that stats degrades to path-exact read matching when no git history is available.
+def test_stats_dead_candidates_without_git() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        root = Path(tmp) / "repo"
+        root.mkdir(parents=True)
+        # Shared mode in a directory that is not a git repo: no nested KB repo, no parent history.
+        result = run_cli(root, "init", "--shared")
+        require(result.returncode == 0, "shared init should succeed", result)
+        kb = root / ".agent-kb"
+        (kb / "architecture" / "overview.md").rename(kb / "architecture" / "system-overview.md")
+        append_kb_read_event(root, "architecture/overview.md", "session-old-path")
+
+        result = run_cli(root, "stats", "--no-backfill", "--dead-sessions", "1", "--top", "30")
+        require(result.returncode == 0, "stats should succeed without git history", result)
+        require("Traceback" not in result.stderr, "stats should not crash without git history", result)
+        require(
+            "- architecture/system-overview.md" in stats_section_rows(result.stdout, "Dead knowledge candidates"),
+            "without rename history the moved doc keeps today's dead-candidate behaviour",
+            result,
+        )
+
+
 # Checks that a bare path is never resolved against the process cwd, only against a session workdir.
 def test_root_relative_rejects_bare_paths() -> None:
     from transcript_reads import command_paths, root_relative
@@ -1196,6 +1285,130 @@ def test_root_relative_rejects_bare_paths() -> None:
         require(
             codex_kb_read_path("cat .agent-kb/`, x", root, root) is None,
             "a junk token after `.agent-kb/` must not be recorded as a KB doc read",
+        )
+
+
+# Checks that Codex `exec` JS wrapper payloads surface their reads in both parsers.
+def test_codex_exec_wrapper_reads() -> None:
+    from transcript_reads import parse_codex_tool_events, parse_codex_transcript
+
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        base = Path(tmp).resolve()
+        root = base / "repo"
+        (root / ".agent-kb" / "workflows").mkdir(parents=True)
+        workdir = str(root)
+        # Unquoted `cmd` key, and a read hidden behind `&&` in a compound command.
+        compound_input = (
+            'const r = await tools.exec_command({cmd:"pwd && sed -n \'1,240p\' .agent-kb/start.md",'
+            '"workdir":"' + workdir + '","yield_time_ms":10000}); text(r.output);\n'
+        )
+        # Quoted `cmd` key, the other spelling Codex records.
+        quoted_input = 'const r = await tools.exec_command({"cmd":"cat .agent-kb/routes.yaml","workdir":"' + workdir + '"});'
+        # Several commands in one payload, each carrying its own workdir.
+        promise_input = (
+            "const results = await Promise.all(["
+            'tools.exec_command({"cmd":"sed -n \'1,10p\' .agent-kb/workflows/local-dev.md","workdir":"' + workdir + '"}), '
+            'tools.exec_command({cmd:"cat .agent-kb/map.md","workdir":"' + workdir + '"})'
+            "]);"
+        )
+        patch_input = "*** Begin Patch\n*** Update File: .agent-kb/start.md\n@@\n-old\n+new\n*** End Patch\n"
+        transcript = base / "codex" / "sessions" / "rollout-exec-wrapper.jsonl"
+        write_jsonl(
+            transcript,
+            [
+                {"timestamp": "2026-07-05T00:00:00Z", "type": "session_meta", "payload": {"cwd": workdir}},
+                {
+                    "timestamp": "2026-07-05T00:00:01Z",
+                    "type": "response_item",
+                    "payload": {"type": "custom_tool_call", "name": "exec", "input": compound_input},
+                },
+                {
+                    "timestamp": "2026-07-05T00:00:02Z",
+                    "type": "response_item",
+                    "payload": {"type": "custom_tool_call", "name": "exec", "input": quoted_input},
+                },
+                {
+                    "timestamp": "2026-07-05T00:00:03Z",
+                    "type": "response_item",
+                    "payload": {"type": "custom_tool_call", "name": "exec", "input": promise_input},
+                },
+                {
+                    "timestamp": "2026-07-05T00:00:04Z",
+                    "type": "response_item",
+                    "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": patch_input},
+                },
+            ],
+        )
+
+        scan = parse_codex_transcript(transcript, root)
+        require(
+            sorted(read.file for read in scan.reads)
+            == ["map.md", "routes.yaml", "start.md", "workflows/local-dev.md"],
+            f"the exec JS wrapper should yield every read it ran, got {sorted(r.file for r in scan.reads)}",
+        )
+        require(
+            sum(1 for read in scan.reads if read.file == "start.md") == 1,
+            "an `apply_patch` body must not be counted as a KB read",
+        )
+
+        events = parse_codex_tool_events(transcript, root)
+        require(
+            [event.kind for event in events]
+            == ["kb_entry_read", "kb_entry_read", "kb_read", "kb_read", "source_edit"],
+            f"the analyzer should see the same wrapper commands, got {[e.kind for e in events]}",
+        )
+
+
+# Checks that a Claude Bash command reading a KB doc counts, while a bare mention does not.
+def test_claude_bash_kb_read() -> None:
+    from transcript_reads import parse_claude_tool_events, parse_claude_transcript
+
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        base = Path(tmp).resolve()
+        root = base / "repo"
+        (root / ".agent-kb" / "plans").mkdir(parents=True)
+        transcript = base / "claude" / "projects" / "session-bash-read.jsonl"
+        write_jsonl(
+            transcript,
+            [
+                {
+                    "timestamp": "2026-07-05T00:00:00Z",
+                    "cwd": str(root),
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "name": "Bash",
+                                "input": {"command": "sed -n '1,40p' .agent-kb/start.md"},
+                            }
+                        ]
+                    },
+                },
+                {
+                    # No cwd on this record: the session cwd seen earlier has to carry over.
+                    "timestamp": "2026-07-05T00:00:01Z",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "name": "Bash",
+                                "input": {"command": "git add .agent-kb/plans/current.md"},
+                            }
+                        ]
+                    },
+                },
+            ],
+        )
+
+        scan = parse_claude_transcript(transcript, root)
+        require(
+            [read.file for read in scan.reads] == ["start.md"],
+            f"a Claude Bash `sed` on a KB doc should count as a read, got {[r.file for r in scan.reads]}",
+        )
+        events = parse_claude_tool_events(transcript, root)
+        require(
+            [event.kind for event in events] == ["kb_entry_read"],
+            f"the analyzer should see the Bash KB read and skip `git add`, got {[e.kind for e in events]}",
         )
 
 
@@ -1278,6 +1491,213 @@ def test_stats_rebuild_reads_drops_polluted_events() -> None:
 
         result = run_cli(root, "stats", "--rebuild-reads", "--no-backfill")
         require(result.returncode == 1, "--rebuild-reads with --no-backfill should be refused", result)
+
+
+# Builds one Codex rollout: a session_meta plus an optional KB read, as this repo's real rollouts look.
+def write_codex_rollout(path: Path, root: Path, meta: dict, read_file: str | None = None) -> None:
+    records = [{"timestamp": "2026-08-11T00:00:00Z", "type": "session_meta", "payload": {"cwd": str(root), **meta}}]
+    if read_file:
+        records.append(
+            {
+                "timestamp": "2026-08-11T00:00:01Z",
+                "type": "function_call",
+                "payload": {
+                    "name": "functions.exec_command",
+                    "arguments": json.dumps({"cmd": f"sed -n '1,40p' .agent-kb/{read_file}", "workdir": str(root)}),
+                },
+            }
+        )
+    write_jsonl(path, records)
+
+
+# Checks that a Codex sub-agent rollout is credited to the session that spawned it, not counted alone.
+def test_codex_subagent_rollout_merges_into_parent() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        base = Path(tmp)
+        root = base / "repo"
+        root.mkdir()
+        init_root(root)
+        codex_dir = base / "codex" / "sessions"
+        write_codex_rollout(
+            codex_dir / "rollout-parent.jsonl",
+            root,
+            {"id": "sid-parent", "session_id": "sid-parent", "thread_source": "user"},
+        )
+        write_codex_rollout(
+            codex_dir / "rollout-subagent.jsonl",
+            root,
+            {
+                "id": "sid-child",
+                "session_id": "sid-parent",
+                "thread_source": "subagent",
+                "parent_thread_id": "sid-parent",
+            },
+            read_file="start.md",
+        )
+
+        result = run_cli(root, "stats", "--codex-dir", str(codex_dir), "--no-backfill-claude")
+        require(result.returncode == 0, "stats should succeed with a sub-agent rollout present", result)
+        require("scanned sessions: 1" in result.stdout, "a sub-agent rollout must not be its own session", result)
+        require("KB hit rate: 1/1 (100.0%)" in result.stdout, "the sub-agent read should credit its parent session", result)
+
+
+# Checks that the several rollout files of one resumed Codex session collapse into one session.
+def test_codex_resume_pair_collapses_to_one_session() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        base = Path(tmp)
+        root = base / "repo"
+        root.mkdir()
+        init_root(root)
+        codex_dir = base / "codex" / "sessions"
+        write_codex_rollout(
+            codex_dir / "rollout-first.jsonl",
+            root,
+            {"id": "sid-first", "session_id": "sid-first", "thread_source": "user"},
+            read_file="start.md",
+        )
+        # A resumed rollout replays the earlier thread and ends on the session it continued into.
+        write_jsonl(
+            codex_dir / "rollout-resumed.jsonl",
+            [
+                {
+                    "timestamp": "2026-08-11T01:00:00Z",
+                    "type": "session_meta",
+                    "payload": {"cwd": str(root), "id": "sid-first", "session_id": "sid-first", "thread_source": "user"},
+                },
+                {
+                    "timestamp": "2026-08-11T01:00:01Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "cwd": str(root),
+                        "id": "sid-resumed",
+                        "session_id": "sid-first",
+                        "thread_source": "user",
+                        "forked_from_id": "sid-first",
+                    },
+                },
+            ],
+        )
+
+        result = run_cli(root, "stats", "--codex-dir", str(codex_dir), "--no-backfill-claude")
+        require(result.returncode == 0, "stats should succeed with a resumed rollout present", result)
+        require("scanned sessions: 1" in result.stdout, "a resumed rollout must not add a second session", result)
+        require("KB hit rate: 1/1 (100.0%)" in result.stdout, "the resumed session keeps its earlier read", result)
+
+
+# Checks that a sub-agent session with no user thread of its own leaves numerator and denominator.
+def test_codex_subagent_only_session_is_excluded() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        base = Path(tmp)
+        root = base / "repo"
+        root.mkdir()
+        init_root(root)
+        codex_dir = base / "codex" / "sessions"
+        write_codex_rollout(
+            codex_dir / "rollout-user.jsonl",
+            root,
+            {"id": "sid-user", "session_id": "sid-user", "thread_source": "user"},
+        )
+        write_codex_rollout(
+            codex_dir / "rollout-orphan-subagent.jsonl",
+            root,
+            {"id": "sid-orphan", "session_id": "sid-missing-parent", "thread_source": "subagent"},
+            read_file="start.md",
+        )
+
+        result = run_cli(root, "stats", "--codex-dir", str(codex_dir), "--no-backfill-claude")
+        require(result.returncode == 0, "stats should succeed with an orphan sub-agent rollout", result)
+        require("scanned sessions: 1" in result.stdout, "a sub-agent-only session must not be counted", result)
+        require("KB hit rate: 0/1 (0.0%)" in result.stdout, "its read must not count either", result)
+        require("Backfilled KB reads: 0 new event(s)." in result.stdout, "no orphan read should reach the log", result)
+
+
+# Checks that a Claude sidechain transcript is folded into the session that spawned it.
+def test_claude_sidechain_credits_parent_session() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        base = Path(tmp)
+        root = base / "repo"
+        root.mkdir()
+        init_root(root)
+        claude_dir = base / "claude" / "projects" / fixture_claude_project_name(root)
+        write_jsonl(
+            claude_dir / "main-thread.jsonl",
+            [{"timestamp": "2026-08-11T00:00:00Z", "cwd": str(root), "sessionId": "claude-sid"}],
+        )
+        write_jsonl(
+            claude_dir / "sidechain.jsonl",
+            [
+                {
+                    "timestamp": "2026-08-11T00:00:01Z",
+                    "cwd": str(root),
+                    "sessionId": "claude-sid",
+                    "isSidechain": True,
+                    "agentId": "agent-1",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "name": "Read",
+                                "input": {"file_path": str(root / ".agent-kb" / "start.md")},
+                            }
+                        ]
+                    },
+                }
+            ],
+        )
+
+        result = run_cli(root, "stats", "--claude-dir", str(base / "claude" / "projects"), "--no-backfill-codex")
+        require(result.returncode == 0, "stats should succeed with a sidechain transcript present", result)
+        require("scanned sessions: 1" in result.stdout, "a sidechain file must not be its own session", result)
+        require("KB hit rate: 1/1 (100.0%)" in result.stdout, "the sidechain read should credit its parent session", result)
+
+
+# Checks that a cache written by an older scanner makes stats rebuild kb_read events by itself.
+def test_stats_rebuilds_reads_on_cache_version_change() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        base = Path(tmp)
+        root = base / "repo"
+        root.mkdir()
+        init_root(root)
+        codex_dir = base / "codex" / "sessions"
+        write_codex_rollout(
+            codex_dir / "rollout-read.jsonl",
+            root,
+            {"id": "sid-user", "session_id": "sid-user", "thread_source": "user"},
+            read_file="start.md",
+        )
+
+        result = run_cli(root, "stats", "--codex-dir", str(codex_dir), "--no-backfill-claude")
+        require("Backfilled KB reads: 1 new event(s)." in result.stdout, "first run should log the read", result)
+
+        # Simulate a log left behind by an older scanner: file-shaped session ids plus its cache.
+        log_path = root / ".agent-kb" / ".log" / "events.jsonl"
+        cache_path = root / ".agent-kb" / ".log" / "transcript-backfill-cache.json"
+        log_path.write_text(
+            json.dumps({"ts": "2026-08-01T00:00:00Z", "event": "cli", "command": "validate", "exit": 0})
+            + "\n"
+            + json.dumps(
+                {
+                    "ts": "2026-08-01T00:00:01Z",
+                    "event": "kb_read",
+                    "source": "backfill",
+                    "session": "codex:rollout-read",
+                    "file": "start.md",
+                    "chars": 10,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        cache_path.write_text(json.dumps({"version": 1, "files": {}}) + "\n", encoding="utf-8")
+
+        result = run_cli(root, "stats", "--codex-dir", str(codex_dir), "--no-backfill-claude")
+        require(result.returncode == 0, "stats should succeed after a cache version change", result)
+        require("dropped 1 stale transcript-derived event(s)" in result.stdout, "the stale read should be dropped", result)
+        require("Backfilled KB reads: 1 new event(s)." in result.stdout, "the read should be rebuilt", result)
+        require("KB hit rate: 1/1 (100.0%)" in result.stdout, "the rebuilt read must join the new session id", result)
+        text = log_path.read_text(encoding="utf-8")
+        require("codex:rollout-read" not in text, "the stale file-shaped session id must be gone")
+        require('"command": "validate"' in text, "CLI history must survive an automatic rebuild")
 
 
 # Checks that a `~N` token stays resolvable instead of raising when no such user exists.
@@ -2577,9 +2997,18 @@ def main() -> int:
         test_note_body_redacted_in_log,
         test_stats_reports_cli_usage,
         test_stats_backfills_kb_reads,
+        test_stats_follows_kb_renames,
+        test_stats_dead_candidates_without_git,
         test_root_relative_rejects_bare_paths,
+        test_codex_exec_wrapper_reads,
+        test_claude_bash_kb_read,
         test_stats_ignores_other_project_transcripts,
         test_stats_rebuild_reads_drops_polluted_events,
+        test_codex_subagent_rollout_merges_into_parent,
+        test_codex_resume_pair_collapses_to_one_session,
+        test_codex_subagent_only_session_is_excluded,
+        test_claude_sidechain_credits_parent_session,
+        test_stats_rebuilds_reads_on_cache_version_change,
         test_resolve_path_tolerates_junk_home_token,
         test_stats_backfill_survives_junk_home_token,
         test_backfill_skips_unparseable_transcript,
