@@ -62,6 +62,14 @@ class ToolEvent:
     order: int
     kind: str
     path: str = ""
+    # False for a sub-agent (Claude sidechain / Codex non-user thread) file. Such a file reports
+    # its parent's session id, so a consumer can merge it and still tell whose actions these were.
+    user_thread: bool = True
+    # Orders the transcript files of one logical session against each other (a resume/fork chain);
+    # `file_records` is that file's record count, so the files can be laid end to end and `order`
+    # keeps meaning "records into the session".
+    file_key: str = ""
+    file_records: int = 0
 
 
 # Returns a resolved Path while tolerating missing files and user-relative input.
@@ -214,6 +222,35 @@ def file_scan(session: str, harness: str, owned: bool, user_thread: bool, found:
     return TranscriptScan({session}, reads, {session} if user_thread else set())
 
 
+# Builds the key that orders the transcript files of one logical session against each other.
+# A file is ordered by when it starts, with its name only breaking ties. Start time is the one
+# cross-file fact that always holds (a resumed or forked file starts after the file it came from),
+# even though two files can then run at the same time. A file with no timestamp at all sorts last,
+# because sorting it first would let its actions jump ahead of another file's KB read.
+def transcript_file_key(path: Path, first_timestamp: str) -> str:
+    return f"{first_timestamp or '~'}|{path.name}"
+
+
+# Builds one transcript file's compliance events, stamping them with the logical session id.
+# Same identity rule as the read parsers: a sub-agent or resumed file reports the session that
+# started it, and `user_thread` records which of the two this file is.
+def file_tool_events(
+    session: str,
+    harness: str,
+    owned: bool,
+    user_thread: bool,
+    file_key: str,
+    file_records: int,
+    found: list[tuple[str, int, str, str]],
+) -> list[ToolEvent]:
+    if not owned:
+        return []
+    return [
+        ToolEvent(session, harness, timestamp, order, kind, path, user_thread, file_key, file_records)
+        for timestamp, order, kind, path in found
+    ]
+
+
 # Keeps only sessions a human started: a logical session counts when at least one of its transcript
 # files is a user thread, so sub-agent reads stay (they carry the parent id) but sub-agent-only
 # sessions leave both the numerator and the denominator.
@@ -282,18 +319,34 @@ def parse_claude_transcript(path: Path, root: Path) -> TranscriptScan:
 
 
 # Extracts normalized compliance events from one Claude Code transcript.
+# Identity matches parse_claude_transcript: events are held as plain tuples until the file is read
+# out, then stamped with the logical `sessionId` (which sidechain and resumed files share with the
+# session that started them) rather than with the file name, which would split one session into several.
 def parse_claude_tool_events(path: Path, root: Path) -> list[ToolEvent]:
-    events: list[ToolEvent] = []
+    found: list[tuple[str, int, str, str]] = []
     belongs_to_root = False
+    # No `sessionId` anywhere means a single-file session, and a record without `isSidechain`
+    # is a main thread: both fall back to "one user session named after the file".
     session = f"claude:{path.stem}"
+    user_thread = False
+    first_timestamp = ""
+    records = 0
     current_cwd: Path | None = None
     for index, record in enumerate(iter_jsonl(path)):
+        records = index + 1
+        session_id = str(record.get("sessionId") or "")
+        if session_id:
+            session = f"claude:{session_id}"
+        if not record.get("isSidechain"):
+            user_thread = True
         cwd = record_cwd(record)
         if cwd is not None:
             current_cwd = cwd
         if path_is_inside_root(cwd, root):
             belongs_to_root = True
         timestamp = str(record.get("timestamp", ""))
+        if timestamp and not first_timestamp:
+            first_timestamp = timestamp
         for tool_use in claude_tool_uses(record):
             name = str(tool_use.get("name", ""))
             tool_input = tool_use.get("input") if isinstance(tool_use.get("input"), dict) else {}
@@ -302,21 +355,22 @@ def parse_claude_tool_events(path: Path, root: Path) -> list[ToolEvent]:
             if relative is not None:
                 belongs_to_root = True
             if name == "Read" and relative is not None:
-                events.append(ToolEvent(session, "claude", timestamp, index, read_kind_for_relative(relative), str(relative)))
+                found.append((timestamp, index, read_kind_for_relative(relative), str(relative)))
             elif name == "Bash":
                 # Classify Bash with the shared shell rules so a KB read done in the shell still counts.
                 kind, event_path = classify_codex_command(str(tool_input.get("command") or ""), root, current_cwd)
                 if kind and (path_is_inside_root(current_cwd, root) or event_path):
-                    events.append(ToolEvent(session, "claude", timestamp, index, kind, event_path))
+                    found.append((timestamp, index, kind, event_path))
                     belongs_to_root = True
             elif name in SOURCE_SEARCH_TOOLS:
                 if relative is not None and kb_relative(relative) is not None:
                     continue
                 if belongs_to_root or relative is not None:
-                    events.append(ToolEvent(session, "claude", timestamp, index, "source_explore", str(relative or "")))
+                    found.append((timestamp, index, "source_explore", str(relative or "")))
             elif name in SOURCE_EDIT_TOOLS and relative is not None and kb_relative(relative) is None:
-                events.append(ToolEvent(session, "claude", timestamp, index, "source_edit", str(relative)))
-    return events if belongs_to_root else []
+                found.append((timestamp, index, "source_edit", str(relative)))
+    file_key = transcript_file_key(path, first_timestamp)
+    return file_tool_events(session, "claude", belongs_to_root, user_thread, file_key, records, found)
 
 
 # Returns the raw argument payload of a Codex tool call before any decoding.
@@ -398,9 +452,13 @@ def codex_tool_commands(payload: dict) -> list[tuple[str, str]]:
 # Returns the tool payload for the known Codex transcript record shapes.
 def codex_record_tool_payload(record: dict) -> dict | None:
     payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
-    if record.get("type") in {"function_call", "tool_call"}:
+    # A transcript can nest JSON schemas whose `type` is a dict (`{"type": {"type": "string"}}`).
+    # Testing an unhashable value against a set raises TypeError, so require a string first.
+    record_type = record.get("type") if isinstance(record.get("type"), str) else ""
+    payload_type = payload.get("type") if isinstance(payload.get("type"), str) else ""
+    if record_type in {"function_call", "tool_call"}:
         return payload
-    if record.get("type") == "response_item" and payload.get("type") in {"function_call", "custom_tool_call"}:
+    if record_type == "response_item" and payload_type in {"function_call", "custom_tool_call"}:
         return payload
     return None
 
@@ -556,15 +614,30 @@ def parse_codex_transcript(path: Path, root: Path) -> TranscriptScan:
 
 
 # Extracts normalized compliance events from one Codex transcript.
+# Identity matches parse_codex_transcript: the logical `session_meta.session_id` (last one wins,
+# because a resumed or forked rollout records several) merges sub-agent and resumed rollouts into
+# the session that started them, and only an explicit non-user `thread_source` marks a sub-agent.
 def parse_codex_tool_events(path: Path, root: Path) -> list[ToolEvent]:
-    events: list[ToolEvent] = []
+    found: list[tuple[str, int, str, str]] = []
     session = f"codex:{path.stem}"
+    user_thread = True
+    first_timestamp = ""
+    records = 0
     belongs_to_root = False
     current_workdir: Path | None = None
     for index, record in enumerate(iter_jsonl(path)):
+        records = index + 1
         payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
         timestamp = str(record.get("timestamp", ""))
+        if timestamp and not first_timestamp:
+            first_timestamp = timestamp
         if record.get("type") == "session_meta":
+            session_id = str(payload.get("session_id") or "")
+            if session_id:
+                session = f"codex:{session_id}"
+            thread_source = str(payload.get("thread_source") or "")
+            if thread_source:
+                user_thread = thread_source == "user"
             cwd = str(payload.get("cwd") or payload.get("workdir") or "")
             cwd_path = resolve_path(cwd) if cwd else None
             if cwd_path is not None:
@@ -582,7 +655,7 @@ def parse_codex_tool_events(path: Path, root: Path) -> list[ToolEvent]:
             belongs_to_root = True
         if "apply_patch" in name:
             if path_is_inside_root(default_workdir, root):
-                events.append(ToolEvent(session, "codex", timestamp, index, "source_edit"))
+                found.append((timestamp, index, "source_edit", ""))
             continue
         for command, command_workdir_raw in codex_tool_commands(tool_payload):
             workdir = resolve_path(command_workdir_raw) if command_workdir_raw else default_workdir
@@ -591,9 +664,10 @@ def parse_codex_tool_events(path: Path, root: Path) -> list[ToolEvent]:
                 belongs_to_root = True
             kind, event_path = classify_codex_command(command, root, workdir)
             if kind and (in_root_workdir or event_path):
-                events.append(ToolEvent(session, "codex", timestamp, index, kind, event_path))
+                found.append((timestamp, index, kind, event_path))
                 belongs_to_root = True
-    return events if belongs_to_root else []
+    file_key = transcript_file_key(path, first_timestamp)
+    return file_tool_events(session, "codex", belongs_to_root, user_thread, file_key, records, found)
 
 
 # Collects transcript paths under a directory using the harness' JSONL layout.

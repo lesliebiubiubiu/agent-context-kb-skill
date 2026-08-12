@@ -1289,6 +1289,26 @@ def test_root_relative_rejects_bare_paths() -> None:
 
 
 # Checks that Codex `exec` JS wrapper payloads surface their reads in both parsers.
+def test_codex_record_tool_payload_survives_dict_type() -> None:
+    from transcript_reads import codex_record_tool_payload
+
+    # Transcripts embed tool JSON schemas, whose `type` is a dict. Testing an unhashable
+    # value against a set raises TypeError, which aborted extraction for the whole file.
+    schema_node = {"type": {"type": "string", "description": "a parameter"}}
+    require(
+        codex_record_tool_payload(schema_node) is None,
+        "a dict-valued `type` must return None, not raise",
+    )
+    require(
+        codex_record_tool_payload({"type": "response_item", "payload": {"type": {"nested": True}}}) is None,
+        "a dict-valued payload `type` must return None, not raise",
+    )
+    require(
+        codex_record_tool_payload({"type": "function_call", "payload": {"name": "exec"}}) == {"name": "exec"},
+        "a well-formed function_call record must still return its payload",
+    )
+
+
 def test_codex_exec_wrapper_reads() -> None:
     from transcript_reads import parse_codex_tool_events, parse_codex_transcript
 
@@ -1893,6 +1913,139 @@ def test_compliance_survives_junk_home_token() -> None:
         )
 
 
+# Builds a Codex `session_meta` record carrying the logical session id and thread source.
+def codex_session_meta(timestamp: str, workdir: Path, session_id: str, thread_source: str) -> dict:
+    return {
+        "timestamp": timestamp,
+        "type": "session_meta",
+        "payload": {"cwd": str(workdir), "session_id": session_id, "thread_source": thread_source},
+    }
+
+
+# Builds one Codex `exec` tool-call record for compliance fixtures.
+def codex_exec_record(timestamp: str, command: str, workdir: Path) -> dict:
+    return {
+        "timestamp": timestamp,
+        "type": "function_call",
+        "payload": {
+            "name": "functions.exec_command",
+            "arguments": json.dumps({"cmd": command, "workdir": str(workdir)}),
+        },
+    }
+
+
+# Checks that a sub-agent rollout is folded into the session that spawned it, never judged alone.
+def test_compliance_merges_sub_agent_rollouts() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        base = Path(tmp)
+        root = base / "repo"
+        root.mkdir()
+        init_root(root)
+        (root / "src.py").write_text("print('hi')\n", encoding="utf-8")
+        claude_dir = base / "claude" / "projects"
+        claude_dir.mkdir(parents=True)
+        codex_dir = base / "codex" / "sessions"
+        write_jsonl(
+            codex_dir / "rollout-parent.jsonl",
+            [
+                codex_session_meta("2026-08-12T00:00:00Z", root, "s-parent", "user"),
+                codex_exec_record("2026-08-12T00:00:01Z", "git status", root),
+                codex_exec_record("2026-08-12T00:00:02Z", "date", root),
+                codex_exec_record("2026-08-12T00:00:03Z", "sed -n '1,40p' .agent-kb/start.md", root),
+                codex_exec_record("2026-08-12T00:00:04Z", "rg print src.py", root),
+            ],
+        )
+        # The guardian explores at record 1, before the parent's KB read at record 3: merging on the
+        # per-file record index would rank it first and invent a late-KB-read verdict for the parent.
+        write_jsonl(
+            codex_dir / "rollout-guardian.jsonl",
+            [
+                codex_session_meta("2026-08-12T00:00:05Z", root, "s-parent", "guardian"),
+                codex_exec_record("2026-08-12T00:00:06Z", "rg print src.py", root),
+            ],
+        )
+        write_jsonl(
+            codex_dir / "rollout-guardian-orphan.jsonl",
+            [
+                codex_session_meta("2026-08-12T00:10:00Z", root, "s-orphan", "guardian"),
+                codex_exec_record("2026-08-12T00:10:01Z", "rg print src.py", root),
+            ],
+        )
+
+        result = run_compliance(root, claude_dir, codex_dir, "--details")
+        require(result.returncode == 0, "compliance analyzer should succeed on sub-agent rollouts", result)
+        require(
+            "Sessions analyzed (logical user sessions): 1" in result.stdout,
+            "a sub-agent rollout should not add a session of its own",
+            result,
+        )
+        require(
+            "- codex:s-parent [codex] compliant category=compliant" in result.stdout,
+            "sub-agent exploration must not turn the parent session into a late KB read",
+            result,
+        )
+        require(
+            "codex:s-orphan" not in result.stdout,
+            "a sub-agent-only session should leave the report entirely",
+            result,
+        )
+        require(
+            "rollout-guardian" not in result.stdout,
+            "no session should still be named after a transcript file",
+            result,
+        )
+
+
+# Checks that a resumed session is one session, ordered as whole files rather than interleaved.
+def test_compliance_merges_resumed_rollouts() -> None:
+    from transcript_reads import transcript_file_key
+
+    with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
+        base = Path(tmp)
+        root = base / "repo"
+        root.mkdir()
+        init_root(root)
+        (root / "src.py").write_text("print('hi')\n", encoding="utf-8")
+        claude_dir = base / "claude" / "projects"
+        claude_dir.mkdir(parents=True)
+        codex_dir = base / "codex" / "sessions"
+        write_jsonl(
+            codex_dir / "rollout-first.jsonl",
+            [
+                codex_session_meta("2026-08-12T01:00:00Z", root, "s-resumed", "user"),
+                codex_exec_record("2026-08-12T01:00:01Z", "git status", root),
+                codex_exec_record("2026-08-12T01:00:02Z", "date", root),
+                codex_exec_record("2026-08-12T01:00:03Z", "sed -n '1,40p' .agent-kb/start.md", root),
+            ],
+        )
+        # The resumed file explores at its record 1, so interleaving by record index would place it
+        # before the KB read the first file recorded at index 3.
+        write_jsonl(
+            codex_dir / "rollout-resumed.jsonl",
+            [
+                codex_session_meta("2026-08-12T02:00:00Z", root, "s-resumed", "user"),
+                codex_exec_record("2026-08-12T02:00:01Z", "rg print src.py", root),
+            ],
+        )
+
+        result = run_compliance(root, claude_dir, codex_dir, "--details")
+        require(result.returncode == 0, "compliance analyzer should succeed on a resumed session", result)
+        require(
+            "Sessions analyzed (logical user sessions): 1" in result.stdout,
+            "a resumed session should be counted once, not once per transcript file",
+            result,
+        )
+        require(
+            "- codex:s-resumed [codex] compliant category=compliant first_kb=3 first_any_kb=3 first_source=5" in result.stdout,
+            "the resumed file's records should continue after the first file's four records",
+            result,
+        )
+        require(
+            transcript_file_key(Path("a.jsonl"), "") > transcript_file_key(Path("z.jsonl"), "2026-08-12T00:00:00Z"),
+            "a file with no timestamp must sort last so it cannot jump ahead of another file's KB read",
+        )
+
+
 # Checks that the private compliance analyzer parses synthetic Claude and Codex transcripts.
 def test_compliance_analyzer_synthetic_transcripts() -> None:
     with tempfile.TemporaryDirectory(prefix="agent-kb-smoke-") as tmp:
@@ -2199,7 +2352,7 @@ def test_compliance_analyzer_synthetic_transcripts() -> None:
 
         result = run_compliance(root, claude_dir, codex_dir, "--details")
         require(result.returncode == 0, "compliance analyzer should succeed", result)
-        require("Sessions analyzed: 11" in result.stdout, "analyzer should count all synthetic sessions", result)
+        require("Sessions analyzed (logical user sessions): 11" in result.stdout, "analyzer should count all synthetic sessions", result)
         require("KB entry hit rate: 7/11 (63.6%)" in result.stdout, "analyzer should report entry reads", result)
         require("Any KB hit rate: 8/11 (72.7%)" in result.stdout, "analyzer should report all KB reads", result)
         require("Read compliance: 5/11 (45.5%)" in result.stdout, "analyzer should report raw compliant sessions", result)
@@ -2220,10 +2373,10 @@ def test_compliance_analyzer_synthetic_transcripts() -> None:
             result,
         )
         require("Breakdown by harness:" in result.stdout, "analyzer should print harness breakdown", result)
-        require("  claude\n  Sessions analyzed: 3" in result.stdout, "analyzer should report Claude sessions separately", result)
+        require("  claude\n  Sessions analyzed (logical user sessions): 3" in result.stdout, "analyzer should report Claude sessions separately", result)
         require("Claude AGENTS.md delivery:" in result.stdout, "analyzer should print AGENTS.md delivery split", result)
-        require("  read AGENTS.md\n  Sessions analyzed: 2" in result.stdout, "delivery split should count AGENTS.md readers", result)
-        require("  did not read AGENTS.md\n  Sessions analyzed: 1" in result.stdout, "delivery split should count Claude sessions without AGENTS.md", result)
+        require("  read AGENTS.md\n  Sessions analyzed (logical user sessions): 2" in result.stdout, "delivery split should count AGENTS.md readers", result)
+        require("  did not read AGENTS.md\n  Sessions analyzed (logical user sessions): 1" in result.stdout, "delivery split should count Claude sessions without AGENTS.md", result)
         require("category=late_kb_read late_bucket=20+ actions late" in result.stdout, "details should include late bucket")
         require("read_agents_md=True" in result.stdout, "details should expose AGENTS.md read status")
         require(
@@ -2271,7 +2424,7 @@ def test_compliance_analyzer_synthetic_transcripts() -> None:
             "since filter should count sessions without real timestamps",
             result,
         )
-        require("Sessions analyzed: 1" in result.stdout, "since filter should keep only post-cutoff sessions", result)
+        require("Sessions analyzed (logical user sessions): 1" in result.stdout, "since filter should keep only post-cutoff sessions", result)
 
 
 # Checks that the Release 2 eval runner can parse a bundle and write summary JSON without invoking an agent.
@@ -3000,6 +3153,7 @@ def main() -> int:
         test_stats_follows_kb_renames,
         test_stats_dead_candidates_without_git,
         test_root_relative_rejects_bare_paths,
+        test_codex_record_tool_payload_survives_dict_type,
         test_codex_exec_wrapper_reads,
         test_claude_bash_kb_read,
         test_stats_ignores_other_project_transcripts,
@@ -3014,6 +3168,8 @@ def main() -> int:
         test_backfill_skips_unparseable_transcript,
         test_compliance_skips_unparseable_transcript,
         test_compliance_survives_junk_home_token,
+        test_compliance_merges_sub_agent_rollouts,
+        test_compliance_merges_resumed_rollouts,
         test_compliance_analyzer_synthetic_transcripts,
         test_eval_runner_dry_run,
         test_eval_runner_shared_kb_dry_run,
