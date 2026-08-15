@@ -10,7 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "skills" / "agent-context-kb" / "scripts"))
 from transcript_reads import (  # noqa: E402
     ToolEvent,
     collect_tool_events,
