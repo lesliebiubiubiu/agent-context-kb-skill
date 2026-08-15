@@ -141,6 +141,28 @@ npx skills add lesliebiubiubiu/agent-context-kb-skill
 完整协议——路由格式、压缩循环、版本化与隐私模式——见
 [`skills/agent-context-kb/SKILL.md`](skills/agent-context-kb/SKILL.md)。
 
+## 数据处理
+
+`stats` 可以通过扫描本地 agent transcript 来衡量哪些知识库文档真正被读到——但只有
+在你明确同意之后才会这样做；默认情况下它什么都不读。
+
+- **只在被允许时读取，且只读这些。** 开启 backfill 后，`stats` 会扫描
+  `~/.claude/projects` 和 `~/.codex/sessions` 下的 transcript 文件——都是你本机
+  的 agent 历史记录，绝不会是任何远程内容。
+- **先判归属，再读内容。** Claude 的 transcript 通过本仓库自己的 project 目录
+  定位。Codex 的存储不按项目划分，因此那里的每一份 transcript 都要先用它声明
+  的元数据（session 的工作目录 / 每次调用的 `workdir`）判定归属——绝不通过读取
+  其文本内容来判断。只有通过这层检查的 transcript，其自由文本命令才会被解析。
+- **数据不出本机。** 统计结果只写入本机的 `.agent-kb/.log/`（已被
+  gitignore）。
+- **先回答，再出统计。** 在本仓库有答案之前，`stats` 不会输出任何统计——它只打印
+  backfill 会读取什么，然后停下，避免把问题和它所把关的结果一起交付。
+- **开启 / 关闭。** `stats --backfill` 开启，`stats --no-backfill` 保持关闭且其余
+  统计照常输出——两种选择都会按仓库记住。`stats --forget-backfill` 会清除记录，
+  下次运行重新询问。
+
+这些选项由 `stats` 自己说明，其输出即权威版本。
+
 ## 更新日志
 
 以 git tag 版本化——每个版本的变更见

@@ -277,7 +277,12 @@ TRIM_MAJOR_OVERAGE = 0.10
 # Bumped to 4 when a session became the logical session (shared by sub-agent and resumed
 # transcript files) instead of one file, and shell KB reads started being detected: older caches
 # hold both file-shaped session ids and reads a blinder parser missed.
-TRANSCRIPT_CACHE_VERSION = 4
+# Bumped to 5 when Codex ownership became a metadata-only first pass (session cwd and per-call
+# workdir): older caches list sessions owned on evidence scraped from command text, which the
+# scan no longer accepts, so their per-file session lists would keep those sessions alive.
+TRANSCRIPT_CACHE_VERSION = 5
+# Longest label printed for transcript-derived text (KB paths, transcript file names).
+MAX_LABEL_CHARS = 120
 
 
 # Returns the repository root from an argparse namespace.
@@ -288,6 +293,13 @@ def repo_root(args: argparse.Namespace) -> Path:
 # Returns the `.agent-kb` directory for a repository root.
 def kb_dir(root: Path) -> Path:
     return root / ".agent-kb"
+
+
+# Renders untrusted text as one safe printable line: escapes non-printables and caps the length,
+# so transcript-scraped text can never inject newlines or escape sequences into stats output.
+def safe_label(text: str, limit: int = MAX_LABEL_CHARS) -> str:
+    escaped = "".join(char if char.isprintable() else repr(char)[1:-1] for char in str(text))
+    return escaped if len(escaped) <= limit else escaped[: limit - 1] + "…"
 
 
 # CLI params never logged: dispatch internals and the repo root (location, low signal).
@@ -491,7 +503,7 @@ def scan_transcripts_incremental(root: Path, kb: Path, claude_dir: Path | None, 
             else:
                 scan = parse_codex_transcript(path, root)
         except Exception as err:
-            print(f"WARN: skipped unparseable transcript {path.name}: {err}")
+            print(f"WARN: skipped unparseable transcript {safe_label(path.name)}: {safe_label(str(err))}")
             return
         sessions.update(scan.sessions)
         user_sessions.update(scan.user_sessions)
@@ -533,6 +545,64 @@ def reset_kb_read_events(kb: Path) -> int:
     except OSError:
         pass
     return removed
+
+
+# Returns the per-repo transcript-consent path, kept in the gitignored KB log directory so the
+# decision stays local to this checkout and is never shared or applied globally.
+def transcript_consent_path(kb: Path) -> Path:
+    return kb / ".log" / "transcript-consent.json"
+
+
+# Reads the stored transcript-backfill decision, treating an absent or unreadable file as "not asked".
+def read_transcript_consent(kb: Path) -> dict | None:
+    path = transcript_consent_path(kb)
+    if not path.exists():
+        return None
+    try:
+        consent = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(consent, dict) or not isinstance(consent.get("backfill"), bool):
+        return None
+    return consent
+
+
+# Records an explicit transcript-backfill decision best-effort, so stats never fails on a read-only KB.
+def write_transcript_consent(kb: Path, enabled: bool) -> dict:
+    consent = {
+        "backfill": enabled,
+        "decided_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+    }
+    try:
+        path = transcript_consent_path(kb)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(consent, sort_keys=True) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+    return consent
+
+
+# Forgets the stored decision so the next stats run asks again by printing the disclosure.
+def clear_transcript_consent(kb: Path) -> None:
+    try:
+        transcript_consent_path(kb).unlink()
+    except OSError:
+        return
+
+
+# Decides whether this stats run scans transcripts, persisting any explicit choice for next time.
+# Resolution order: an explicit flag wins over stored consent, and stored consent over the
+# opt-in default of off.
+def resolve_backfill(kb: Path, args: argparse.Namespace) -> tuple[bool, dict | None]:
+    if args.forget_backfill:
+        clear_transcript_consent(kb)
+    if args.backfill or args.no_backfill:
+        enabled = bool(args.backfill)
+        return enabled, write_transcript_consent(kb, enabled)
+    consent = read_transcript_consent(kb)
+    if consent is not None:
+        return bool(consent.get("backfill")), consent
+    return False, None
 
 
 # Scans transcripts for this repo and backfills KB read events into the local event log.
@@ -1960,7 +2030,9 @@ def command_compile(args: argparse.Namespace) -> int:
 
 
 # Prints (label, value, suffix) rows as a proportional ASCII bar chart for quick visual scanning.
+# Labels can carry transcript-derived text, so every one goes through safe_label first.
 def print_bar_chart(rows: list[tuple[str, int, str]], indent: str = "  ", width: int = 24) -> None:
+    rows = [(safe_label(label), value, suffix) for label, value, suffix in rows]
     max_value = max((value for _, value, _ in rows), default=0)
     label_width = max((len(label) for label, _, _ in rows), default=0)
     for label, value, suffix in rows:
@@ -2031,6 +2103,43 @@ def kb_rename_map(root: Path) -> dict[str, str]:
     return {old: latest_renamed_path(direct, old) for old in direct}
 
 
+# Printed in place of every statistic while nobody has decided about the backfill: what it
+# measures, what it reads, what that exposes, where the data stays, and how to answer.
+BACKFILL_DISCLOSURE_LINES = [
+    "STOPPED: nobody has decided about transcript backfill for this repo, so no",
+    "statistics were produced and no transcript was opened.",
+    "",
+    "What backfill measures: which .agent-kb docs agents actually read, per",
+    "session, so popular docs and dead docs become visible.",
+    "To do that it reads local agent transcripts under ~/.claude/projects and",
+    "~/.codex/sessions.",
+    "The Codex store is not per-project, so transcripts belonging to other",
+    "projects are opened to check which repo they ran in.",
+    "Nothing leaves this machine: reads are counted into .agent-kb/.log/ only.",
+    "",
+    "ACTION NEEDED - answer this and stats runs. These are not per-run switches:",
+    "each one stores a standing choice for this repo, and only these three flags",
+    "change it.",
+    "  stats --backfill         -> on, and stays on until changed",
+    "  stats --no-backfill      -> off; every other stats section still reports",
+    "  stats --forget-backfill  -> back to undecided, so this asks again",
+    "Put the choice to the user, or make it yourself if they have delegated that",
+    "- and either way say which way it was answered.",
+    "If you have a structured way to ask the user a multiple-choice question, use",
+    "it here instead of prose.",
+]
+
+
+# Returns the one line that keeps a stored backfill decision findable in stats: what was
+# decided, when, and how to undo it. stats never reaches here while the decision is undecided.
+def backfill_notice_lines(consent: dict | None, enabled: bool) -> list[str]:
+    decided_at = str((consent or {}).get("decided_at", ""))
+    when = f" since {decided_at}" if decided_at else ""
+    if enabled:
+        return [f"  Transcript backfill: on{when}; turn it off with --no-backfill."]
+    return [f"  Transcript backfill: off by stored choice{when}; turn it on with --backfill."]
+
+
 # Prints read-observability metrics from transcript backfill and logged KB read events,
 # counting reads under a doc's current path even when they were logged before a rename.
 def print_kb_read_stats(
@@ -2041,14 +2150,16 @@ def print_kb_read_stats(
     top: int,
     dead_sessions: int,
     backfill_error: str | None = None,
+    consent: dict | None = None,
 ) -> None:
     read_events = [event for event in events if event.get("event") == "kb_read"]
     print("KB read usage (transcript backfill):")
+    backfill_ran = scan is not None or backfill_error is not None
+    for line in backfill_notice_lines(consent, backfill_ran):
+        print(line)
     if backfill_error:
-        print(f"  (backfill failed: {backfill_error})")
-    elif scan is None:
-        print("  (backfill disabled)")
-    else:
+        print(f"  (backfill failed: {safe_label(backfill_error)})")
+    elif scan is not None:
         hit_sessions = {str(event.get("session", "")) for event in read_events if str(event.get("session", "")) in scan.sessions}
         print(f"  scanned sessions: {len(scan.sessions)}")
         print(f"  KB hit rate: {format_rate(len(hit_sessions), len(scan.sessions))}")
@@ -2102,20 +2213,27 @@ def command_stats(args: argparse.Namespace) -> int:
     scan: TranscriptScan | None = None
     added = 0
     backfill_error = None
+    backfill_on, consent = resolve_backfill(kb, args)
+    if consent is None:
+        # Ask before reporting, never after: once the numbers are already printed, nobody has a
+        # reason to answer, so the question only binds while it is still holding the report back.
+        for line in BACKFILL_DISCLOSURE_LINES:
+            print(line)
+        return 2
     if args.rebuild_reads:
-        if args.no_backfill:
-            print("ERROR: --rebuild-reads needs the backfill; drop --no-backfill")
+        if not backfill_on:
+            print("ERROR: --rebuild-reads needs the transcript backfill; pass --backfill")
             return 1
         removed = reset_kb_read_events(kb)
         print(f"Rebuilding KB read history: dropped {removed} transcript-derived event(s).")
         print()
-    elif not args.no_backfill and transcript_cache_is_outdated(kb):
+    elif backfill_on and transcript_cache_is_outdated(kb):
         # Old events were derived by an older scanner and no longer match the session ids it
         # produces now, so rebuild them instead of reporting a hit rate that quietly collapses.
         removed = reset_kb_read_events(kb)
         print(f"Transcript scanner changed (cache v{TRANSCRIPT_CACHE_VERSION}): dropped {removed} stale transcript-derived event(s) and rescanned.")
         print()
-    if not args.no_backfill:
+    if backfill_on:
         try:
             scan, added = backfill_kb_reads(root, args)
         except Exception as err:
@@ -2143,7 +2261,7 @@ def command_stats(args: argparse.Namespace) -> int:
     print()
     if scan is not None:
         print(f"Backfilled KB reads: {added} new event(s).")
-    print_kb_read_stats(root, kb, events, scan, args.top, args.dead_sessions, backfill_error)
+    print_kb_read_stats(root, kb, events, scan, args.top, args.dead_sessions, backfill_error, consent)
 
     print()
     print("KB file churn (git history):")
@@ -2232,7 +2350,24 @@ def build_parser() -> argparse.ArgumentParser:
     stats_parser = subparsers.add_parser("stats", help="Summarize CLI usage, KB reads, and KB file churn.")
     stats_parser.add_argument("--root", default=".", help="Repository root to manage.")
     stats_parser.add_argument("--top", type=int, default=5, help="Show at most this many rows per section (default 5).")
-    stats_parser.add_argument("--no-backfill", action="store_true", help="Do not scan local transcripts before rendering stats.")
+    # Reading local transcripts is opt-in, so both answers are explicit decisions worth remembering;
+    # they are mutually exclusive because one run cannot store two of them.
+    backfill_choice = stats_parser.add_mutually_exclusive_group()
+    backfill_choice.add_argument(
+        "--backfill",
+        action="store_true",
+        help="Scan local transcripts before rendering stats, and remember that choice for this repo.",
+    )
+    backfill_choice.add_argument(
+        "--no-backfill",
+        action="store_true",
+        help="Do not scan local transcripts, and remember that refusal for this repo.",
+    )
+    backfill_choice.add_argument(
+        "--forget-backfill",
+        action="store_true",
+        help="Forget the stored backfill choice for this repo, so stats shows the disclosure again.",
+    )
     stats_parser.add_argument(
         "--rebuild-reads",
         action="store_true",

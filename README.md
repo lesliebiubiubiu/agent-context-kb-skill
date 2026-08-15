@@ -156,6 +156,30 @@ For the full protocol — route format, the compaction loop, and the versioning 
 privacy modes — see
 [`skills/agent-context-kb/SKILL.md`](skills/agent-context-kb/SKILL.md).
 
+## Data handling
+
+`stats` can measure which KB docs actually get read by scanning local agent
+transcripts — but only once you say so; it reads nothing by default.
+
+- **What it reads, and only when asked.** With backfill on, `stats` scans
+  transcript files under `~/.claude/projects` and `~/.codex/sessions` — your
+  own local agent history, never anything remote.
+- **Ownership before content.** Claude transcripts are located through this
+  repo's own project directory. The Codex store is not per-project, so every
+  transcript there is first checked against declared metadata (session working
+  directory / per-call `workdir`) — never by reading its text. Free-form
+  command text is only parsed inside transcripts that pass that check.
+- **Nothing leaves this machine.** Counts are written to `.agent-kb/.log/`
+  (gitignored) on this machine only.
+- **Answer first, stats second.** Until this repo has an answer on record,
+  `stats` reports nothing at all — it prints what backfill would read and
+  stops, so the question can't be delivered alongside the results it gates.
+- **Enable / disable.** `stats --backfill` turns it on, `stats --no-backfill`
+  keeps it off and every other stats section still reports — either choice is
+  remembered per repo. `stats --forget-backfill` resets it to "ask again."
+
+`stats` states these options itself; that output is the authoritative account.
+
 ## Changelog
 
 Versioned via git tags — see
