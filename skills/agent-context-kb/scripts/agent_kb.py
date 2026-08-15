@@ -2103,31 +2103,36 @@ def kb_rename_map(root: Path) -> dict[str, str]:
     return {old: latest_renamed_path(direct, old) for old in direct}
 
 
-# Shown once, before any transcript is opened, when nobody has decided about the backfill yet:
-# what it measures, what it reads, what that exposes, where the data stays, and who decides next.
-# The closing lines ask for a decision rather than describing the flags, because an agent relaying
-# this report summarizes help text away but carries an open question through to the user.
+# Printed in place of every statistic while nobody has decided about the backfill: what it
+# measures, what it reads, what that exposes, where the data stays, and how to answer.
 BACKFILL_DISCLOSURE_LINES = [
-    "  (off by default; nothing was scanned)",
-    "  What it measures: which .agent-kb docs agents actually read, per session,",
-    "  so popular docs and dead docs become visible.",
-    "  To do that it reads local agent transcripts under ~/.claude/projects and",
-    "  ~/.codex/sessions.",
-    "  The Codex store is not per-project, so transcripts belonging to other",
-    "  projects are opened to check which repo they ran in.",
-    "  Nothing leaves this machine: reads are counted into .agent-kb/.log/ only.",
-    "  ACTION NEEDED - nobody has answered yet. Put this question to the user, or",
-    "  answer it yourself if they have delegated that: turn it on with",
-    "  `stats --backfill`, or keep it off with `stats --no-backfill`. Either",
-    "  answer is remembered for this repo (--forget-backfill to be asked again).",
+    "STOPPED: nobody has decided about transcript backfill for this repo, so no",
+    "statistics were produced and no transcript was opened.",
+    "",
+    "What backfill measures: which .agent-kb docs agents actually read, per",
+    "session, so popular docs and dead docs become visible.",
+    "To do that it reads local agent transcripts under ~/.claude/projects and",
+    "~/.codex/sessions.",
+    "The Codex store is not per-project, so transcripts belonging to other",
+    "projects are opened to check which repo they ran in.",
+    "Nothing leaves this machine: reads are counted into .agent-kb/.log/ only.",
+    "",
+    "ACTION NEEDED - answer this and stats runs. These are not per-run switches:",
+    "each one stores a standing choice for this repo, and only these three flags",
+    "change it.",
+    "  stats --backfill         -> on, and stays on until changed",
+    "  stats --no-backfill      -> off; every other stats section still reports",
+    "  stats --forget-backfill  -> back to undecided, so this asks again",
+    "Put the choice to the user, or make it yourself if they have delegated that",
+    "- and either way say which way it was answered.",
+    "If you have a structured way to ask the user a multiple-choice question, use",
+    "it here instead of prose.",
 ]
 
 
-# Returns the line(s) that keep the backfill decision findable in stats: the full disclosure while
-# nothing is stored, otherwise a one-line status saying what was decided, when, and how to undo it.
+# Returns the one line that keeps a stored backfill decision findable in stats: what was
+# decided, when, and how to undo it. stats never reaches here while the decision is undecided.
 def backfill_notice_lines(consent: dict | None, enabled: bool) -> list[str]:
-    if consent is None and not enabled:
-        return BACKFILL_DISCLOSURE_LINES
     decided_at = str((consent or {}).get("decided_at", ""))
     when = f" since {decided_at}" if decided_at else ""
     if enabled:
@@ -2209,6 +2214,12 @@ def command_stats(args: argparse.Namespace) -> int:
     added = 0
     backfill_error = None
     backfill_on, consent = resolve_backfill(kb, args)
+    if consent is None:
+        # Ask before reporting, never after: once the numbers are already printed, nobody has a
+        # reason to answer, so the question only binds while it is still holding the report back.
+        for line in BACKFILL_DISCLOSURE_LINES:
+            print(line)
+        return 2
     if args.rebuild_reads:
         if not backfill_on:
             print("ERROR: --rebuild-reads needs the transcript backfill; pass --backfill")

@@ -155,11 +155,13 @@ npx skills add lesliebiubiubiu/agent-context-kb-skill
   其文本内容来判断。只有通过这层检查的 transcript，其自由文本命令才会被解析。
 - **数据不出本机。** 统计结果只写入本机的 `.agent-kb/.log/`（已被
   gitignore）。
-- **开启 / 关闭。** `stats --backfill` 开启，`stats --no-backfill` 保持关闭——
-  两种选择都会按仓库记住。`stats --forget-backfill` 会清除记录，下次运行重新
-  询问。
+- **先回答，再出统计。** 在本仓库有答案之前，`stats` 不会输出任何统计——它只打印
+  backfill 会读取什么，然后停下，避免把问题和它所把关的结果一起交付。
+- **开启 / 关闭。** `stats --backfill` 开启，`stats --no-backfill` 保持关闭且其余
+  统计照常输出——两种选择都会按仓库记住。`stats --forget-backfill` 会清除记录，
+  下次运行重新询问。
 
-完整机制见 [`skills/agent-context-kb/SKILL.md`](skills/agent-context-kb/SKILL.md)。
+这些选项由 `stats` 自己说明，其输出即权威版本。
 
 ## 更新日志
 

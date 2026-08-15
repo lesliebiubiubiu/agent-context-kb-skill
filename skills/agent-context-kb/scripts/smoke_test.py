@@ -1739,13 +1739,14 @@ def test_stats_backfill_is_opt_in_and_remembered() -> None:
         )
         consent = root / ".agent-kb" / ".log" / "transcript-consent.json"
 
-        # Nothing decided yet: no transcript is opened, and the disclosure says what enabling reads.
+        # Nothing decided yet: stats stops before reporting anything, so the question still binds.
         result = run_cli(root, "stats", "--codex-dir", str(codex_dir), "--no-backfill-claude")
-        require(result.returncode == 0, "stats should succeed with no stored decision", result)
+        require(result.returncode == 2, "an undecided backfill should block stats, not just warn", result)
         require("Backfilled KB reads:" not in result.stdout, "a default stats run must not scan transcripts", result)
-        require("~/.codex/sessions" in result.stdout, "the unasked state should disclose what backfill reads", result)
+        require("KB file churn" not in result.stdout, "a blocked run must not deliver statistics anyway", result)
+        require("~/.codex/sessions" in result.stdout, "the undecided state should disclose what backfill reads", result)
         # Help text gets summarized away by a relaying agent; an open question does not.
-        require("ACTION NEEDED" in result.stdout, "the unasked state should ask for a decision, not just describe flags", result)
+        require("ACTION NEEDED" in result.stdout, "the undecided state should ask for a decision, not just describe flags", result)
         require(not consent.exists(), "a default run must not store a decision")
 
         # --backfill scans and remembers the decision.
@@ -1768,9 +1769,9 @@ def test_stats_backfill_is_opt_in_and_remembered() -> None:
         stored = json.loads(consent.read_text(encoding="utf-8"))
         require(stored.get("backfill") is False, f"consent should record the refusal, got {stored}")
 
-        # --forget-backfill returns to the unasked state, disclosure and all.
+        # --forget-backfill returns to the undecided state, blocking disclosure and all.
         result = run_cli(root, "stats", "--forget-backfill", "--codex-dir", str(codex_dir), "--no-backfill-claude")
-        require(result.returncode == 0, "stats --forget-backfill should succeed", result)
+        require(result.returncode == 2, "forgetting a decision should block the next report", result)
         require(not consent.exists(), "--forget-backfill should clear the stored decision")
         require("Backfilled KB reads:" not in result.stdout, "forgetting a decision should not scan", result)
         require("~/.codex/sessions" in result.stdout, "forgetting a decision should bring the disclosure back", result)
