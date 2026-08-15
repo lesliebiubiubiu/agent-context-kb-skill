@@ -13,10 +13,12 @@ import tempfile
 from pathlib import Path
 
 
-SCRIPT = Path(__file__).with_name("agent_kb.py")
-DEV_COMPLIANCE_SCRIPT = Path(__file__).parent / "dev" / "compliance_analyzer.py"
-EVAL_RUNNER = Path(__file__).resolve().parents[3] / "evals" / "run_bundle.py"
-sys.path.insert(0, str(Path(__file__).parent))
+REPO_DIR = Path(__file__).resolve().parents[1]
+SKILL_SCRIPTS = REPO_DIR / "skills" / "agent-context-kb" / "scripts"
+SCRIPT = SKILL_SCRIPTS / "agent_kb.py"
+DEV_COMPLIANCE_SCRIPT = Path(__file__).with_name("compliance_analyzer.py")
+EVAL_RUNNER = REPO_DIR / "evals" / "run_bundle.py"
+sys.path.insert(0, str(SKILL_SCRIPTS))
 from transcript_reads import claude_project_name  # noqa: E402
 
 
@@ -939,8 +941,7 @@ def test_trim_reports_structure_advisories() -> None:
 
 # Checks this repository's KB does not trigger the new structural trim advisories.
 def test_trim_structure_advisories_no_self_false_positive() -> None:
-    repo = Path(__file__).resolve().parents[3]
-    result = run_cli(repo, "trim")
+    result = run_cli(REPO_DIR, "trim")
     require(result.returncode == 0, "repo self trim check should succeed", result)
     require("depth advisory:" not in result.stdout, "repo KB should not trigger depth advisory", result)
     require("hub advisory:" not in result.stdout, "repo KB should not trigger hub advisory", result)
