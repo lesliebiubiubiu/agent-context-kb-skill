@@ -22,6 +22,9 @@ SHELL_TOKEN_TRIM = "'\"`;&|<>()"
 # KB docs only ever carry these suffixes. Codex reads are scraped from free-form command text,
 # so this rejects junk tokens that happen to sit after a `.agent-kb/` prefix.
 KB_DOC_SUFFIXES = {".md", ".yaml", ".yml", ".json", ".txt"}
+# Control characters (newline, carriage return, tab, ESC, NUL...) never appear in a real KB doc
+# path, so a scraped path carrying one is junk or injected text, not a doc this repo owns.
+CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 SHELL_EDIT_COMMANDS = {"apply_patch", "perl", "ruby"}
 # Shell operators that chain several commands into one recorded string.
 SHELL_SEGMENT_RE = re.compile(r"&&|\|\||;|\n")
@@ -141,8 +144,10 @@ def claude_project_dirs(base: Path, root: Path) -> list[Path]:
 # Returns whether an absolute path is inside root and, if so, its relative path.
 # Relative input is rejected on purpose: resolving it here would use the process cwd, which
 # attributes another project's transcript paths to this repo. Callers join it with the session workdir.
+# A value carrying control characters is dropped here, the one gate every untrusted transcript path
+# passes through, so injected text leaves the event stream instead of being classified as anything.
 def root_relative(path_value: str, root: Path) -> Path | None:
-    if not path_value:
+    if not path_value or CONTROL_CHAR_RE.search(path_value):
         return None
     try:
         expanded = Path(path_value).expanduser()
@@ -196,10 +201,15 @@ def file_chars(root: Path, relative: Path) -> int:
 
 
 # Returns the KB-relative path when a repo-relative path is inside `.agent-kb/`.
+# A path with control characters is dropped here, at extraction, so no transcript text carrying
+# newlines or escape sequences can reach the event log or the printed charts.
 def kb_relative(relative: Path) -> str | None:
     if not relative.parts or relative.parts[0] != ".agent-kb" or len(relative.parts) == 1:
         return None
-    return str(Path(*relative.parts[1:]))
+    kb_path = str(Path(*relative.parts[1:]))
+    if CONTROL_CHAR_RE.search(kb_path):
+        return None
+    return kb_path
 
 
 # Classifies a root-relative read path as KB, AGENTS.md, or source exploration.
@@ -438,6 +448,21 @@ def js_exec_commands(source: str) -> list[tuple[str, str]]:
     return pairs
 
 
+# Pulls only the `workdir` fields out of a Codex `exec` JavaScript payload, never a command.
+# Ownership must be decidable without reading command text, so this stops at the declared field;
+# a payload that is a patch body, or carries no exec call at all, declares no workdir.
+def js_exec_workdirs(source: str) -> list[str]:
+    if source.lstrip().startswith(PATCH_PREFIX) or JS_EXEC_MARKER not in source:
+        return []
+    workdirs: list[str] = []
+    for segment in source.split(JS_EXEC_MARKER)[1:]:
+        match = JS_WORKDIR_RE.search(segment)
+        workdir = js_string(match.group(1)) if match else ""
+        if workdir:
+            workdirs.append(workdir)
+    return workdirs
+
+
 # Returns the (command, workdir) pairs one Codex tool call ran.
 # JSON arguments hold a single command; an `exec` call arrives as a JS wrapper string that can
 # hold several, so the JS decoder is the fallback whenever the arguments are not JSON.
@@ -560,17 +585,58 @@ def classify_codex_segment(command: str, root: Path, workdir: Path | None) -> tu
     return None, ""
 
 
+# Returns every cwd/workdir one Codex record declares as structured metadata: the session's
+# `session_meta.payload.cwd`, a record-level `cwd`, and the `workdir` a tool call was launched with
+# (including the `workdir` field of the JavaScript `exec` envelope). Free-form command text is never
+# inspected here, which is what lets ownership be decided without parsing a foreign transcript.
+def codex_metadata_workdirs(record: dict) -> list[Path]:
+    payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+    raw = [str(record.get("cwd") or ""), str(record.get("workdir") or "")]
+    if record.get("type") == "session_meta":
+        raw.extend([str(payload.get("cwd") or ""), str(payload.get("workdir") or "")])
+    tool_payload = codex_record_tool_payload(record)
+    if tool_payload is not None:
+        _name, args = codex_tool_call(tool_payload)
+        raw.append(str(args.get("workdir") or ""))
+        raw_args = codex_raw_args(tool_payload)
+        if isinstance(raw_args, str):
+            raw.extend(js_exec_workdirs(raw_args))
+    workdirs: list[Path] = []
+    for value in raw:
+        if not value:
+            continue
+        try:
+            workdirs.append(resolve_path(value))
+        except (OSError, ValueError):
+            continue
+    return workdirs
+
+
+# Pass 1 of the Codex scan: decides whether a rollout belongs to this repo from declared
+# cwd/workdir metadata alone, stopping at the first piece of evidence. Codex sessions are not
+# stored per project, so this is the check that keeps another project's transcript from ever
+# being parsed for content; only pass 2, for a rollout this returns True for, reads commands.
+def codex_transcript_owns_root(path: Path, root: Path) -> bool:
+    for record in iter_jsonl(path):
+        if any(path_is_inside_root(workdir, root) for workdir in codex_metadata_workdirs(record)):
+            return True
+    return False
+
+
 # Extracts KB read events and root-owned session membership from one Codex transcript.
 # A sub-agent or resumed rollout already records the root thread's id in `session_meta.session_id`,
 # so keying on it (instead of on the file) merges those rollouts into the session that started them.
 # A rollout can carry several `session_meta` records when it is resumed or forked; the last one
 # wins, which folds every file of a resume chain onto the thread the chain ended up in.
+# This is pass 2: it runs only after `codex_transcript_owns_root` proved, from metadata alone,
+# that the rollout is this repo's, so an unowned transcript's commands are never read.
 def parse_codex_transcript(path: Path, root: Path) -> TranscriptScan:
+    if not codex_transcript_owns_root(path, root):
+        return TranscriptScan(set(), [], set())
     # An old rollout without `thread_source` has no sub-agent concept at all, so it is a user
     # session; only an explicit non-user thread_source marks a rollout as a sub-agent.
     session = f"codex:{path.stem}"
     user_thread = True
-    owned = False
     found: list[tuple[str, str, int]] = []
     current_workdir: Path | None = None
     for index, record in enumerate(iter_jsonl(path)):
@@ -589,8 +655,6 @@ def parse_codex_transcript(path: Path, root: Path) -> TranscriptScan:
             # paths resolve there and fail the root check instead of landing under root.
             if cwd_path is not None:
                 current_workdir = cwd_path
-            if path_is_inside_root(cwd_path, root):
-                owned = True
             continue
         tool_payload = codex_record_tool_payload(record)
         if tool_payload is None:
@@ -598,32 +662,30 @@ def parse_codex_transcript(path: Path, root: Path) -> TranscriptScan:
         _name, args = codex_tool_call(tool_payload)
         workdir_raw = str(args.get("workdir") or "")
         default_workdir = resolve_path(workdir_raw) if workdir_raw else current_workdir
-        if path_is_inside_root(default_workdir, root):
-            owned = True
         for command, command_workdir_raw in codex_tool_commands(tool_payload):
             workdir = resolve_path(command_workdir_raw) if command_workdir_raw else default_workdir
-            if path_is_inside_root(workdir, root):
-                owned = True
             for relative in shell_kb_read_paths(command, root, workdir):
                 kb_path = kb_relative(relative)
                 if kb_path is None:
                     continue
-                owned = True
                 found.append((timestamp, kb_path, file_chars(root, relative)))
-    return file_scan(session, "codex", owned, user_thread, found)
+    return file_scan(session, "codex", True, user_thread, found)
 
 
 # Extracts normalized compliance events from one Codex transcript.
 # Identity matches parse_codex_transcript: the logical `session_meta.session_id` (last one wins,
 # because a resumed or forked rollout records several) merges sub-agent and resumed rollouts into
 # the session that started them, and only an explicit non-user `thread_source` marks a sub-agent.
+# Like the read parser this is pass 2, gated on metadata ownership: this is the more exposed path
+# because it classifies every command, so an unowned rollout must not reach it at all.
 def parse_codex_tool_events(path: Path, root: Path) -> list[ToolEvent]:
+    if not codex_transcript_owns_root(path, root):
+        return []
     found: list[tuple[str, int, str, str]] = []
     session = f"codex:{path.stem}"
     user_thread = True
     first_timestamp = ""
     records = 0
-    belongs_to_root = False
     current_workdir: Path | None = None
     for index, record in enumerate(iter_jsonl(path)):
         records = index + 1
@@ -642,8 +704,6 @@ def parse_codex_tool_events(path: Path, root: Path) -> list[ToolEvent]:
             cwd_path = resolve_path(cwd) if cwd else None
             if cwd_path is not None:
                 current_workdir = cwd_path
-            if path_is_inside_root(cwd_path, root):
-                belongs_to_root = True
             continue
         tool_payload = codex_record_tool_payload(record)
         if tool_payload is None:
@@ -651,8 +711,6 @@ def parse_codex_tool_events(path: Path, root: Path) -> list[ToolEvent]:
         name, args = codex_tool_call(tool_payload)
         workdir_raw = str(args.get("workdir") or "")
         default_workdir = resolve_path(workdir_raw) if workdir_raw else current_workdir
-        if path_is_inside_root(default_workdir, root):
-            belongs_to_root = True
         if "apply_patch" in name:
             if path_is_inside_root(default_workdir, root):
                 found.append((timestamp, index, "source_edit", ""))
@@ -660,14 +718,11 @@ def parse_codex_tool_events(path: Path, root: Path) -> list[ToolEvent]:
         for command, command_workdir_raw in codex_tool_commands(tool_payload):
             workdir = resolve_path(command_workdir_raw) if command_workdir_raw else default_workdir
             in_root_workdir = path_is_inside_root(workdir, root)
-            if in_root_workdir:
-                belongs_to_root = True
             kind, event_path = classify_codex_command(command, root, workdir)
             if kind and (in_root_workdir or event_path):
                 found.append((timestamp, index, kind, event_path))
-                belongs_to_root = True
     file_key = transcript_file_key(path, first_timestamp)
-    return file_tool_events(session, "codex", belongs_to_root, user_thread, file_key, records, found)
+    return file_tool_events(session, "codex", True, user_thread, file_key, records, found)
 
 
 # Collects transcript paths under a directory using the harness' JSONL layout.

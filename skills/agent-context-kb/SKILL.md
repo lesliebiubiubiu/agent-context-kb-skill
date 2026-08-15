@@ -39,8 +39,12 @@ python3 scripts/agent_kb.py stats --root /path/to/repo
 - `trim`: run it and follow its output. Size is a proxy; compact redundant or
   stale information, and stop when the remaining content is genuinely
   non-redundant. Use `trim --write` only for deterministic cleanup.
-- `stats`: backfills local transcript reads when available. Paste its full
-  output verbatim in a fenced code block; the ASCII charts are the deliverable.
+- `stats`: transcript backfill is opt-in, so a bare run reports only the reads
+  already in the event log — no fresh scan, no hit rate. When it prints the
+  disclosure, surface it and get a decision; answer with
+  `--backfill` or `--no-backfill` yourself when the user has delegated it.
+  Paste its full output verbatim in a fenced code block; the ASCII charts are
+  the deliverable.
 
 ## Knowledge Rules
 
