@@ -2104,7 +2104,9 @@ def kb_rename_map(root: Path) -> dict[str, str]:
 
 
 # Shown once, before any transcript is opened, when nobody has decided about the backfill yet:
-# what it measures, what it reads, what that exposes, where the data stays, and how to turn it on.
+# what it measures, what it reads, what that exposes, where the data stays, and who decides next.
+# The closing lines ask for a decision rather than describing the flags, because an agent relaying
+# this report summarizes help text away but carries an open question through to the user.
 BACKFILL_DISCLOSURE_LINES = [
     "  (off by default; nothing was scanned)",
     "  What it measures: which .agent-kb docs agents actually read, per session,",
@@ -2114,8 +2116,10 @@ BACKFILL_DISCLOSURE_LINES = [
     "  The Codex store is not per-project, so transcripts belonging to other",
     "  projects are opened to check which repo they ran in.",
     "  Nothing leaves this machine: reads are counted into .agent-kb/.log/ only.",
-    "  Enable with `stats --backfill`. The choice is remembered for this repo",
-    "  (--no-backfill to refuse, --forget-backfill to be asked again).",
+    "  ACTION NEEDED - nobody has answered yet. Put this question to the user, or",
+    "  answer it yourself if they have delegated that: turn it on with",
+    "  `stats --backfill`, or keep it off with `stats --no-backfill`. Either",
+    "  answer is remembered for this repo (--forget-backfill to be asked again).",
 ]
 
 

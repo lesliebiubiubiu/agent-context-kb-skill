@@ -1744,6 +1744,8 @@ def test_stats_backfill_is_opt_in_and_remembered() -> None:
         require(result.returncode == 0, "stats should succeed with no stored decision", result)
         require("Backfilled KB reads:" not in result.stdout, "a default stats run must not scan transcripts", result)
         require("~/.codex/sessions" in result.stdout, "the unasked state should disclose what backfill reads", result)
+        # Help text gets summarized away by a relaying agent; an open question does not.
+        require("ACTION NEEDED" in result.stdout, "the unasked state should ask for a decision, not just describe flags", result)
         require(not consent.exists(), "a default run must not store a decision")
 
         # --backfill scans and remembers the decision.
